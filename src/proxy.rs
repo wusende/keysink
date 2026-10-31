@@ -90,6 +90,10 @@ pub fn build_upstream_client(
     proxy: Option<&str>,
     read_timeout: Option<Duration>,
 ) -> Result<reqwest::Client> {
+    // reqwest 0.13 uses rustls-no-provider: pick ring as the process-wide
+    // crypto provider before the first client is built (idempotent; covers
+    // every entry path including tests that bypass bootstrap()).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(64)
         .pool_idle_timeout(Duration::from_secs(90))

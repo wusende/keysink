@@ -309,7 +309,7 @@ pub fn export(paths: &Paths, output: &Path, passphrase: &str) -> Result<usize> {
         }
     }
     let plaintext = Zeroizing::new(serde_json::to_vec_pretty(&store)?);
-    let encryptor = age::Encryptor::with_user_passphrase(age::secrecy::SecretString::new(
+    let encryptor = age::Encryptor::with_user_passphrase(age::secrecy::SecretString::from(
         passphrase.to_string(),
     ));
     let mut out = Vec::new();
@@ -321,12 +321,14 @@ pub fn export(paths: &Paths, output: &Path, passphrase: &str) -> Result<usize> {
 }
 
 fn encrypt_to(plaintext: &[u8], identities: &[&age::x25519::Identity]) -> Result<Vec<u8>> {
-    let recipients: Vec<Box<dyn age::Recipient + Send>> = identities
+    let recipients: Vec<Box<dyn age::Recipient>> = identities
         .iter()
-        .map(|id| Box::new(id.to_public()) as Box<dyn age::Recipient + Send>)
+        .map(|id| Box::new(id.to_public()) as Box<dyn age::Recipient>)
         .collect();
-    let encryptor = age::Encryptor::with_recipients(recipients)
-        .ok_or_else(|| Error::msg("age: no recipients available"))?;
+    let encryptor = age::Encryptor::with_recipients(
+        recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient),
+    )
+    .map_err(|e| Error::msg(format!("age: recipient encryption setup failed: {e}")))?;
     let mut out = Vec::new();
     let mut writer = encryptor.wrap_output(&mut out)?;
     writer.write_all(plaintext)?;
@@ -336,24 +338,20 @@ fn encrypt_to(plaintext: &[u8], identities: &[&age::x25519::Identity]) -> Result
 
 fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8>> {
     let decryptor = age::Decryptor::new(ciphertext)?;
-    let mut plaintext = Vec::new();
-    match decryptor {
-        age::Decryptor::Recipients(d) => {
-            let mut reader = d
-                .decrypt(std::iter::once(identity as &dyn age::Identity))
-                .map_err(|e| {
-                    Error::Age(format!(
-                        "master.key does not match the store or the file is corrupt: {e}"
-                    ))
-                })?;
-            reader.read_to_end(&mut plaintext)?;
-        }
-        age::Decryptor::Passphrase(_) => {
-            return Err(Error::msg(
-                "this is a passphrase-encrypted age file and cannot be decrypted with master.key",
-            ));
-        }
+    if decryptor.is_scrypt() {
+        return Err(Error::msg(
+            "this is a passphrase-encrypted age file and cannot be decrypted with master.key",
+        ));
     }
+    let mut plaintext = Vec::new();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| {
+            Error::Age(format!(
+                "master.key does not match the store or the file is corrupt: {e}"
+            ))
+        })?;
+    reader.read_to_end(&mut plaintext)?;
     Ok(plaintext)
 }
 
@@ -534,10 +532,7 @@ mod tests {
         let out = paths.home.join("backup.age");
         export(&paths, &out, "test-pass").unwrap();
         let ct = fs::read(&out).unwrap();
-        assert!(matches!(
-            age::Decryptor::new(&ct[..]).unwrap(),
-            age::Decryptor::Passphrase(_)
-        ));
+        assert!(age::Decryptor::new(&ct[..]).unwrap().is_scrypt());
     }
 
     #[test]
@@ -565,17 +560,20 @@ mod tests {
         // decrypt it to verify the key value is really absent.
         let ct = fs::read(&out).unwrap();
         let decryptor = age::Decryptor::new(&ct[..]).unwrap();
-        let age::Decryptor::Passphrase(d) = decryptor else {
-            panic!("export should be passphrase-encrypted");
-        };
+        assert!(
+            decryptor.is_scrypt(),
+            "export should be passphrase-encrypted"
+        );
         let mut plain = Vec::new();
-        d.decrypt(
-            &age::secrecy::SecretString::new("test-pass".to_string()),
-            None,
-        )
-        .unwrap()
-        .read_to_end(&mut plain)
-        .unwrap();
+        decryptor
+            .decrypt(std::iter::once(
+                &age::scrypt::Identity::new(age::secrecy::SecretString::from(
+                    "test-pass".to_string(),
+                )) as &dyn age::Identity,
+            ))
+            .unwrap()
+            .read_to_end(&mut plain)
+            .unwrap();
         let text = String::from_utf8(plain).unwrap();
         assert!(
             !text.contains("never-leak"),

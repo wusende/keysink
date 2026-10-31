@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::util;
-use rand::RngCore;
+use rand::Rng;
 use std::io::{IsTerminal, Read};
 
 const LOG_N: u8 = 15;
@@ -14,8 +14,8 @@ pub fn hash_password(password: &str) -> Result<String> {
         return Err(Error::msg("master password must not be empty"));
     }
     let mut salt = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    let params = scrypt::Params::new(LOG_N, R, P, OUT_LEN)
+    rand::rng().fill_bytes(&mut salt);
+    let params = scrypt::Params::new(LOG_N, R, P)
         .map_err(|e| Error::msg(format!("invalid scrypt parameters: {e}")))?;
     let mut out = [0u8; OUT_LEN];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut out)
@@ -38,7 +38,7 @@ pub fn verify_password(password: &str, encoded: &str) -> Result<bool> {
     let p: u32 = parse(parts.next(), "p")?;
     let salt = hex_decode(parts.next().ok_or_else(|| Error::msg("missing salt"))?)?;
     let expected = hex_decode(parts.next().ok_or_else(|| Error::msg("missing hash"))?)?;
-    let params = scrypt::Params::new(log_n, r, p, expected.len())
+    let params = scrypt::Params::new(log_n, r, p)
         .map_err(|e| Error::msg(format!("invalid scrypt parameters: {e}")))?;
     let mut out = vec![0u8; expected.len()];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut out)

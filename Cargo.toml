@@ -6,10 +6,10 @@ description = "Local credential gateway: virtual key → upstream endpoint + rea
 license = "MIT"
 
 [dependencies]
-age = "0.10"
+age = "0.12"
 arc-swap = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
@@ -18,13 +18,16 @@ http-body-util = "0.1"
 httpdate = "1"
 libc = "0.2"
 memchr = "2"
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json"] }
+# Explicit ring crypto provider for rustls: avoids aws-lc-rs (cmake to build)
+# and keeps the provider already proven on all release targets.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rpassword = "7"
-scrypt = "0.11"
+scrypt = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["full"] }

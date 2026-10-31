@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use rand::RngCore;
+use rand::Rng;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -214,7 +214,7 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| Error::msg(format!("invalid path: {}", path.display())))?;
     let mut suffix = [0u8; 4];
-    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    rand::rng().fill_bytes(&mut suffix);
     let tmp = dir.join(format!(".{file_name}.tmp.{}", hex(&suffix)));
 
     let result = (|| -> Result<()> {
@@ -244,7 +244,7 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
-    rand::rngs::OsRng.fill_bytes(&mut out);
+    rand::rng().fill_bytes(&mut out);
     out
 }
 
