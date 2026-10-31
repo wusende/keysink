@@ -26,6 +26,10 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: keysink-x86_64-unknown-linux-gnu
+            # Only one matrix leg generates release notes: every leg calls the
+            # publish action, and generate_release_notes appends its section to
+            # the body on each call — N legs meant N duplicate "Full Changelog" lines.
+            notes: true
           # Native arm64 runner: cross-compiling ring (rustls) from x86_64 needs
           # a full cross toolchain and is fragile; public repos get arm64 runners for free.
           - os: ubuntu-24.04-arm
@@ -75,4 +79,4 @@ jobs:
         with:
           files: |
             ${{ matrix.artifact }}.*
-          generate_release_notes: true
+          generate_release_notes: ${{ matrix.notes == true }}
