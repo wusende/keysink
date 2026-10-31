@@ -1258,8 +1258,9 @@ pub(crate) fn cmd_deploy() -> Result<()> {
         return Err(Error::msg("请用 sudo 运行:sudo keysink deploy"));
     }
     // sudoers 只放行发起部署的管理员;不知道是谁就拒绝,避免白名单写错人
-    let admin = std::env::var("SUDO_USER")
-        .map_err(|_| Error::msg("请通过管理员账号的 sudo 运行(需要 SUDO_USER 生成 sudoers 白名单)"))?;
+    let admin = std::env::var("SUDO_USER").map_err(|_| {
+        Error::msg("请通过管理员账号的 sudo 运行(需要 SUDO_USER 生成 sudoers 白名单)")
+    })?;
 
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
@@ -1292,13 +1293,18 @@ pub(crate) fn cmd_deploy() -> Result<()> {
     run_checked(
         "创建 vault 目录",
         "install",
-        &["-d", "-o", "keysink", "-g", "keysink", "-m", "0700", SYSTEM_VAULT_HOME],
+        &[
+            "-d",
+            "-o",
+            "keysink",
+            "-g",
+            "keysink",
+            "-m",
+            "0700",
+            SYSTEM_VAULT_HOME,
+        ],
     )?;
-    run_checked(
-        "安装二进制",
-        "install",
-        &["-m", "0755", &exe, SYSTEM_BIN],
-    )?;
+    run_checked("安装二进制", "install", &["-m", "0755", &exe, SYSTEM_BIN])?;
 
     std::fs::write(SYSTEM_UNIT, SYSTEMD_UNIT)
         .map_err(|e| Error::msg(format!("写入 unit 失败: {e}")))?;
@@ -1374,7 +1380,9 @@ pub(crate) fn cmd_deploy() -> Result<()> {
     println!("下一步(添加路由,管理员 {admin}):");
     println!("  sudo -u keysink keysink route add claude --base-url https://api.anthropic.com");
     println!("  # 终端里依次引导:名称 / base URL / 上游认证 / key 值(隐藏回显,只进不出)");
-    println!("  # 脚本里:printf %s \"$KEY\" | sudo -u keysink keysink route add <name> --base-url ...");
+    println!(
+        "  # 脚本里:printf %s \"$KEY\" | sudo -u keysink keysink route add <name> --base-url ..."
+    );
     println!();
     println!("agent 侧配置(route add 末尾会打印这两行):");
     println!("  BASE_URL=http://127.0.0.1:8787");
@@ -1554,9 +1562,16 @@ mod tests {
     #[test]
     fn standalone_home_prefers_absolute_xdg_then_home() {
         use std::ffi::OsStr;
+        // An absolute XDG path wins; on Windows an absolute path needs a
+        // drive prefix — "/xdg/data" is rooted but driveless and NOT absolute.
+        let xdg = if cfg!(windows) {
+            "C:/xdg/data"
+        } else {
+            "/xdg/data"
+        };
         assert_eq!(
-            standalone_home_from(Some(OsStr::new("/xdg/data")), Some(OsStr::new("/home/u"))),
-            PathBuf::from("/xdg/data/keysink")
+            standalone_home_from(Some(OsStr::new(xdg)), Some(OsStr::new("/home/u"))),
+            PathBuf::from(format!("{xdg}/keysink"))
         );
         #[cfg(unix)]
         {

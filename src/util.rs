@@ -230,7 +230,9 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         // fsync the directory so the rename itself is durable; Windows can't
         // open a directory handle, so accept the crash window there.
         #[cfg(unix)]
-        File::open(dir)?.sync_all()?;
+        {
+            File::open(dir)?.sync_all()?;
+        }
         Ok(())
     })();
 
