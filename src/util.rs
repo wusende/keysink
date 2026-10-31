@@ -227,6 +227,9 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         drop(f);
         inherit_dir_owner(&tmp, path)?;
         fs::rename(&tmp, path)?;
+        // fsync the directory so the rename itself is durable; Windows can't
+        // open a directory handle, so accept the crash window there.
+        #[cfg(unix)]
         File::open(dir)?.sync_all()?;
         Ok(())
     })();
