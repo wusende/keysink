@@ -1,0 +1,41 @@
+[package]
+name = "keysink"
+version = "0.1.0"
+edition = "2024"
+description = "本地凭证网关：虚拟 key → 上游端点 + 真凭证的字节级透传，外加 age 加密的集中配置库"
+license = "MIT"
+
+[dependencies]
+age = "0.10"
+arc-swap = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = "0.3"
+http-body-util = "0.1"
+httpdate = "1"
+libc = "0.2"
+memchr = "2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rpassword = "7"
+scrypt = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

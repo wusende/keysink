@@ -1,0 +1,1413 @@
+use crate::audit::{Audit, AuditEntry};
+use crate::error::{Error, Result};
+use crate::model::{Auth, Route, Store, Terminator};
+use crate::retry::{RetryPolicy, parse_retry_after};
+use crate::store::Paths;
+use crate::vkey::{self, RouteTable};
+use arc_swap::ArcSwap;
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use base64::Engine;
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tracing::Instrument;
+use zeroize::Zeroizing;
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Read-idle timeout for streaming (SSE) clients: if the upstream sends no
+/// bytes for this long, it is deemed hung. Applies only to the streaming
+/// client — non-streaming requests must not set a read idle, otherwise slow
+/// models that only send response headers after generation completes
+/// (non-streaming long reasoning) get killed at 60s and then retried as a
+/// network error POST (double billing).
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+const RID_DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+fn next_rid() -> String {
+    let n = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    rid_from(n)
+}
+
+/// At least 4 base36 digits; it naturally lengthens past 36^4, avoiding duplicate rids after wraparound.
+fn rid_from(n: u64) -> String {
+    let mut digits = Vec::with_capacity(4);
+    let mut m = n;
+    loop {
+        digits.push(RID_DIGITS[(m % 36) as usize]);
+        m /= 36;
+        if m == 0 {
+            break;
+        }
+    }
+    while digits.len() < 4 {
+        digits.push(b'0');
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap_or_else(|_| "0000".into())
+}
+
+pub struct Snapshot {
+    pub store: Arc<Store>,
+    pub table: RouteTable,
+    /// Whether this snapshot came from the `.bak` backup (main store failed to decrypt).
+    /// Surfaced as `degraded` on the health endpoint; revoked/deleted vkeys may become effective again.
+    pub from_backup: bool,
+}
+
+pub struct AppState {
+    pub snapshot: ArcSwap<Snapshot>,
+    pub clients: ProxyClients,
+    pub retry: RetryPolicy,
+    pub body_limit: usize,
+    pub audit: Audit,
+    pub started: Instant,
+}
+
+/// Builds an upstream HTTP client; `proxy` decides proxy semantics and
+/// `read_timeout` decides read idle:
+/// - `None` → follow system proxy environment variables (reqwest default behavior)
+/// - `Some("direct")` → clear proxy and skip system proxy pickup, forcing a direct connection
+/// - `Some(url)` → use the specified proxy (reqwest semantics: an explicit proxy disables system proxy pickup)
+///
+/// read_timeout is for the streaming client only; non-streaming clients must
+/// pass None: reqwest's read_timeout also applies to the "waiting for response
+/// headers" phase, so if non-streaming also set 60s, a slow non-streaming
+/// request (response headers sent only after generation completes) would be
+/// cut off and retried as a network error POST.
+pub fn build_upstream_client(
+    proxy: Option<&str>,
+    read_timeout: Option<Duration>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(rt) = read_timeout {
+        builder = builder.read_timeout(rt);
+    }
+    builder = match proxy {
+        None => builder,
+        Some(crate::model::PROXY_DIRECT) => builder.no_proxy(),
+        Some(url) => builder.proxy(
+            reqwest::Proxy::all(url)
+                .map_err(|e| Error::msg(format!("代理 URL 非法 `{url}`: {e}")))?,
+        ),
+    };
+    builder
+        .build()
+        .map_err(|e| Error::msg(format!("构造 HTTP client 失败: {e}")))
+}
+
+/// Two clients under the same proxy config: streaming / non-streaming timeout semantics differ, so they must be built separately.
+struct ClientPair {
+    /// Non-streaming: no read idle; "waiting for response headers" is backstopped by the outer header_timeout (tokio timeout).
+    plain: reqwest::Client,
+    /// Streaming: 60s read idle, used to detect hung SSE.
+    streaming: reqwest::Client,
+}
+
+impl ClientPair {
+    fn build(proxy: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            plain: build_upstream_client(proxy, None)?,
+            streaming: build_upstream_client(proxy, Some(STREAM_READ_TIMEOUT))?,
+        })
+    }
+
+    fn pick(&self, is_stream: bool) -> reqwest::Client {
+        if is_stream {
+            self.streaming.clone()
+        } else {
+            self.plain.clone()
+        }
+    }
+}
+
+/// Client pool cached per route proxy config. reqwest has no per-request
+/// proxy override and proxy URLs are hot-reload mutable, so cache by
+/// "proxy config → client": base/direct prebuilt, URLs built lazily.
+/// After a successful hot reload, retain_urls converges to the URLs still in
+/// use, releasing clients (and their connection pools) left behind by
+/// obsolete configs.
+pub struct ProxyClients {
+    base: ClientPair,
+    direct: ClientPair,
+    by_url: Mutex<HashMap<String, ClientPair>>,
+}
+
+impl ProxyClients {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            base: ClientPair::build(None)?,
+            direct: ClientPair::build(Some(crate::model::PROXY_DIRECT))?,
+            by_url: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Route proxy decision: the route.proxy config wins; the default follows the system proxy.
+    pub fn for_route(&self, route: &Route, is_stream: bool) -> Result<reqwest::Client> {
+        match route.proxy.as_deref() {
+            None => Ok(self.base.pick(is_stream)),
+            Some(crate::model::PROXY_DIRECT) => Ok(self.direct.pick(is_stream)),
+            Some(url) => {
+                let mut cache = self.by_url.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pair) = cache.get(url) {
+                    return Ok(pair.pick(is_stream));
+                }
+                let pair = ClientPair::build(Some(url))?;
+                let client = pair.pick(is_stream);
+                cache.insert(url.to_string(), pair);
+                Ok(client)
+            }
+        }
+    }
+
+    /// Called after a successful hot reload: drops cached proxy URLs no longer referenced by any route.
+    /// In-flight requests hold Client clones (Arc) and are unaffected.
+    pub fn retain_urls(&self, live: &HashSet<String>) {
+        let mut cache = self.by_url.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|url, _| live.contains(url));
+    }
+}
+
+pub fn build_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/__keysink/health", get(health))
+        .fallback(handler)
+        .with_state(state)
+}
+
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snap = state.snapshot.load();
+    Json(json!({
+        "ok": true,
+        "degraded": snap.from_backup,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": state.started.elapsed().as_secs(),
+        "routes": snap.table.len(),
+    }))
+}
+
+pub async fn handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let rid = next_rid();
+    let span = tracing::info_span!("req", rid = %rid);
+    async move { handle_inner(state, req, rid).await }
+        .instrument(span)
+        .await
+}
+
+async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> Response {
+    let started = Instant::now();
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let path = parts.uri.path().to_string();
+    let query = parts.uri.query().map(str::to_string);
+    let in_headers = parts.headers;
+
+    // Rejected requests are audited too (route `-` means no route matched).
+    let deny = |route: &str,
+                hash: Option<&[u8; 32]>,
+                status: StatusCode,
+                kind: &'static str,
+                msg: &str|
+     -> Response {
+        record_reject(
+            state.as_ref(),
+            &rid,
+            route,
+            hash,
+            &method,
+            &path,
+            status,
+            started,
+        );
+        error_response(status, kind, msg, &rid)
+    };
+
+    if in_headers.contains_key(header::UPGRADE) {
+        return deny(
+            "-",
+            None,
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported",
+            "keysink 不支持 WebSocket / Upgrade",
+        );
+    }
+
+    let Some(token) = extract_vkey(&in_headers) else {
+        return deny(
+            "-",
+            None,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "缺少有效的虚拟 key（Authorization: Bearer ks_... 或 x-api-key）",
+        );
+    };
+
+    let snapshot = state.snapshot.load_full();
+    let hash = vkey::hash(&token);
+    let Some(resolved) = snapshot.table.lookup_hash(&hash) else {
+        return deny(
+            "-",
+            Some(&hash),
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "虚拟 key 无效或已被轮换",
+        );
+    };
+    let route = &resolved.route;
+    let route_name = resolved.name.as_str();
+    if !route.enabled {
+        return deny(
+            route_name,
+            Some(&hash),
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "该路由已被禁用",
+        );
+    }
+
+    let Some(value) = &route.inline_key else {
+        // validate guarantees non-empty; reaching here means the snapshot came from old data that never passed validate.
+        tracing::error!(route = route_name, "路由缺少 route-only key");
+        return deny(
+            route_name,
+            Some(&hash),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "configuration_error",
+            "路由配置不完整",
+        );
+    };
+    let key = Zeroizing::new(value.clone());
+
+    if let Some(len) = in_headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && len > state.body_limit
+    {
+        return deny(
+            route_name,
+            Some(&hash),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            &format!("请求体超过上限 {} 字节", state.body_limit),
+        );
+    }
+
+    let body = match axum::body::to_bytes(body, state.body_limit).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let too_large = is_length_limit_error(&e);
+            let (status, kind, message) = if too_large {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    "请求体超过上限",
+                )
+            } else {
+                (StatusCode::BAD_REQUEST, "invalid_request", "读取请求体失败")
+            };
+            return deny(route_name, Some(&hash), status, kind, message);
+        }
+    };
+
+    let is_stream = is_stream_request(&body);
+
+    let fwd_headers = match forward_headers(&in_headers, route, key.as_str(), is_stream) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, route = route_name, "构造上游 header 失败");
+            return deny(
+                route_name,
+                Some(&hash),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration_error",
+                "路由 header 配置非法",
+            );
+        }
+    };
+
+    let url = match build_upstream_url(
+        &route.base_url,
+        &path,
+        query.as_deref(),
+        &route.auth,
+        key.as_str(),
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(error = %e, route = route_name, "构造上游 URL 失败");
+            return deny(
+                route_name,
+                Some(&hash),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration_error",
+                "路由 URL 配置非法",
+            );
+        }
+    };
+
+    tracing::info!(
+        route = route_name,
+        %method,
+        %path,
+        is_stream,
+        bytes_in = body.len(),
+        "转发请求"
+    );
+
+    let client = match state.clients.for_route(route, is_stream) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, route = route_name, "路由代理 client 构建失败");
+            return deny(
+                route_name,
+                Some(&hash),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration_error",
+                "路由代理配置非法",
+            );
+        }
+    };
+
+    let forward = forward_with_retry(
+        &state,
+        &client,
+        route,
+        route_name,
+        method.clone(),
+        url,
+        fwd_headers,
+        body.clone(),
+        is_stream,
+        &rid,
+    )
+    .await;
+
+    let mut response = forward.response;
+    response.headers_mut().insert(
+        "x-keysink-request-id",
+        HeaderValue::from_str(&rid).unwrap_or(HeaderValue::from_static("0000")),
+    );
+
+    let mut entry = AuditEntry::new(
+        rid.clone(),
+        route_name,
+        vkey::fingerprint(&hash),
+        method.to_string(),
+        path,
+        body.len(),
+        is_stream,
+    );
+    entry.status = response.status().as_u16();
+    entry.ms = started.elapsed().as_millis() as u64;
+    entry.attempts = forward.attempts;
+    state.audit.record(entry);
+
+    response
+}
+
+/// Audit row for a rejected request: `route` `-` means no route matched;
+/// record the fingerprint (not invertible) when the token hash is available, `-` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn record_reject(
+    state: &AppState,
+    rid: &str,
+    route: &str,
+    hash: Option<&[u8; 32]>,
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+    started: Instant,
+) {
+    let mut entry = AuditEntry::new(
+        rid.to_string(),
+        route.to_string(),
+        hash.map(vkey::fingerprint).unwrap_or_else(|| "-".into()),
+        method.to_string(),
+        path.to_string(),
+        0,
+        false,
+    );
+    entry.status = status.as_u16();
+    entry.ms = started.elapsed().as_millis() as u64;
+    state.audit.record(entry);
+}
+
+struct Forwarded {
+    response: Response,
+    attempts: u8,
+}
+
+/// Whether a network-class error may be replayed: for connect errors the
+/// request certainly never arrived (zero side effects upstream); replaying
+/// idempotent methods has no side effects. In the remaining cases (timeout /
+/// disconnect mid-send) the upstream may have already processed and billed it.
+fn network_retry_allowed(is_connect: bool, idempotent_method: bool) -> bool {
+    is_connect || idempotent_method
+}
+
+/// Whether a to_bytes error is a length-limit breach: downcast along the
+/// source chain to http_body_util::LengthLimitError (axum wraps it in
+/// axum::Error), keeping the message match as a fallback in case axum's
+/// wording changes between versions.
+fn is_length_limit_error(e: &axum::Error) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = cur {
+        if err
+            .downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+            || err.to_string().contains("length limit")
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Bounded read that discards a retryable response body to give the
+/// connection back: past the limit it simply gives up (drop the connection,
+/// no reuse), preventing a misbehaving upstream from blowing up memory with a
+/// huge body.
+const DISCARD_BODY_LIMIT: usize = 64 * 1024;
+
+async fn discard_body_limited(mut resp: reqwest::Response) {
+    let mut remaining = DISCARD_BODY_LIMIT;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if chunk.len() >= remaining {
+            return;
+        }
+        remaining -= chunk.len();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_retry(
+    state: &AppState,
+    client: &reqwest::Client,
+    route: &Route,
+    route_name: &str,
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Bytes,
+    is_stream: bool,
+    rid: &str,
+) -> Forwarded {
+    let policy = state.retry.for_route(route);
+    let max_retries = policy.max_retries;
+    // POST replay safety (§4.2): on a response-header timeout or a network
+    // error mid-send, the request may already have reached the upstream and
+    // been billed, so a retry is a second POST. Only connect-class errors
+    // (request definitely not delivered, including connect timeout) or
+    // idempotent methods (GET/HEAD/OPTIONS) are retried; everything else
+    // fails immediately for the caller.
+    let idempotent = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+
+    for attempt in 0..=max_retries {
+        let req = client
+            .request(method.clone(), &url)
+            .headers(headers.clone());
+        let req = if body.is_empty() {
+            req
+        } else {
+            req.body(body.clone())
+        };
+
+        let send = tokio::time::timeout(policy.header_timeout, req.send()).await;
+
+        let resp = match send {
+            Err(_) => {
+                tracing::warn!(attempt, route = route_name, "等待上游响应头超时");
+                if idempotent && attempt < max_retries {
+                    tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
+                    continue;
+                }
+                return Forwarded {
+                    response: error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "upstream_timeout",
+                        "上游响应头超时",
+                        rid,
+                    ),
+                    attempts: attempt + 1,
+                };
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    attempt,
+                    route = route_name,
+                    timeout = e.is_timeout(),
+                    connect = e.is_connect(),
+                    "上游请求失败"
+                );
+                if network_retry_allowed(e.is_connect(), idempotent) && attempt < max_retries {
+                    tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
+                    continue;
+                }
+                return Forwarded {
+                    response: error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "上游不可达",
+                        rid,
+                    ),
+                    attempts: attempt + 1,
+                };
+            }
+            Ok(Ok(resp)) => resp,
+        };
+
+        let status = resp.status().as_u16();
+        if policy.is_retryable(status) && attempt < max_retries {
+            let retry_after = resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after);
+            tracing::warn!(attempt, status, route = route_name, "上游返回可重试状态");
+            discard_body_limited(resp).await;
+            tokio::time::sleep(policy.backoff(attempt as u32, retry_after)).await;
+            continue;
+        }
+
+        let response = if is_stream {
+            stream_response(resp, route.sse_terminator, rid.to_string()).await
+        } else {
+            pass_through_response(resp).await
+        };
+        return Forwarded {
+            response,
+            attempts: attempt + 1,
+        };
+    }
+
+    Forwarded {
+        response: error_response(
+            StatusCode::BAD_GATEWAY,
+            "internal_error",
+            "重试循环异常退出",
+            rid,
+        ),
+        attempts: max_retries + 1,
+    }
+}
+
+fn extract_vkey(headers: &HeaderMap) -> Option<String> {
+    for name in ["authorization", "x-api-key", "x-goog-api-key", "api-key"] {
+        let Some(value) = headers.get(name) else {
+            continue;
+        };
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        let text = text.trim();
+        let text = if name == "authorization" {
+            match text.get(..7) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &text[7..],
+                _ => text,
+            }
+        } else {
+            text
+        };
+        if text.starts_with(vkey::PREFIX) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
+    const HOP: &[&str] = &[
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    HOP.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+fn is_auth_header(name: &str) -> bool {
+    const AUTH: &[&str] = &[
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "api-key",
+        "anthropic-api-key",
+        "openai-api-key",
+    ];
+    AUTH.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+fn forward_headers(
+    src: &HeaderMap,
+    route: &Route,
+    upstream_key: &str,
+    is_stream: bool,
+) -> Result<HeaderMap> {
+    let mut out = HeaderMap::with_capacity(src.len() + 2);
+    for (name, value) in src.iter() {
+        let n = name.as_str();
+        if is_hop_by_hop(n) || is_auth_header(n) {
+            continue;
+        }
+        // Streaming responses need plain-text scanning for SSE terminators;
+        // once the upstream compresses according to the client-negotiated
+        // Accept-Encoding (zstd/gzip/br), the scan goes blind, falsely flags
+        // truncation, and then appends plain-text events to the tail of the
+        // compressed stream, corrupting it. The gateway does not decompress,
+        // so streaming requests declare no content encoding to the upstream in
+        // exchange for inspectable plain-text SSE.
+        if is_stream && n.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+
+    for (key, value) in &route.headers {
+        let name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| Error::msg(format!("非法 header 名 `{key}`: {e}")))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|e| Error::msg(format!("header `{key}` 的值非法: {e}")))?;
+        // Static headers are only filled in when the client didn't send them, to avoid overriding version/tracing headers the client negotiated itself.
+        out.entry(name).or_insert(value);
+    }
+
+    match &route.auth {
+        Auth::Bearer => {
+            out.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {upstream_key}"))
+                    .map_err(|e| Error::msg(format!("Bearer 值非法: {e}")))?,
+            );
+        }
+        Auth::XApiKey => {
+            out.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(upstream_key)
+                    .map_err(|e| Error::msg(format!("x-api-key 值非法: {e}")))?,
+            );
+        }
+        Auth::Header { name, prefix } => {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| Error::msg(format!("非法 auth header 名 `{name}`: {e}")))?;
+            out.insert(
+                header_name,
+                HeaderValue::from_str(&format!("{prefix}{upstream_key}"))
+                    .map_err(|e| Error::msg(format!("auth header 值非法: {e}")))?,
+            );
+        }
+        Auth::Basic { username } => {
+            let raw = format!("{username}:{upstream_key}");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+            out.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {encoded}"))
+                    .map_err(|e| Error::msg(format!("Basic 值非法: {e}")))?,
+            );
+        }
+        Auth::Query { .. } | Auth::None => {}
+    }
+
+    Ok(out)
+}
+
+fn build_upstream_url(
+    base_url: &str,
+    path: &str,
+    query: Option<&str>,
+    auth: &Auth,
+    upstream_key: &str,
+) -> Result<String> {
+    let base = base_url.trim_end_matches('/');
+    let path = if path.is_empty() {
+        "/"
+    } else if path.starts_with('/') {
+        path
+    } else {
+        return Err(Error::msg("入站 path 不以 / 开头"));
+    };
+
+    let mut url =
+        String::with_capacity(base.len() + path.len() + 64 + query.map_or(0, |q| q.len()));
+    url.push_str(base);
+    url.push_str(path);
+
+    let query_auth = match auth {
+        Auth::Query { param } => Some(param.as_str()),
+        _ => None,
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some(param) = query_auth {
+                let key = pair.split('=').next().unwrap_or("");
+                if key == param {
+                    continue;
+                }
+            }
+            parts.push(pair.to_string());
+        }
+    }
+    if let Some(param) = query_auth {
+        parts.push(format!(
+            "{param}={}",
+            crate::util::percent_encode(upstream_key)
+        ));
+    }
+
+    if !parts.is_empty() {
+        url.push('?');
+        url.push_str(&parts.join("&"));
+    }
+    Ok(url)
+}
+
+fn is_stream_request(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        stream: Option<bool>,
+    }
+    // Byte-level pre-filter first: a body not containing the `"stream"`
+    // substring cannot be stream:true, which avoids fully JSON-parsing a body
+    // of up to 32MB just to probe one field.
+    if memchr::memmem::find(body, b"\"stream\"").is_none() {
+        return false;
+    }
+    serde_json::from_slice::<Probe>(body)
+        .ok()
+        .and_then(|p| p.stream)
+        .unwrap_or(false)
+}
+
+fn convert_resp_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(src.len());
+    for (name, value) in src.iter() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
+/// Whether the response carries a content encoding (`identity` counts as
+/// unencoded). When encoded, the body is compressed bytes that cannot be
+/// scanned for SSE terminators as plain text, so it can only be passed through as-is.
+fn is_encoded(headers: &HeaderMap) -> bool {
+    match headers.get(header::CONTENT_ENCODING) {
+        None => false,
+        Some(value) => match value.to_str() {
+            Ok(v) => {
+                let v = v.trim();
+                !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+            }
+            Err(_) => true,
+        },
+    }
+}
+
+async fn pass_through_response(resp: reqwest::Response) -> Response {
+    let status = resp.status();
+    let headers = convert_resp_headers(resp.headers());
+    let stream = resp.bytes_stream().map(|res| match res {
+        Ok(chunk) => Ok::<Bytes, std::io::Error>(chunk),
+        Err(_) => {
+            tracing::warn!("读取上游响应 body 失败");
+            Err(std::io::Error::other("upstream body error"))
+        }
+    });
+    build_response(status, headers, Body::from_stream(stream))
+}
+
+async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: String) -> Response {
+    let status = resp.status();
+    let headers = convert_resp_headers(resp.headers());
+
+    let is_sse = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().starts_with("text/event-stream"))
+        .unwrap_or(false);
+
+    if !is_sse || terminator == Terminator::None {
+        return pass_through_response(resp).await;
+    }
+
+    // A content-encoded response is compressed bytes, so terminator scanning
+    // is guaranteed to miss; pass it through as-is — better to give up
+    // truncation detection than to append plain-text events to a compressed
+    // stream (that corrupts the frame tail and makes the client's decoder
+    // error out, e.g. Bun's ZstdDecompressionError).
+    if is_encoded(&headers) {
+        tracing::debug!(rid = %rid, "响应带内容编码，跳过 SSE 终止符检测");
+        return pass_through_response(resp).await;
+    }
+
+    let seen_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let seen_for_scan = seen_done.clone();
+    let errored_for_scan = errored.clone();
+    let rid_for_scan = rid.clone();
+    // carry keeps the tail of the previous chunk so a terminator marker split across a chunk boundary is not missed.
+    let carry = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let carry_for_scan = carry.clone();
+    let stream = resp.bytes_stream();
+    let mapped = stream.scan((), move |(), res| {
+        let seen = seen_for_scan.clone();
+        let errored = errored_for_scan.clone();
+        let rid = rid_for_scan.clone();
+        let carry = carry_for_scan.clone();
+        async move {
+            if errored.load(Ordering::Relaxed) {
+                return None;
+            }
+            match res {
+                Ok(chunk) => {
+                    if !seen.load(Ordering::Relaxed) {
+                        let mut carry = carry.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut window = Vec::with_capacity(carry.len() + chunk.len());
+                        window.extend_from_slice(&carry);
+                        window.extend_from_slice(&chunk);
+                        if contains_terminator(&window, terminator) {
+                            seen.store(true, Ordering::Relaxed);
+                        }
+                        let keep = window.len().min(64);
+                        carry.clear();
+                        carry.extend_from_slice(&window[window.len() - keep..]);
+                    }
+                    Some(Ok::<Bytes, std::io::Error>(chunk))
+                }
+                Err(_) => {
+                    tracing::warn!(rid = %rid, "上游 SSE 流中断");
+                    seen.store(true, Ordering::Relaxed);
+                    errored.store(true, Ordering::Relaxed);
+                    Some(Ok(sse_error_event("upstream stream error", terminator)))
+                }
+            }
+        }
+    });
+
+    let seen_for_tail = seen_done.clone();
+    let tail = stream::once(async move {
+        if seen_for_tail.load(Ordering::Relaxed) {
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        } else {
+            tracing::warn!(rid = %rid, "SSE 流提前结束且未见终止标记，视为截断");
+            Ok(sse_error_event(
+                "upstream stream ended prematurely",
+                terminator,
+            ))
+        }
+    });
+    build_response(status, headers, Body::from_stream(mapped.chain(tail)))
+}
+
+fn sse_error_event(message: &str, terminator: Terminator) -> Bytes {
+    // Inject an Anthropic-shaped error event into Anthropic streams; the others (OpenAI/auto/none) use the OpenAI shape.
+    if matches!(terminator, Terminator::Anthropic) {
+        let payload = json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": message }
+        });
+        Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    } else {
+        let payload = json!({ "error": { "type": "upstream_stream_error", "message": message } });
+        Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"))
+    }
+}
+
+fn contains_terminator(chunk: &[u8], terminator: Terminator) -> bool {
+    let openai = || find_memmem(chunk, b"data: [DONE]") || find_memmem_ci(chunk, b"data: [DONE]");
+    let anthropic = || {
+        find_memmem(chunk, b"event: message_stop")
+            || find_memmem(chunk, b"\"type\":\"message_stop\"")
+            || find_memmem_ci(chunk, b"event: message_stop")
+            || find_memmem_ci(chunk, b"\"type\":\"message_stop\"")
+    };
+    match terminator {
+        Terminator::Openai => openai(),
+        Terminator::Anthropic => anthropic(),
+        Terminator::Auto => openai() || anthropic(),
+        Terminator::None => false,
+    }
+}
+
+fn find_memmem(haystack: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(haystack, needle).is_some()
+}
+
+fn find_memmem_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn build_response(status: reqwest::StatusCode, headers: HeaderMap, body: Body) -> Response {
+    let mut out = Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    for (name, value) in headers.iter() {
+        out = out.header(name, value);
+    }
+    out.body(body).unwrap_or_else(|_| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "internal_error",
+            "构造响应失败",
+            "0000",
+        )
+    })
+}
+
+pub fn error_response(status: StatusCode, kind: &str, message: &str, rid: &str) -> Response {
+    let body = json!({
+        "error": {
+            "type": kind,
+            "message": message,
+            "request_id": rid,
+        }
+    })
+    .to_string();
+    let mut response = (status, [(header::CONTENT_TYPE, "application/json")], body).into_response();
+    if let Ok(value) = HeaderValue::from_str(rid) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-keysink-request-id"), value);
+    }
+    response
+}
+
+/// Whether to adopt a hot-reloaded new snapshot: never let .bak overwrite a
+/// "good" snapshot still being served (.bak lags one generation and would
+/// revive revoked/deleted vkeys). Adopt a backup only when there is no
+/// current snapshot, or the current snapshot itself came from .bak (old and
+/// new are both backups; swapping in the newer one is not a downgrade).
+fn adopt_snapshot(incoming_from_backup: bool, current_from_backup: Option<bool>) -> bool {
+    !incoming_from_backup || current_from_backup.is_none_or(|current| current)
+}
+
+/// Polls the store.age / master.key mtime+size and swaps in a whole new snapshot on change.
+pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
+    tokio::spawn(async move {
+        // Zeroed so the first round after startup always reloads once,
+        // covering the race where the CLI modified the store between serve
+        // finishing the initial store load and the watcher starting.
+        let mut last = (0u64, 0u64, 0u64);
+        let mut failures = 0u32;
+        let mut backup_warned = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let now = stamp(&paths);
+            if now == last {
+                continue;
+            }
+            match crate::store::unlock(&paths) {
+                Ok(unlocked) => match RouteTable::build(&unlocked.store) {
+                    Ok(table) => {
+                        let from_backup = unlocked.from_backup;
+                        if !adopt_snapshot(from_backup, Some(state.snapshot.load().from_backup)) {
+                            // .bak wants to overwrite a good in-memory snapshot: refuse the
+                            // downgrade. .bak lags one generation and would revive
+                            // revoked/deleted vkeys; memory still holds the latest good data.
+                            last = now;
+                            if !backup_warned {
+                                tracing::error!(
+                                    "主 store 解密失败，拒绝用过期 .bak 覆盖内存快照（继续服务最近的好数据），请尽快修复主 store"
+                                );
+                                backup_warned = true;
+                            }
+                            continue;
+                        }
+                        let routes = table.len();
+                        let live_urls: HashSet<String> = unlocked
+                            .store
+                            .routes
+                            .values()
+                            .filter_map(|r| r.proxy.clone())
+                            .filter(|p| p.as_str() != crate::model::PROXY_DIRECT)
+                            .collect();
+                        state.snapshot.store(Arc::new(Snapshot {
+                            store: Arc::new(unlocked.store),
+                            table,
+                            from_backup,
+                        }));
+                        state.clients.retain_urls(&live_urls);
+                        last = now;
+                        failures = 0;
+                        backup_warned = false;
+                        if from_backup {
+                            tracing::error!(
+                                "热加载回落到 .bak 备份（主 store 解密失败）：已吊销/删除的 vkey 可能重新生效，请尽快修复"
+                            );
+                        }
+                        tracing::info!(routes, from_backup, "store 已热加载");
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        if failures % 10 == 1 {
+                            tracing::warn!(error = %e, "热加载校验失败，保留旧快照");
+                        }
+                    }
+                },
+                Err(e) => {
+                    failures += 1;
+                    if failures % 10 == 1 {
+                        tracing::warn!(error = %e, "热加载解密失败，保留旧快照");
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn stamp(paths: &Paths) -> (u64, u64, u64) {
+    fn one(path: &std::path::Path) -> u64 {
+        let Ok(md) = std::fs::metadata(path) else {
+            return 0;
+        };
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Mix in the inode: atomic writes go through rename, which always
+        // changes the inode, so even with coarse filesystem mtime granularity
+        // (e.g. 1s) and identical sizes across two writes the change is not
+        // missed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            mtime ^ md.len().rotate_left(17) ^ md.ino().rotate_left(41)
+        }
+        #[cfg(not(unix))]
+        {
+            mtime ^ md.len().rotate_left(17)
+        }
+    }
+    (
+        one(&paths.store()),
+        one(&paths.master_key()),
+        one(&paths.store_bak()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Auth;
+    use std::collections::BTreeMap;
+
+    fn route(auth: Auth) -> Route {
+        Route::new(
+            vkey::generate(),
+            "https://api.example.com".into(),
+            "real-key-123".into(),
+            auth,
+            BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn extracts_vkey_case_insensitive_and_from_alt_headers() {
+        let token = vkey::generate();
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("BEARER {token}")).unwrap(),
+        );
+        assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()));
+
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+        assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()));
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-real"),
+        );
+        assert!(extract_vkey(&h).is_none());
+    }
+
+    #[test]
+    fn rejects_forbidden_static_headers() {
+        let mut r = route(Auth::Bearer);
+        r.headers.insert("host".into(), "evil".into());
+        assert!(r.validate("r").is_err());
+    }
+
+    #[test]
+    fn detects_stream_flag() {
+        assert!(is_stream_request(br#"{"stream":true}"#));
+        assert!(is_stream_request(br#"{"stream": true, "x": 1}"#));
+        assert!(!is_stream_request(br#"{"stream":false}"#));
+        assert!(!is_stream_request(br#"{"model":"x"}"#));
+        assert!(!is_stream_request(b"not json"));
+        assert!(!is_stream_request(b""));
+    }
+
+    #[test]
+    fn builds_url_with_path_and_query() {
+        let url = build_upstream_url(
+            "https://api.example.com/",
+            "/v1/messages",
+            Some("a=1&b=2"),
+            &Auth::Bearer,
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(url, "https://api.example.com/v1/messages?a=1&b=2");
+    }
+
+    #[test]
+    fn query_auth_replaces_existing_param() {
+        let url = build_upstream_url(
+            "https://generativelanguage.googleapis.com",
+            "/v1beta/models/x:generateContent",
+            Some("alt=sse&key=old"),
+            &Auth::Query {
+                param: "key".into(),
+            },
+            "a b&c",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?alt=sse&key=a%20b%26c"
+        );
+    }
+
+    #[test]
+    fn injects_bearer_and_strips_inbound_auth() {
+        let mut src = HeaderMap::new();
+        src.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ks_xxx"),
+        );
+        src.insert("x-api-key", HeaderValue::from_static("ks_xxx"));
+        src.insert("x-custom", HeaderValue::from_static("ok"));
+        let out = forward_headers(&src, &route(Auth::Bearer), "real-secret", false).unwrap();
+        assert_eq!(
+            out.get(header::AUTHORIZATION).unwrap(),
+            "Bearer real-secret"
+        );
+        assert!(out.get("x-api-key").is_none());
+        assert_eq!(out.get("x-custom").unwrap(), "ok");
+    }
+
+    #[test]
+    fn injects_x_api_key_and_static_headers() {
+        let mut r = route(Auth::XApiKey);
+        r.headers
+            .insert("anthropic-version".into(), "2023-06-01".into());
+        let out = forward_headers(&HeaderMap::new(), &r, "real", false).unwrap();
+        assert_eq!(out.get("x-api-key").unwrap(), "real");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+    }
+
+    #[test]
+    fn strips_accept_encoding_only_for_streaming_requests() {
+        let mut src = HeaderMap::new();
+        src.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        let r = route(Auth::Bearer);
+
+        let streamed = forward_headers(&src, &r, "k", true).unwrap();
+        assert!(streamed.get(header::ACCEPT_ENCODING).is_none());
+
+        let plain = forward_headers(&src, &r, "k", false).unwrap();
+        assert_eq!(
+            plain.get(header::ACCEPT_ENCODING).unwrap(),
+            "gzip, deflate, br, zstd"
+        );
+    }
+
+    #[test]
+    fn detects_content_encoding_but_not_identity() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_encoded(&headers));
+
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        assert!(!is_encoded(&headers));
+
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        assert!(is_encoded(&headers));
+
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        assert!(is_encoded(&headers));
+    }
+
+    #[test]
+    fn basic_auth_encodes_pair() {
+        let out = forward_headers(
+            &HeaderMap::new(),
+            &route(Auth::Basic {
+                username: "user".into(),
+            }),
+            "pass",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out.get(header::AUTHORIZATION).unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
+    }
+
+    #[test]
+    fn detects_sse_terminators() {
+        assert!(contains_terminator(b"data: [DONE]\n\n", Terminator::Auto));
+        assert!(contains_terminator(
+            b"event: message_stop\ndata: {}\n\n",
+            Terminator::Auto
+        ));
+        assert!(!contains_terminator(
+            b"data: {\"i\":0}\n\n",
+            Terminator::Auto
+        ));
+        assert!(contains_terminator(b"DATA: [done]\n\n", Terminator::Openai));
+        assert!(!contains_terminator(
+            b"data: [DONE]\n\n",
+            Terminator::Anthropic
+        ));
+        assert!(!contains_terminator(b"data: [DONE]\n\n", Terminator::None));
+    }
+
+    #[test]
+    fn rid_grows_past_four_digits() {
+        assert_eq!(rid_from(0), "0000");
+        assert_eq!(rid_from(1), "0001");
+        assert_eq!(rid_from(1679615), "ZZZZ");
+        assert_eq!(rid_from(1679616), "10000");
+        assert_eq!(rid_from(u64::MAX).len(), 13);
+    }
+
+    #[test]
+    fn sse_error_event_matches_protocol() {
+        let anthropic = sse_error_event("boom", Terminator::Anthropic);
+        let text = std::str::from_utf8(&anthropic).unwrap();
+        assert!(text.starts_with("event: error\n"));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(!text.contains("[DONE]"));
+
+        let openai = sse_error_event("boom", Terminator::Openai);
+        let text = std::str::from_utf8(&openai).unwrap();
+        assert!(text.starts_with("data: {"));
+        assert!(text.ends_with("data: [DONE]\n\n"));
+
+        let auto = sse_error_event("boom", Terminator::Auto);
+        assert_eq!(auto, openai);
+    }
+
+    #[test]
+    fn proxy_clients_follow_route_config() {
+        let clients = ProxyClients::new().unwrap();
+        let mut r = route(Auth::Bearer);
+
+        r.proxy = None;
+        assert!(clients.for_route(&r, false).is_ok());
+        assert!(clients.for_route(&r, true).is_ok());
+        r.proxy = Some("direct".into());
+        assert!(clients.for_route(&r, false).is_ok());
+        r.proxy = Some("http://127.0.0.1:7890".into());
+        assert!(clients.for_route(&r, true).is_ok());
+        assert!(clients.for_route(&r, false).is_ok()); // cache-hit path
+
+        r.proxy = Some("http://".into()); // valid scheme but empty host in the URL
+        assert!(clients.for_route(&r, false).is_err());
+    }
+
+    #[test]
+    fn retain_urls_evicts_stale_proxy_clients() {
+        let clients = ProxyClients::new().unwrap();
+        let mut r = route(Auth::Bearer);
+        r.proxy = Some("http://127.0.0.1:7890".into());
+        assert!(clients.for_route(&r, false).is_ok());
+
+        let mut live = HashSet::new();
+        clients.retain_urls(&live);
+        assert!(clients.for_route(&r, false).is_ok()); // rebuilt (i.e. it had been evicted)
+
+        live.insert("http://127.0.0.1:7890".into());
+        clients.for_route(&r, false).unwrap();
+        clients.retain_urls(&live);
+        clients.for_route(&r, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn classifies_length_limit_by_type_not_string_only() {
+        // LengthLimitError is #[non_exhaustive] and cannot be constructed
+        // directly in tests; take the real path: when to_bytes exceeds the
+        // limit, it is in the axum::Error source chain.
+        let e = axum::body::to_bytes(axum::body::Body::from("hello"), 2)
+            .await
+            .unwrap_err();
+        assert!(is_length_limit_error(&e));
+        let other = axum::Error::new(std::io::Error::other("boom"));
+        assert!(!is_length_limit_error(&other));
+    }
+
+    #[test]
+    fn watcher_never_downgrades_good_snapshot_to_backup() {
+        // new snapshot is the main store → adopt unconditionally
+        assert!(adopt_snapshot(false, Some(false)));
+        // .bak wants to overwrite a good snapshot still being served → refuse
+        assert!(!adopt_snapshot(true, Some(false)));
+        // no current snapshot (startup path) → adopt
+        assert!(adopt_snapshot(true, None));
+        // the current snapshot itself is from .bak → a peer replacement is not a downgrade
+        assert!(adopt_snapshot(true, Some(true)));
+    }
+
+    #[test]
+    fn network_errors_retry_only_when_replay_safe() {
+        // connect-class error: request definitely not delivered → replayable
+        assert!(network_retry_allowed(true, false));
+        // idempotent method: any network error is replayable
+        assert!(network_retry_allowed(false, true));
+        // POST + non-connect error (timeout/disconnect): upstream may have billed → not replayable
+        assert!(!network_retry_allowed(false, false));
+    }
+}

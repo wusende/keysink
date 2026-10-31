@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# End-to-end smoke test: real binary + local fake upstream. Run cargo build first.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${KEYSINK_BIN:-$ROOT/target/debug/keysink}"
+UP_PORT="${UP_PORT:-19090}"
+GW_PORT="${GW_PORT:-18787}"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/keysink-smoke.XXXXXX")"
+VAULT="$TMP/vault"
+
+if [[ ! -x "$BIN" ]]; then
+  echo "找不到 $BIN，先 cargo build" >&2
+  exit 1
+fi
+
+GATEWAY_PID=""
+cleanup() {
+  if [[ -n "$GATEWAY_PID" ]]; then kill "$GATEWAY_PID" 2>/dev/null || true; fi
+  kill "$UP_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+wait_health() {
+  for _ in $(seq 1 50); do
+    if curl -sf "http://127.0.0.1:$GW_PORT/__keysink/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "网关未启动" >&2
+  cat "$TMP/gw.log" >&2 || true
+  return 1
+}
+
+ks() { "$BIN" --home "$VAULT" "$@"; }
+# route add/rotate prints the vkey only once, so the smoke test grabs it from stdout.
+new_vkey() { sed -n 's/^vkey: //p'; }
+
+python3 "$ROOT/scripts/fake_upstream.py" "$UP_PORT" >"$TMP/up.log" 2>&1 &
+UP_PID=$!
+sleep 0.3
+
+echo "== init vault =="
+printf 'test-pass\n' | ks init --password-stdin >/dev/null
+VKEY="$(printf 'real-key-123\n' | ks route add echo --base-url "http://127.0.0.1:$UP_PORT" \
+  --auth bearer --header 'x-static: from-keysink' | new_vkey)"
+# stat permission output differs between GNU and BSD; use python3 (which smoke
+# already depends on) for a portable check
+python3 -c 'import os,sys; sys.exit(0 if oct(os.stat(sys.argv[1]).st_mode)[-3:]=="600" else 1)' \
+  "$VAULT/vault.key"
+
+echo "== export needs master password =="
+if ks export --output "$TMP/e1.age" --password-stdin <<< '' >/dev/null 2>&1; then
+  echo "export 在空密码下仍然成功" >&2
+  exit 1
+fi
+if ks export --output "$TMP/e2.age" --password-stdin <<< 'wrong' >/dev/null 2>&1; then
+  echo "export 在错误密码下仍然成功" >&2
+  exit 1
+fi
+
+"$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" >"$TMP/gw.log" 2>&1 &
+GATEWAY_PID=$!
+wait_health
+
+echo "== echo passthrough =="
+RESP="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/echo?x=1&y=2" \
+  -H "Authorization: Bearer $VKEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"stream":false,"hello":"world"}')"
+echo "$RESP" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("path:", d["path"])
+print("auth:", d["headers"].get("authorization"))
+print("static:", d["headers"].get("x-static"))
+print("body:", d["body"])
+assert d["path"]=="/echo?x=1&y=2", d["path"]
+assert d["headers"].get("authorization")=="Bearer real-key-123"
+assert d["headers"].get("x-static")=="from-keysink"
+assert "ks_" not in json.dumps(d), "vkey leaked upstream"
+'
+
+echo "== invalid vkey =="
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GW_PORT/echo" -H 'Authorization: Bearer ks_invalid')"
+test "$CODE" = "401"
+
+echo "== sse =="
+SSE="$(curl -sS -N -X POST "http://127.0.0.1:$GW_PORT/sse" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{"stream":true}')"
+echo "$SSE" | grep -q 'data: \[DONE\]'
+echo "$SSE" | grep -q '"i":2'
+
+echo "== retry 429 =="
+RETRY="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/retry" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{"stream":false}')"
+echo "$RETRY" | grep -q '"retry_count": 2'
+
+echo "== sse terminator split across chunks =="
+SPLIT="$(curl -sS -N -X POST "http://127.0.0.1:$GW_PORT/sse_split" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{"stream":true}')"
+echo "$SPLIT" | grep -q 'data: \[DONE\]'
+if echo "$SPLIT" | grep -q 'ended prematurely'; then
+  echo "跨 chunk 终止标记误判为截断" >&2
+  exit 1
+fi
+
+echo "== truncated sse =="
+TRUNC="$(curl -sS -N -X POST "http://127.0.0.1:$GW_PORT/truncate" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{"stream":true}')"
+echo "$TRUNC" | grep -q 'upstream stream ended prematurely'
+
+echo "== client abort mid-sse leaves gateway alive =="
+# Client disconnects mid-stream (curl killed by timeout); the gateway must survive (SIGPIPE regression case)
+curl -sS -N --max-time 0.08 -X POST "http://127.0.0.1:$GW_PORT/sse" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' \
+  -d '{"stream":true}' >/dev/null 2>&1 || true
+sleep 0.5
+curl -sf "http://127.0.0.1:$GW_PORT/__keysink/health" >/dev/null || {
+  echo "客户端断开后网关失联（疑似 SIGPIPE）" >&2
+  exit 1
+}
+
+echo "== route update keeps vkey =="
+ks route update echo --note updated >/dev/null
+# No grep -q: it exits on first match while keysink (SIGPIPE fatal by default)
+# may still have pending output; under pipefail the whole pipeline then dies
+# with 141 spuriously. grep without -q reads its input to EOF — deterministic.
+ks route show echo | grep 'updated' >/dev/null
+# The vkey cannot be read back, so verify directly that the old vkey still works
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/echo" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{}')"
+test "$CODE" = "200"
+ks route update echo --clear-headers >/dev/null
+ks route show echo | grep 'x-static' >/dev/null && { echo "--clear-headers 未生效" >&2; exit 1; }
+ks route update echo --header 'x-static: from-keysink' >/dev/null
+
+echo "== hot reload (route add) =="
+HOTOUT="$(printf 'real-key-123\n' | ks route add echo2 --base-url "http://127.0.0.1:$UP_PORT" --auth x-api-key)"
+VKEY2="$(echo "$HOTOUT" | new_vkey)"
+# Gateway already running: route add must report the actual listen address (gateway.addr runtime file)
+# ${GW_PORT} is delimited explicitly: old bash (macOS 3.2) would parse a
+# directly following fullwidth character into the variable name
+echo "$HOTOUT" | grep -q "网关: http://127.0.0.1:${GW_PORT}（运行中）" || {
+  echo "route add 未报告运行中的监听地址: $HOTOUT" >&2
+  exit 1
+}
+sleep 1.5
+RESP2="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/echo2" -H "x-api-key: $VKEY2" \
+  -H 'Content-Type: application/json' -d '{}')"
+echo "$RESP2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["headers"].get("x-api-key")=="real-key-123", d["headers"].get("x-api-key")
+assert "authorization" not in d["headers"]
+'
+
+echo "== route-only key + export strips key values =="
+VKEY3="$(printf 'inline-key-xyz\n' | ks route add inline-route \
+  --base-url "http://127.0.0.1:$UP_PORT" --route-key --auth bearer | new_vkey)"
+sleep 1.5
+ks route show inline-route | grep 'route-only' >/dev/null
+RESP3="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/inline" -H "Authorization: Bearer $VKEY3" \
+  -H 'Content-Type: application/json' -d '{}')"
+echo "$RESP3" | grep -q 'Bearer inline-key-xyz'
+ks export --output "$TMP/vault-export.age" --password-stdin <<< 'test-pass' >/dev/null
+if grep -q 'inline-key-xyz\|real-key-123' "$TMP/vault-export.age"; then
+  echo "导出文件包含 key 值" >&2
+  exit 1
+fi
+
+echo "== rekey while running =="
+ks rekey --yes >/dev/null
+sleep 1.5
+RESP3="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/echo" -H "Authorization: Bearer $VKEY" \
+  -H 'Content-Type: application/json' -d '{}')"
+echo "$RESP3" | grep -q 'real-key-123'
+
+echo "== audit default off =="
+test ! -e "$VAULT/audit.jsonl"
+
+echo "== audit opt-in =="
+kill "$GATEWAY_PID" 2>/dev/null || true
+wait "$GATEWAY_PID" 2>/dev/null || true
+"$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" --audit-log "$TMP/audit.jsonl" >"$TMP/gw2.log" 2>&1 &
+GATEWAY_PID=$!
+wait_health
+curl -sS -o /dev/null -X POST "http://127.0.0.1:$GW_PORT/echo" -H "Authorization: Bearer $VKEY" \
+  -H 'Content-Type: application/json' -d '{}'
+curl -sS -o /dev/null "http://127.0.0.1:$GW_PORT/echo" \
+  -H 'Authorization: Bearer ks_rejected000000000000000000000000000000000000000'
+grep -q '"route":"echo"' "$TMP/audit.jsonl"
+grep -q '"route":"-"' "$TMP/audit.jsonl"
+grep -q '"status":401' "$TMP/audit.jsonl"
+if grep -q 'real-key-123\|ks_' "$TMP/audit.jsonl"; then
+  echo "审计日志泄漏了 secret 或 vkey" >&2
+  exit 1
+fi
+
+echo "== per-route proxy overrides =="
+# Route pinned to a dead proxy: must be 502 even though the upstream is reachable (per-route takes precedence)
+ks route update echo --proxy http://127.0.0.1:1 >/dev/null
+sleep 1.5
+CODE="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/echo" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{}')"
+test "$CODE" = "502"
+ks route update echo --clear-proxy >/dev/null
+sleep 1.5
+CODE="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/echo" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{}')"
+test "$CODE" = "200"
+
+echo "== system proxy fallback vs route direct =="
+kill "$GATEWAY_PID" 2>/dev/null || true
+wait "$GATEWAY_PID" 2>/dev/null || true
+VKEYD="$(printf 'real-key-123\n' | ks route add direct-route --base-url "http://127.0.0.1:$UP_PORT" \
+  --auth bearer --proxy direct | new_vkey)"
+# Gateway running with a dead system proxy: routes without proxy fall back to the system proxy → 502; direct routes bypass it → 200
+ALL_PROXY=http://127.0.0.1:1 "$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" >"$TMP/gw3.log" 2>&1 &
+GATEWAY_PID=$!
+wait_health
+CODE="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/echo" \
+  -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{}')"
+test "$CODE" = "502"
+CODE="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/direct" \
+  -H "Authorization: Bearer $VKEYD" -H 'Content-Type: application/json' -d '{}')"
+test "$CODE" = "200"
+kill "$GATEWAY_PID" 2>/dev/null || true
+wait "$GATEWAY_PID" 2>/dev/null || true
+GATEWAY_PID=""
+
+echo "== doctor =="
+ks doctor >/dev/null
+
+echo "ALL SMOKE TESTS PASSED"
