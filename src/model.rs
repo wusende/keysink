@@ -36,7 +36,7 @@ impl Store {
     pub fn validate(&self) -> Result<()> {
         if self.version != STORE_VERSION {
             return Err(Error::msg(format!(
-                "store 版本 {} 不受支持（当前支持 {}）",
+                "store version {} is not supported (supported version: {})",
                 self.version, STORE_VERSION
             )));
         }
@@ -48,16 +48,20 @@ impl Store {
             match &route.inline_key {
                 Some(value) if !value.is_empty() => {}
                 Some(_) => {
-                    return Err(Error::msg(format!("route `{name}` 的 route-only key 为空")));
+                    return Err(Error::msg(format!(
+                        "route `{name}` has an empty route-only key"
+                    )));
                 }
                 None => {
                     return Err(Error::msg(format!(
-                        "route `{name}` 缺少 key（用 route update --route-key 重新输入）"
+                        "route `{name}` is missing its key (use route update --route-key to re-enter it)"
                     )));
                 }
             }
             if !vkeys.insert(route.vkey.clone()) {
-                return Err(Error::msg(format!("route `{name}` 的 vkey 与其他路由重复")));
+                return Err(Error::msg(format!(
+                    "route `{name}` has a vkey that duplicates another route"
+                )));
             }
         }
 
@@ -136,22 +140,22 @@ impl Route {
         // while serve refused to start, and the two sides' errors didn't line up.
         if !crate::vkey::is_well_formed(&self.vkey) {
             return Err(Error::msg(format!(
-                "route `{name}` 的 vkey 格式非法（应为 ks_ + 43 字符 base64url）"
+                "route `{name}` has an invalid vkey (expected ks_ + 43 chars of base64url)"
             )));
         }
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
             return Err(Error::msg(format!(
-                "route `{name}` 的 base_url 必须以 http:// 或 https:// 开头"
+                "route `{name}` base_url must start with http:// or https://"
             )));
         }
         if self.base_url.ends_with('/') {
             return Err(Error::msg(format!(
-                "route `{name}` 的 base_url 不能以 / 结尾"
+                "route `{name}` base_url must not end with /"
             )));
         }
         if self.base_url.contains('?') || self.base_url.contains('#') {
             return Err(Error::msg(format!(
-                "route `{name}` 的 base_url 不能包含 query 或 fragment"
+                "route `{name}` base_url must not contain a query or fragment"
             )));
         }
         match &self.auth {
@@ -161,26 +165,32 @@ impl Route {
                 prefix,
             } => {
                 if header.is_empty() {
-                    return Err(Error::msg(format!("route `{name}` 的 auth header 名为空")));
+                    return Err(Error::msg(format!(
+                        "route `{name}` has an empty auth header name"
+                    )));
                 }
                 if !header
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
                 {
                     return Err(Error::msg(format!(
-                        "route `{name}` 的 auth header 名包含非法字符"
+                        "route `{name}` auth header name contains invalid characters"
                     )));
                 }
                 let _ = prefix;
             }
             Auth::Basic { username } => {
                 if username.is_empty() {
-                    return Err(Error::msg(format!("route `{name}` 的 basic 用户名为空")));
+                    return Err(Error::msg(format!(
+                        "route `{name}` has an empty basic username"
+                    )));
                 }
             }
             Auth::Query { param } => {
                 if param.is_empty() {
-                    return Err(Error::msg(format!("route `{name}` 的 query 参数名为空")));
+                    return Err(Error::msg(format!(
+                        "route `{name}` has an empty query parameter name"
+                    )));
                 }
                 // &, =, or spaces would build a broken URL or inject extra parameters.
                 if !param
@@ -188,26 +198,28 @@ impl Route {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
                 {
                     return Err(Error::msg(format!(
-                        "route `{name}` 的 query 参数名包含非法字符（只允许字母、数字、-、_、.）"
+                        "route `{name}` query parameter name contains invalid characters (only letters, digits, -, _, . are allowed)"
                     )));
                 }
             }
         }
         for key in self.headers.keys() {
             if key.is_empty() {
-                return Err(Error::msg(format!("route `{name}` 有空 header 名")));
+                return Err(Error::msg(format!(
+                    "route `{name}` has an empty header name"
+                )));
             }
             if !key
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
             {
                 return Err(Error::msg(format!(
-                    "route `{name}` 的 header `{key}` 名包含非法字符"
+                    "route `{name}` header `{key}` name contains invalid characters"
                 )));
             }
             if is_forbidden_static_header(key) {
                 return Err(Error::msg(format!(
-                    "route `{name}` 不允许用静态 header 覆盖 `{key}`"
+                    "route `{name}` must not override `{key}` with a static header"
                 )));
             }
         }
@@ -215,7 +227,7 @@ impl Route {
             && retries > 10
         {
             return Err(Error::msg(format!(
-                "route `{name}` 的 max_retries 不能超过 10"
+                "route `{name}` max_retries must not exceed 10"
             )));
         }
         if let Some(proxy) = &self.proxy
@@ -223,7 +235,7 @@ impl Route {
             && !(proxy.starts_with("http://") || proxy.starts_with("https://"))
         {
             return Err(Error::msg(format!(
-                "route `{name}` 的 proxy 只支持 http(s):// URL 或 `direct`（缺省跟随系统代理）"
+                "route `{name}` proxy only supports an http(s):// URL or `direct` (default follows the system proxy)"
             )));
         }
         Ok(())
@@ -287,7 +299,7 @@ impl Terminator {
             "anthropic" => Ok(Self::Anthropic),
             "none" => Ok(Self::None),
             other => Err(Error::msg(format!(
-                "未知的 sse-terminator `{other}`（可选 auto/openai/anthropic/none）"
+                "unknown sse-terminator `{other}` (options: auto/openai/anthropic/none)"
             ))),
         }
     }
@@ -327,14 +339,16 @@ fn is_forbidden_static_header(name: &str) -> bool {
 
 pub fn validate_name(name: &str, what: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
-        return Err(Error::msg(format!("{what} 名长度必须在 1..=64 之间")));
+        return Err(Error::msg(format!(
+            "{what} name length must be within 1..=64"
+        )));
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         return Err(Error::msg(format!(
-            "{what} 名 `{name}` 只能包含字母、数字、-、_、."
+            "{what} name `{name}` may only contain letters, digits, -, _, ."
         )));
     }
     Ok(())
@@ -399,7 +413,7 @@ mod tests {
         for bad in ["a=b", "a&b", "a b", "a/b"] {
             let mut s = sample();
             s.routes.get_mut("r").unwrap().auth = Auth::Query { param: bad.into() };
-            assert!(s.validate().is_err(), "param `{bad}` 应被拒绝");
+            assert!(s.validate().is_err(), "param `{bad}` should be rejected");
         }
         let mut s = sample();
         s.routes.get_mut("r").unwrap().auth = Auth::Query {
@@ -423,7 +437,7 @@ mod tests {
         }
         for bad in ["127.0.0.1:7890", "socks5://127.0.0.1:7890", ""] {
             s.routes.get_mut("r").unwrap().proxy = Some(bad.into());
-            assert!(s.validate().is_err(), "proxy `{bad}` 应被拒绝");
+            assert!(s.validate().is_err(), "proxy `{bad}` should be rejected");
         }
     }
 }

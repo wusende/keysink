@@ -23,12 +23,12 @@ impl Error {
 
 impl From<age::EncryptError> for Error {
     fn from(e: age::EncryptError) -> Self {
-        Self::Age(format!("加密失败: {e}"))
+        Self::Age(format!("encryption failed: {e}"))
     }
 }
 
 impl From<age::DecryptError> for Error {
     fn from(e: age::DecryptError) -> Self {
-        Self::Age(format!("解密失败: {e}"))
+        Self::Age(format!("decryption failed: {e}"))
     }
 }

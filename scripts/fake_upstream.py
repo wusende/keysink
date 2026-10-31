@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""keysink 冒烟测试用的假上游：回显请求、SSE、429 重试、截断流。"""
+"""Fake upstream for keysink smoke tests: echoes requests, SSE, 429 retry, truncated streams."""
 import json
 import sys
 import time

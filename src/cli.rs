@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 #[command(
     name = "keysink",
     version,
-    about = "本地凭证网关：agent 只认 vkey，上游 key 只进不出（不可读取/导出）",
+    about = "Local credential gateway: agents see only vkeys; upstream keys go in, never out (cannot be read/exported)",
     long_about = None
 )]
 pub struct Cli {
@@ -166,15 +166,17 @@ fn data_home_fallback(_home: Option<&std::ffi::OsStr>) -> PathBuf {
 fn cmd_init(paths: &Paths, force: bool, password_stdin: bool) -> Result<()> {
     let password = crate::password::read_new_password(password_stdin)?;
     store::init(paths, force, &password)?;
-    println!("vault 初始化完成: {}", paths.home.display());
+    println!("vault initialized: {}", paths.home.display());
     println!("  {}  0600", paths.master_key().display());
     println!("  {}  0600", paths.store().display());
     println!();
-    println!("master password 只用于 `export` 备份的加密与恢复；写入/轮换/serve 都不需要它。");
-    println!("下一步：");
+    println!(
+        "master password is only used to encrypt and restore `export` backups; writes/rotation/serve never need it."
+    );
+    println!("Next steps:");
     println!("  keysink route add claude --base-url https://api.anthropic.com");
     println!(
-        "  # 终端里引导输入 key（隐藏回显）；脚本里：printf %s \"$KEY\" | keysink route add ..."
+        "  # in a terminal the key is prompted (hidden echo); in scripts: printf %s \"$KEY\" | keysink route add ..."
     );
     println!("  keysink serve");
     Ok(())
@@ -345,16 +347,16 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
     match cmd {
         RouteCmd::Add(args) => {
             let name =
-                resolve_required(args.name.clone(), "Route 名称（例：claude）", "route 名称")?;
+                resolve_required(args.name.clone(), "Route name (e.g. claude)", "route name")?;
             validate_name(&name, "route")?;
             let base_url = resolve_required(
                 args.base_url.clone(),
-                "上游 base URL（例：https://api.anthropic.com）",
+                "Upstream base URL (e.g. https://api.anthropic.com)",
                 "--base-url",
             )?;
             let base_url = base_url.trim_end_matches('/').to_string();
             if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-                return Err(Error::msg("base_url 必须以 http:// 或 https:// 开头"));
+                return Err(Error::msg("base_url must start with http:// or https://"));
             }
             let auth = resolve_auth(&args)?;
             let proxy = guide_proxy(args.proxy.clone())?;
@@ -370,7 +372,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             let key_value = read_key_value(given_key)?;
             store::update(paths, |store| {
                 if store.routes.contains_key(&name) {
-                    return Err(Error::msg(format!("route `{name}` 已存在")));
+                    return Err(Error::msg(format!("route `{name}` already exists")));
                 }
                 let mut route = Route::new(
                     token.clone(),
@@ -389,20 +391,22 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 store.routes.insert(name.clone(), route);
                 Ok(())
             })?;
-            println!("route `{name}` 已创建（key 只进不出：不可读取/导出）");
+            println!("route `{name}` created (key goes in, never out: cannot be read/exported)");
             println!("auth: {}    base_url: {}", auth_out.describe(), base_url);
             println!("vkey: {token_out}");
-            println!("（vkey 只显示这一次；丢失后只能 `keysink route rotate {name}` 换新）");
+            println!(
+                "(vkey is shown only this once; if lost, only `keysink route rotate {name}` can issue a new one)"
+            );
             let (gw, alive) = current_gateway(paths);
             println!(
-                "网关: http://{gw}（{}）",
+                "gateway: http://{gw} ({})",
                 if alive {
-                    "运行中"
+                    "running"
                 } else {
-                    "未响应——确认 serve 已启动"
+                    "not responding — make sure serve is running"
                 }
             );
-            println!("agent 侧配置（OpenAI 兼容客户端的 base_url 通常带 /v1）：");
+            println!("agent-side config (OpenAI-compatible clients usually need /v1 in base_url):");
             println!("  BASE_URL=http://{gw}");
             println!("  TOKEN={token_out}");
             Ok(())
@@ -410,7 +414,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
         RouteCmd::Ls => {
             let unlocked = store::unlock(paths)?;
             if unlocked.store.routes.is_empty() {
-                println!("（空）");
+                println!("(empty)");
                 return Ok(());
             }
             println!(
@@ -436,7 +440,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 .store
                 .routes
                 .get(&name)
-                .ok_or_else(|| Error::msg(format!("route `{name}` 不存在")))?;
+                .ok_or_else(|| Error::msg(format!("route `{name}` does not exist")))?;
             println!("name:        {name}");
             println!("enabled:     {}", route.enabled);
             println!("base_url:    {}", route.base_url);
@@ -447,7 +451,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             println!(
                 "proxy:       {}",
                 match route.proxy.as_deref() {
-                    None => "（跟随系统代理环境变量）",
+                    None => "(follows system proxy environment variables)",
                     Some(p) => p,
                 }
             );
@@ -487,13 +491,13 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 let route = store
                     .routes
                     .get_mut(&name)
-                    .ok_or_else(|| Error::msg(format!("route `{name}` 不存在")))?;
+                    .ok_or_else(|| Error::msg(format!("route `{name}` does not exist")))?;
                 route.vkey = token.clone();
                 Ok(())
             })?;
-            println!("route `{name}` 已轮换，旧 vkey 立即失效");
+            println!("route `{name}` rotated; the old vkey is invalid immediately");
             println!("vkey: {token_out}");
-            println!("（把 agent 配置里的 vkey 更新为新值）");
+            println!("(update the vkey in the agent config to the new value)");
             Ok(())
         }
         RouteCmd::Update(args) => {
@@ -504,7 +508,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             if let Some(base) = &new_base
                 && !(base.starts_with("http://") || base.starts_with("https://"))
             {
-                return Err(Error::msg("base_url 必须以 http:// 或 https:// 开头"));
+                return Err(Error::msg("base_url must start with http:// or https://"));
             }
             let new_auth = match args.auth {
                 Some(kind) => Some(build_auth_from(
@@ -522,7 +526,9 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 None => None,
             };
             if args.clear_proxy && args.proxy.is_some() {
-                return Err(Error::msg("--proxy 与 --clear-proxy 互斥"));
+                return Err(Error::msg(
+                    "--proxy and --clear-proxy are mutually exclusive",
+                ));
             }
             let new_inline_key = if args.route_key.is_some() {
                 let given = match &args.route_key {
@@ -536,14 +542,14 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             if args.clear_retry && (args.max_retries.is_some() || !args.retry_on_status.is_empty())
             {
                 return Err(Error::msg(
-                    "--clear-retry 与 --max-retries / --retry-on-status 互斥",
+                    "--clear-retry and --max-retries / --retry-on-status are mutually exclusive",
                 ));
             }
             store::update(paths, |store| {
                 let route = store
                     .routes
                     .get_mut(&args.name)
-                    .ok_or_else(|| Error::msg(format!("route `{}` 不存在", args.name)))?;
+                    .ok_or_else(|| Error::msg(format!("route `{}` does not exist", args.name)))?;
                 if let Some(base) = &new_base {
                     route.base_url = base.clone();
                 }
@@ -582,7 +588,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 }
                 Ok(())
             })?;
-            println!("route `{}` 已更新（vkey 不变）", args.name);
+            println!("route `{}` updated (vkey unchanged)", args.name);
             Ok(())
         }
         RouteCmd::Rm { name } => {
@@ -590,10 +596,10 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                 store
                     .routes
                     .remove(&name)
-                    .ok_or_else(|| Error::msg(format!("route `{name}` 不存在")))?;
+                    .ok_or_else(|| Error::msg(format!("route `{name}` does not exist")))?;
                 Ok(())
             })?;
-            println!("route `{name}` 已删除");
+            println!("route `{name}` deleted");
             Ok(())
         }
         RouteCmd::Enable { name } => set_route_enabled(paths, &name, true),
@@ -606,11 +612,14 @@ fn set_route_enabled(paths: &Paths, name: &str, enable: bool) -> Result<()> {
         let route = store
             .routes
             .get_mut(name)
-            .ok_or_else(|| Error::msg(format!("route `{name}` 不存在")))?;
+            .ok_or_else(|| Error::msg(format!("route `{name}` does not exist")))?;
         route.enabled = enable;
         Ok(())
     })?;
-    println!("route `{name}` 已{}", if enable { "启用" } else { "禁用" });
+    println!(
+        "route `{name}` {}",
+        if enable { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 
@@ -657,7 +666,7 @@ fn resolve_auth(args: &RouteAddArgs) -> Result<Auth> {
 /// TTY prompt phrased to the user's mental model: "what interface is the upstream".
 fn guide_auth_prompt() -> Result<AuthChoice> {
     let choice = prompt_line(
-        "上游接口 [1]OpenAI 兼容(含responses,默认) [2]Claude/Anthropic [3]Gemini [4]其他",
+        "Upstream interface [1]OpenAI-compatible (incl. responses, default) [2]Claude/Anthropic [3]Gemini [4]other",
         Some("1"),
     )?;
     match choice.as_str() {
@@ -683,14 +692,14 @@ fn guide_auth_prompt() -> Result<AuthChoice> {
             param: None,
         }),
         "4" | "other" => prompt_auth_detail(),
-        other => Err(Error::msg(format!("无效的接口类型: {other}"))),
+        other => Err(Error::msg(format!("invalid interface type: {other}"))),
     }
 }
 
 /// Auth primitives expanded from the "other" choice, for non-mainstream upstreams (basic, query parameters, etc.).
 fn prompt_auth_detail() -> Result<AuthChoice> {
     let choice = prompt_line(
-        "认证方式 [1]bearer(默认) [2]x-api-key [3]自定义header [4]basic [5]query [6]none",
+        "Auth method [1]bearer (default) [2]x-api-key [3]custom header [4]basic [5]query [6]none",
         Some("1"),
     )?;
     let out = match choice.as_str() {
@@ -709,8 +718,8 @@ fn prompt_auth_detail() -> Result<AuthChoice> {
             param: None,
         },
         "3" | "header" => {
-            let name = prompt_line("header 名（例：x-goog-api-key）", None)?;
-            let prefix = prompt_line("值前缀（回车=无，例：Bearer ）", Some(""))?;
+            let name = prompt_line("Header name (e.g. x-goog-api-key)", None)?;
+            let prefix = prompt_line("Value prefix (Enter=none, e.g. Bearer )", Some(""))?;
             AuthChoice {
                 kind: AuthKind::Header,
                 header: Some(name),
@@ -720,7 +729,7 @@ fn prompt_auth_detail() -> Result<AuthChoice> {
             }
         }
         "4" | "basic" => {
-            let user = prompt_line("Basic 用户名", None)?;
+            let user = prompt_line("Basic username", None)?;
             AuthChoice {
                 kind: AuthKind::Basic,
                 header: None,
@@ -730,7 +739,7 @@ fn prompt_auth_detail() -> Result<AuthChoice> {
             }
         }
         "5" | "query" => {
-            let param = prompt_line("query 参数名（例：key）", None)?;
+            let param = prompt_line("Query parameter name (e.g. key)", None)?;
             AuthChoice {
                 kind: AuthKind::Query,
                 header: None,
@@ -746,7 +755,7 @@ fn prompt_auth_detail() -> Result<AuthChoice> {
             user: None,
             param: None,
         },
-        other => return Err(Error::msg(format!("无效的认证方式: {other}"))),
+        other => return Err(Error::msg(format!("invalid auth method: {other}"))),
     };
     Ok(out)
 }
@@ -760,7 +769,7 @@ fn guide_proxy(given: Option<String>) -> Result<Option<String>> {
         return Ok(None);
     }
     let v = prompt_line(
-        "上游代理（回车=跟随系统代理；direct=强制直连；或 http(s)://URL）",
+        "Upstream proxy (Enter=follow system proxy; direct=force a direct connection; or http(s)://URL)",
         Some(""),
     )?;
     Ok((!v.is_empty()).then_some(v))
@@ -777,18 +786,20 @@ fn build_auth_from(
         AuthKind::Bearer => Ok(Auth::Bearer),
         AuthKind::XApiKey => Ok(Auth::XApiKey),
         AuthKind::Header => {
-            let name = auth_header.ok_or_else(|| Error::msg("header 认证需要 --auth-header"))?;
+            let name =
+                auth_header.ok_or_else(|| Error::msg("header auth requires --auth-header"))?;
             Ok(Auth::Header {
                 name,
                 prefix: auth_prefix.unwrap_or_default(),
             })
         }
         AuthKind::Basic => {
-            let username = auth_user.ok_or_else(|| Error::msg("basic 认证需要 --auth-user"))?;
+            let username =
+                auth_user.ok_or_else(|| Error::msg("basic auth requires --auth-user"))?;
             Ok(Auth::Basic { username })
         }
         AuthKind::Query => {
-            let param = auth_param.ok_or_else(|| Error::msg("query 认证需要 --auth-param"))?;
+            let param = auth_param.ok_or_else(|| Error::msg("query auth requires --auth-param"))?;
             Ok(Auth::Query { param })
         }
         AuthKind::None => Ok(Auth::None),
@@ -800,7 +811,7 @@ fn parse_headers(raws: &[String]) -> Result<BTreeMap<String, String>> {
     for raw in raws {
         let (key, value) = raw
             .split_once(':')
-            .ok_or_else(|| Error::msg(format!("header 需要 KEY:VALUE 格式: `{raw}`")))?;
+            .ok_or_else(|| Error::msg(format!("header requires KEY:VALUE format: `{raw}`")))?;
         headers.insert(key.trim().to_string(), value.trim().to_string());
     }
     Ok(headers)
@@ -834,7 +845,7 @@ fn read_key_value(value: Option<Zeroizing<String>>) -> Result<Zeroizing<String>>
         text.pop();
     }
     if text.is_empty() {
-        return Err(Error::msg("key 值为空"));
+        return Err(Error::msg("key value is empty"));
     }
     Ok(text)
 }
@@ -843,17 +854,17 @@ fn read_key_value(value: Option<Zeroizing<String>>) -> Result<Zeroizing<String>>
 fn prompt_hidden_twice() -> Result<Zeroizing<String>> {
     let first = Zeroizing::new(
         rpassword::prompt_password("Key value: ")
-            .map_err(|e| Error::msg(format!("读取输入失败: {e}")))?,
+            .map_err(|e| Error::msg(format!("failed to read input: {e}")))?,
     );
     let second = Zeroizing::new(
         rpassword::prompt_password("Repeat: ")
-            .map_err(|e| Error::msg(format!("读取输入失败: {e}")))?,
+            .map_err(|e| Error::msg(format!("failed to read input: {e}")))?,
     );
     if first != second {
-        return Err(Error::msg("两次输入不一致"));
+        return Err(Error::msg("the two entries do not match"));
     }
     if first.is_empty() {
-        return Err(Error::msg("key 值为空"));
+        return Err(Error::msg("key value is empty"));
     }
     Ok(first)
 }
@@ -868,7 +879,7 @@ fn interactive() -> bool {
 fn prompt_line(label: &str, default: Option<&str>) -> Result<String> {
     use std::io::{BufRead as _, Write as _};
     match default {
-        Some(d) => eprint!("{label}（回车={d}）: "),
+        Some(d) => eprint!("{label} (Enter={d}): "),
         None => eprint!("{label}: "),
     }
     std::io::stderr().flush()?;
@@ -894,7 +905,9 @@ fn resolve_required(given: Option<String>, label: &str, flag: &str) -> Result<St
     if interactive() {
         prompt_line(label, None)
     } else {
-        Err(Error::msg(format!("缺少 {flag}（非交互环境必须显式传参）")))
+        Err(Error::msg(format!(
+            "missing {flag} (non-interactive environments must pass it explicitly)"
+        )))
     }
 }
 
@@ -909,12 +922,12 @@ fn check_master_password(paths: &Paths, from_stdin: bool) -> Result<Zeroizing<St
     let unlocked = store::unlock(paths)?;
     let Some(hash) = unlocked.store.password_hash.as_deref() else {
         return Err(Error::msg(
-            "未设置 master password；请先 init --force 重新初始化并设置密码",
+            "master password not set; run init --force first to reinitialize and set one",
         ));
     };
     let password = Zeroizing::new(crate::password::read_existing_password(from_stdin)?);
     if !crate::password::verify_password(&password, hash)? {
-        return Err(Error::msg("master password 错误"));
+        return Err(Error::msg("incorrect master password"));
     }
     Ok(password)
 }
@@ -932,14 +945,14 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     let addr: std::net::SocketAddr = args
         .listen
         .parse()
-        .map_err(|e| Error::msg(format!("listen 地址非法 `{}`: {e}", args.listen)))?;
+        .map_err(|e| Error::msg(format!("invalid listen address `{}`: {e}", args.listen)))?;
     if !addr.ip().is_loopback() && !args.allow_remote {
         return Err(Error::msg(
-            "listen 不是 loopback；确需远程请加 --allow-remote，并自行在前面加 TLS",
+            "listen address is not loopback; for remote access add --allow-remote and put TLS in front yourself",
         ));
     }
     if args.body_limit_mb == 0 || args.body_limit_mb > 1024 {
-        return Err(Error::msg("body-limit-mb 必须在 1..=1024"));
+        return Err(Error::msg("body-limit-mb must be within 1..=1024"));
     }
     let audit = match &args.audit_log {
         Some(path) => {
@@ -949,7 +962,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
                 .unwrap_or_else(|| std::path::Path::new("."));
             if !parent.exists() {
                 return Err(Error::msg(format!(
-                    "审计日志目录不存在: {}",
+                    "audit log directory does not exist: {}",
                     parent.display()
                 )));
             }
@@ -964,19 +977,22 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     if !paths.master_key().exists() {
         if !std::io::stdin().is_terminal() {
             return Err(Error::msg(format!(
-                "vault 未初始化（{} 缺失）。交互终端重跑 serve 会自动初始化；\
-                 非交互环境请先 `keysink init [--password-stdin]`",
+                "vault not initialized ({} missing). Re-running serve in an interactive terminal \
+                 auto-initializes it; non-interactive environments must run `keysink init [--password-stdin]` first",
                 paths.master_key().display()
             )));
         }
-        println!("==> vault 未初始化，开始初始化: {}", paths.home.display());
+        println!(
+            "==> vault not initialized, initializing now: {}",
+            paths.home.display()
+        );
         cmd_init(&paths, false, false)?;
     }
 
     let unlocked = store::unlock(&paths)?;
     if unlocked.from_backup {
         tracing::error!(
-            "主 store 解密失败，本次以 .bak 备份启动；备份可能过期（已吊销/删除的 vkey 可能重新生效），请尽快修复"
+            "primary store failed to decrypt; starting from the .bak backup this time; the backup may be stale (revoked/deleted vkeys may work again) — fix this as soon as possible"
         );
     }
     let table = vkey::RouteTable::build(&unlocked.store)?;
@@ -1005,7 +1021,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     });
 
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| Error::msg(format!("创建 tokio runtime 失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to create tokio runtime: {e}")))?;
     let audit_state = state.clone();
     let result = runtime.block_on(async move {
         proxy::spawn_watcher(state.clone(), paths.clone());
@@ -1014,24 +1030,24 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
             .await
             .map_err(|e| {
                 let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
-                    "（端口已被占用：可能已有一个 keysink 在跑，`systemctl status keysink` 或换 --listen）"
+                    " (port already in use: another keysink may be running; `systemctl status keysink` or change --listen)"
                 } else {
                     ""
                 };
-                Error::msg(format!("监听 {addr} 失败: {e}{hint}"))
+                Error::msg(format!("failed to listen on {addr}: {e}{hint}"))
             })?;
         // Record the actual listen address as soon as the bind succeeds: route add relies on it to report where it is listening.
         util::atomic_write(&paths.gateway_addr(), format!("{addr}\n").as_bytes(), 0o600)?;
-        tracing::info!(%addr, routes, from_backup, store = %store_path.display(), "keysink 已启动");
+        tracing::info!(%addr, routes, from_backup, store = %store_path.display(), "keysink started");
         if let Some(path) = args.audit_log {
-            tracing::info!(audit = %path.display(), "审计已开启");
+            tracing::info!(audit = %path.display(), "audit enabled");
         } else {
-            tracing::info!("审计未开启（--audit-log 可开启）");
+            tracing::info!("audit disabled (enable with --audit-log)");
         }
         let serve_result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|e| Error::msg(format!("服务异常退出: {e}")));
+            .map_err(|e| Error::msg(format!("server exited abnormally: {e}")));
         // Remove gateway.addr on shutdown; it can still linger after SIGKILL, so route add falls back to TCP probing
         let _ = std::fs::remove_file(paths.gateway_addr());
         serve_result
@@ -1119,7 +1135,7 @@ pub(crate) fn cmd_doctor(paths: &Paths) -> Result<()> {
                     false,
                     label,
                     format!(
-                        "属主与 {} 不一致（可能用 sudo 直接写入），服务用户会读不到",
+                        "owner does not match {} (possibly written directly with sudo); the service user cannot read it",
                         paths.home.display()
                     ),
                 ),
@@ -1161,17 +1177,21 @@ pub(crate) fn cmd_doctor(paths: &Paths) -> Result<()> {
                 Err(e) => check(false, "vault.age.bak", e.to_string()),
             }
         } else {
-            check(true, "vault.age.bak", "missing（首次写入后生成）".into());
+            check(
+                true,
+                "vault.age.bak",
+                "missing (created after the first write)".into(),
+            );
         }
     } else {
-        check(false, "vault.age", "skipped: vault.key 不可用".into());
+        check(false, "vault.age", "skipped: vault.key unavailable".into());
     }
 
     if failures == 0 {
-        println!("\n全部通过");
+        println!("\nall checks passed");
         Ok(())
     } else {
-        Err(Error::msg(format!("{failures} 项检查失败")))
+        Err(Error::msg(format!("{failures} checks failed")))
     }
 }
 
@@ -1237,9 +1257,9 @@ fn run_checked(what: &str, program: &str, args: &[&str]) -> Result<()> {
     let status = std::process::Command::new(program)
         .args(args)
         .status()
-        .map_err(|e| Error::msg(format!("执行 {program} 失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to execute {program}: {e}")))?;
     if !status.success() {
-        return Err(Error::msg(format!("{what}失败(exit {status})")));
+        return Err(Error::msg(format!("{what} failed (exit {status})")));
     }
     Ok(())
 }
@@ -1247,7 +1267,7 @@ fn run_checked(what: &str, program: &str, args: &[&str]) -> Result<()> {
 pub(crate) fn cmd_deploy() -> Result<()> {
     if !std::path::Path::new("/run/systemd/system").exists() {
         return Err(Error::msg(
-            "系统级部署仅支持 Linux + systemd;个人使用直接 `keysink serve` 即可",
+            "system-level deploy supports only Linux + systemd; for personal use just run `keysink serve`",
         ));
     }
     #[cfg(unix)]
@@ -1255,19 +1275,20 @@ pub(crate) fn cmd_deploy() -> Result<()> {
     #[cfg(not(unix))]
     let root = false;
     if !root {
-        return Err(Error::msg("请用 sudo 运行:sudo keysink deploy"));
+        return Err(Error::msg("run with sudo: sudo keysink deploy"));
     }
-    // sudoers 只放行发起部署的管理员;不知道是谁就拒绝,避免白名单写错人
+    // sudoers allows only the admin who initiated the deploy; refuse when unknown,
+    // to avoid allowlisting the wrong person
     let admin = std::env::var("SUDO_USER").map_err(|_| {
-        Error::msg("请通过管理员账号的 sudo 运行(需要 SUDO_USER 生成 sudoers 白名单)")
+        Error::msg("run via the admin account's sudo (SUDO_USER is needed to generate the sudoers allowlist)")
     })?;
 
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
-        .map_err(|e| Error::msg(format!("定位当前二进制失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to locate the current binary: {e}")))?;
     let exe = exe.to_string_lossy();
 
-    // 旧版双二进制部署的残留,清掉
+    // leftovers from the old dual-binary deploy, clean them up
     let _ = std::fs::remove_file("/usr/local/bin/keysink-admin");
     let _ = std::fs::remove_file("/etc/sudoers.d/keysink-admin");
 
@@ -1278,7 +1299,7 @@ pub(crate) fn cmd_deploy() -> Result<()> {
         .unwrap_or(false);
     if !user_exists {
         run_checked(
-            "创建 keysink 用户",
+            "create keysink user",
             "useradd",
             &[
                 "--system",
@@ -1291,7 +1312,7 @@ pub(crate) fn cmd_deploy() -> Result<()> {
         )?;
     }
     run_checked(
-        "创建 vault 目录",
+        "create vault directory",
         "install",
         &[
             "-d",
@@ -1304,21 +1325,26 @@ pub(crate) fn cmd_deploy() -> Result<()> {
             SYSTEM_VAULT_HOME,
         ],
     )?;
-    run_checked("安装二进制", "install", &["-m", "0755", &exe, SYSTEM_BIN])?;
+    run_checked(
+        "install binary",
+        "install",
+        &["-m", "0755", &exe, SYSTEM_BIN],
+    )?;
 
     std::fs::write(SYSTEM_UNIT, SYSTEMD_UNIT)
-        .map_err(|e| Error::msg(format!("写入 unit 失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to write unit: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(SYSTEM_UNIT, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| Error::msg(format!("设置 unit 权限失败: {e}")))?;
+            .map_err(|e| Error::msg(format!("failed to set unit permissions: {e}")))?;
     }
 
-    // sudoers 先写临时文件、visudo 校验通过再就位:语法错误不会留下坏配置
+    // sudoers goes to a temp file first and is put in place only after visudo
+    // validates it: a syntax error never leaves a broken config behind
     let tmp = format!("{SYSTEM_SUDOERS}.new");
     std::fs::write(&tmp, SUDOERS_TEMPLATE.replace("__ADMIN__", &admin))
-        .map_err(|e| Error::msg(format!("写入 sudoers 失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to write sudoers: {e}")))?;
     let valid = std::process::Command::new("visudo")
         .args(["-cf", &tmp])
         .status()
@@ -1326,24 +1352,29 @@ pub(crate) fn cmd_deploy() -> Result<()> {
         .unwrap_or(false);
     if !valid {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Error::msg("sudoers 校验未通过,已放弃(原文件未动)"));
+        return Err(Error::msg(
+            "sudoers validation failed; aborted (existing file untouched)",
+        ));
     }
     std::fs::rename(&tmp, SYSTEM_SUDOERS)
-        .map_err(|e| Error::msg(format!("sudoers 就位失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("failed to install sudoers: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(SYSTEM_SUDOERS, std::fs::Permissions::from_mode(0o440))
-            .map_err(|e| Error::msg(format!("设置 sudoers 权限失败: {e}")))?;
+            .map_err(|e| Error::msg(format!("failed to set sudoers permissions: {e}")))?;
     }
 
-    // --home 必须显式:vault.key 不存在时默认目录探测会回落到调用方自己的
-    // standalone 目录,runuser 的 HOME 漂移会把首次 init 写进错误位置。
+    // --home must be explicit: without vault.key the default-directory probe falls
+    // back to the caller's own standalone directory, and runuser's HOME drift would
+    // write the first init to the wrong place.
     if !std::path::Path::new(&format!("{SYSTEM_VAULT_HOME}/vault.key")).exists() {
         if std::io::stdin().is_terminal() {
-            println!("==> 初始化 vault(设置 master password,只用于备份导出/恢复)");
+            println!(
+                "==> initializing vault (set the master password; used only for backup export/restore)"
+            );
             run_checked(
-                "初始化 vault",
+                "initialize vault",
                 "runuser",
                 &[
                     "-u",
@@ -1356,12 +1387,12 @@ pub(crate) fn cmd_deploy() -> Result<()> {
                 ],
             )?;
         } else {
-            eprintln!("vault 尚未初始化,且当前无终端;请手动执行:");
+            eprintln!("vault not yet initialized and no terminal is available; run manually:");
             eprintln!("  runuser -u keysink -- {SYSTEM_BIN} --home {SYSTEM_VAULT_HOME} init");
         }
     }
 
-    // 换新二进制/新 unit 必须重启:enable --now 不会动在跑的旧实例
+    // a new binary/unit requires a restart: enable --now won't touch a running old instance
     run_checked("systemctl daemon-reload", "systemctl", &["daemon-reload"])?;
     let active = std::process::Command::new("systemctl")
         .args(["is-active", "--quiet", "keysink"])
@@ -1369,28 +1400,34 @@ pub(crate) fn cmd_deploy() -> Result<()> {
         .map(|s| s.success())
         .unwrap_or(false);
     if active {
-        run_checked("重启服务", "systemctl", &["restart", "keysink"])?;
+        run_checked("restart service", "systemctl", &["restart", "keysink"])?;
     } else {
-        run_checked("启动服务", "systemctl", &["enable", "--now", "keysink"])?;
+        run_checked(
+            "start service",
+            "systemctl",
+            &["enable", "--now", "keysink"],
+        )?;
     }
 
     println!();
-    println!("安装完成。");
+    println!("Installation complete.");
     println!();
-    println!("下一步(添加路由,管理员 {admin}):");
+    println!("Next steps (add a route, admin {admin}):");
     println!("  sudo -u keysink keysink route add claude --base-url https://api.anthropic.com");
-    println!("  # 终端里依次引导:名称 / base URL / 上游认证 / key 值(隐藏回显,只进不出)");
     println!(
-        "  # 脚本里:printf %s \"$KEY\" | sudo -u keysink keysink route add <name> --base-url ..."
+        "  # in a terminal each field is prompted in turn: name / base URL / upstream auth / key value (hidden echo, goes in but never out)"
+    );
+    println!(
+        "  # in scripts: printf %s \"$KEY\" | sudo -u keysink keysink route add <name> --base-url ..."
     );
     println!();
-    println!("agent 侧配置(route add 末尾会打印这两行):");
+    println!("agent-side config (route add prints these two lines at the end):");
     println!("  BASE_URL=http://127.0.0.1:8787");
     println!("  TOKEN=ks_...");
     println!();
-    println!("vault 文件:{SYSTEM_VAULT_HOME}");
-    println!("服务状态:systemctl status keysink");
-    println!("卸载:keysink uninstall");
+    println!("vault files: {SYSTEM_VAULT_HOME}");
+    println!("service status: systemctl status keysink");
+    println!("uninstall: keysink uninstall");
     Ok(())
 }
 
@@ -1405,30 +1442,30 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
 
     if system && !root {
         return Err(Error::msg(
-            "这是系统级部署,请用 root 运行:sudo keysink uninstall",
+            "this is a system-level install; run as root: sudo keysink uninstall",
         ));
     }
 
     if !yes {
         if !std::io::stdin().is_terminal() {
-            return Err(Error::msg("非交互环境请加 --yes"));
+            return Err(Error::msg("non-interactive mode requires --yes"));
         }
         eprintln!(
-            "将删除 vault({})——所有 key 与路由就此丢失,不可恢复。",
+            "This will delete the vault ({}) — all keys and routes will be lost for good.",
             home.display()
         );
         if system {
-            eprintln!("同时移除 systemd unit、sudoers 与 /usr/local/bin/keysink。");
+            eprintln!("This also removes the systemd unit, sudoers and /usr/local/bin/keysink.");
         }
-        eprint!("继续? [y/N] ");
+        eprint!("Continue? [y/N] ");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
-            return Err(Error::msg("已取消"));
+            return Err(Error::msg("cancelled"));
         }
     }
 
-    // 先停服务再删文件;unit 可能本来就不存在,失败忽略
+    // stop the service before deleting files; the unit may not exist, ignore failures
     if system {
         for args in [
             ("systemctl", ["stop", "keysink"].as_slice()),
@@ -1442,7 +1479,7 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
     let mut removed: Vec<PathBuf> = Vec::new();
     if home.exists() {
         std::fs::remove_dir_all(&home)
-            .map_err(|e| Error::msg(format!("删除 {} 失败: {e}", home.display())))?;
+            .map_err(|e| Error::msg(format!("failed to delete {}: {e}", home.display())))?;
         removed.push(home.clone());
     }
     if system {
@@ -1450,26 +1487,35 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
             let p = PathBuf::from(f);
             if p.exists() {
                 std::fs::remove_file(&p)
-                    .map_err(|e| Error::msg(format!("删除 {} 失败: {e}", p.display())))?;
+                    .map_err(|e| Error::msg(format!("failed to delete {}: {e}", p.display())))?;
                 removed.push(p);
             }
         }
     }
 
     if removed.is_empty() {
-        println!("没有找到可删除的文件(vault 不存在:{})", home.display());
+        println!(
+            "nothing to delete (vault does not exist: {})",
+            home.display()
+        );
         return Ok(());
     }
-    println!("已卸载,删除了:");
+    println!("Uninstalled. Removed:");
     for p in &removed {
         println!("  - {}", p.display());
     }
     if !system {
-        // standalone 的二进制是用户自己放的(手动/cargo install/brew),替他删可能弄坏包管理器
+        // the standalone binary was placed by the user (manually/cargo install/brew);
+        // deleting it for them could break the package manager
         if let Ok(exe) = std::env::current_exe() {
-            println!("二进制本身未删除:{},请自行清理", exe.display());
+            println!(
+                "the binary itself was not deleted: {}; clean it up yourself",
+                exe.display()
+            );
         }
-        println!("若 serve 仍在运行请另行结束;启用过 --audit-log 的话审计文件也需自行删除。");
+        println!(
+            "if serve is still running, stop it separately; if --audit-log was used, delete the audit file yourself as well."
+        );
     }
     Ok(())
 }
@@ -1477,19 +1523,26 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
 pub(crate) fn cmd_rekey(paths: &Paths, yes: bool) -> Result<()> {
     if !yes {
         if !std::io::stdin().is_terminal() {
-            return Err(Error::msg("非交互环境请加 --yes"));
+            return Err(Error::msg("non-interactive mode requires --yes"));
         }
-        eprintln!("将生成新的 vault.key，并把 vault 重新加密。旧 key 会留在 vault.key.bak。");
-        eprint!("继续? [y/N] ");
+        eprintln!(
+            "This will generate a new vault.key and re-encrypt the vault. The old key stays in vault.key.bak."
+        );
+        eprint!("Continue? [y/N] ");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
-            return Err(Error::msg("已取消"));
+            return Err(Error::msg("cancelled"));
         }
     }
     store::rekey(paths)?;
-    println!("已换主密钥。旧 key: {}", paths.master_key_bak().display());
-    println!("注意：旧备份仍可用旧 key 解开；请重新备份 vault.key + vault.age。");
+    println!(
+        "Master key rotated. Old key: {}",
+        paths.master_key_bak().display()
+    );
+    println!(
+        "Note: old backups can still be decrypted with the old key; back up vault.key + vault.age again."
+    );
     Ok(())
 }
 
@@ -1498,21 +1551,22 @@ pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
     let passphrase: Zeroizing<String> = if let Some(file) = &args.passphrase_file {
         let bytes = Zeroizing::new(std::fs::read(file)?);
         let text = Zeroizing::new(
-            String::from_utf8(bytes.to_vec()).map_err(|_| Error::msg("口令文件不是 UTF-8"))?,
+            String::from_utf8(bytes.to_vec())
+                .map_err(|_| Error::msg("passphrase file is not UTF-8"))?,
         );
         Zeroizing::new(text.lines().next().unwrap_or("").to_string())
     } else {
         master
     };
     if passphrase.is_empty() {
-        return Err(Error::msg("口令不能为空"));
+        return Err(Error::msg("passphrase must not be empty"));
     }
     let stripped = store::export(paths, &args.output, &passphrase)?;
-    println!("已导出: {}", args.output.display());
+    println!("exported: {}", args.output.display());
     if stripped > 0 {
         println!(
-            "注意：导出不包含任何 key 值（{stripped} 条路由的 route-only key 已剥离）；\
-             恢复后需逐条 `route update <name> --route-key` 重新输入"
+            "Note: the export contains no key values (route-only keys of {stripped} routes were stripped); \
+             re-enter each one with `route update <name> --route-key` after restoring"
         );
     }
     Ok(())
@@ -1550,8 +1604,8 @@ fn truncate(value: &str, max: usize) -> String {
 
 fn route_key_label(route: &Route) -> String {
     match &route.inline_key {
-        Some(_) => "（route-only，不可读取/导出）".to_string(),
-        None => "（缺失）".to_string(),
+        Some(_) => "(route-only, cannot be read/exported)".to_string(),
+        None => "(missing)".to_string(),
     }
 }
 
@@ -1591,11 +1645,11 @@ mod tests {
     fn resolve_required_prefers_given_and_errors_without_tty() {
         // The argument wins: use it when given (including the trim)
         assert_eq!(
-            resolve_required(Some("  x  ".into()), "标签", "--flag").unwrap(),
+            resolve_required(Some("  x  ".into()), "label", "--flag").unwrap(),
             "x"
         );
         // The test process's stdin is not a TTY: a missing argument must fail immediately, never hang waiting for input
-        let err = resolve_required(None, "标签", "--flag")
+        let err = resolve_required(None, "label", "--flag")
             .unwrap_err()
             .to_string();
         assert!(err.contains("--flag"), "{err}");

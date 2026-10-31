@@ -2,7 +2,7 @@
 name = "keysink"
 version = "0.1.0"
 edition = "2024"
-description = "本地凭证网关：虚拟 key → 上游端点 + 真凭证的字节级透传，外加 age 加密的集中配置库"
+description = "Local credential gateway: virtual key → upstream endpoint + real-credential byte-level passthrough, with an age-encrypted centralized vault"
 license = "MIT"
 
 [dependencies]

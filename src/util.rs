@@ -66,13 +66,13 @@ pub fn ensure_private_file(path: &Path, what: &str) -> Result<()> {
     let md = fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() {
         return Err(Error::msg(format!(
-            "{what} 是符号链接，拒绝使用: {}",
+            "{what} is a symlink, refusing to use it: {}",
             path.display()
         )));
     }
     if !md.is_file() {
         return Err(Error::msg(format!(
-            "{what} 不是普通文件: {}",
+            "{what} is not a regular file: {}",
             path.display()
         )));
     }
@@ -81,7 +81,7 @@ pub fn ensure_private_file(path: &Path, what: &str) -> Result<()> {
         let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 && !allow_insecure() {
             return Err(Error::msg(format!(
-                "{what} 权限过宽（{:o}），请 chmod 600 {}；确认风险后可设 KEYSINK_ALLOW_INSECURE=1",
+                "{what} permissions too wide ({:o}); chmod 600 {} — or set KEYSINK_ALLOW_INSECURE=1 once you accept the risk",
                 mode,
                 path.display()
             )));
@@ -94,19 +94,19 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     let md = fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() {
         return Err(Error::msg(format!(
-            "目录是符号链接，拒绝使用: {}",
+            "directory is a symlink, refusing to use it: {}",
             path.display()
         )));
     }
     if !md.is_dir() {
-        return Err(Error::msg(format!("不是目录: {}", path.display())));
+        return Err(Error::msg(format!("not a directory: {}", path.display())));
     }
     #[cfg(unix)]
     {
         let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 && !allow_insecure() {
             return Err(Error::msg(format!(
-                "目录权限过宽（{:o}），请 chmod 700 {}；确认风险后可设 KEYSINK_ALLOW_INSECURE=1",
+                "directory permissions too wide ({:o}); chmod 700 {} — or set KEYSINK_ALLOW_INSECURE=1 once you accept the risk",
                 mode,
                 path.display()
             )));
@@ -167,7 +167,7 @@ pub(crate) fn inherit_dir_owner(file: &Path, target: &Path) -> Result<()> {
     }
     std::os::unix::fs::chown(file, Some(md.uid()), Some(md.gid())).map_err(|e| {
         Error::msg(format!(
-            "设置 {} 属主为 {}:{} 失败: {e}",
+            "failed to set owner of {} to {}:{}: {e}",
             file.display(),
             md.uid(),
             md.gid()
@@ -212,7 +212,7 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| Error::msg(format!("非法路径: {}", path.display())))?;
+        .ok_or_else(|| Error::msg(format!("invalid path: {}", path.display())))?;
     let mut suffix = [0u8; 4];
     rand::rngs::OsRng.fill_bytes(&mut suffix);
     let tmp = dir.join(format!(".{file_name}.tmp.{}", hex(&suffix)));

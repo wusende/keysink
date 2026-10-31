@@ -51,7 +51,7 @@ impl Audit {
         if path.exists()
             && let Err(e) = util::ensure_private_file(&path, "audit log")
         {
-            tracing::warn!(error = %e, "审计日志权限过宽，建议收紧到 0600");
+            tracing::warn!(error = %e, "audit log permissions too wide; consider tightening to 0600");
         }
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         match std::thread::Builder::new()
@@ -62,7 +62,7 @@ impl Audit {
                 writer: Mutex::new(Some(Writer { tx, handle })),
             },
             Err(e) => {
-                tracing::warn!(error = %e, "启动审计写线程失败，审计本次关闭");
+                tracing::warn!(error = %e, "failed to start audit writer thread; audit disabled for this run");
                 Self::disabled()
             }
         }
@@ -81,7 +81,7 @@ impl Audit {
             static DROPPED: AtomicU64 = AtomicU64::new(0);
             let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 100 == 1 {
-                tracing::warn!(dropped = n, "审计队列已满，丢弃审计行");
+                tracing::warn!(dropped = n, "audit queue full; dropping audit lines");
             }
         }
         // Disconnected (after close) is silent: audit is no longer needed during shutdown.
@@ -107,7 +107,7 @@ fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>) {
     };
     while let Ok(entry) = rx.recv() {
         if let Err(e) = append(&path, &mut log, &entry) {
-            tracing::warn!(error = %e, "写审计日志失败");
+            tracing::warn!(error = %e, "failed to write audit log");
             log.file = None;
         }
     }
@@ -216,7 +216,10 @@ mod tests {
         assert!(std::fs::metadata(&rotated).unwrap().len() > MAX_AUDIT_BYTES);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
-        assert!(text.contains("R4"), "轮转后的新文件应只有最后一条: {text}");
+        assert!(
+            text.contains("R4"),
+            "new file after rotation should contain only the last entry: {text}"
+        );
     }
 
     #[test]

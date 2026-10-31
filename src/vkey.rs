@@ -64,7 +64,7 @@ impl RouteTable {
         for (name, route) in &store.routes {
             if !is_well_formed(&route.vkey) {
                 return Err(Error::msg(format!(
-                    "route `{name}` 的 vkey 格式非法（应为 ks_ + 43 字符 base64url）"
+                    "route `{name}` has a malformed vkey (expected ks_ + 43 chars of base64url)"
                 )));
             }
             let h = hash(&route.vkey);
@@ -73,7 +73,9 @@ impl RouteTable {
                 route: route.clone(),
             });
             if map.insert(h, resolved).is_some() {
-                return Err(Error::msg(format!("route `{name}` 的 vkey 与其他路由重复")));
+                return Err(Error::msg(format!(
+                    "route `{name}` has a vkey that duplicates another route"
+                )));
             }
         }
         Ok(Self { map })
@@ -130,9 +132,9 @@ mod tests {
     #[test]
     fn mask_is_safe_on_multibyte() {
         // A malformed vkey (multibyte char landing on the old byte-slice boundary) must not panic.
-        let m = mask("ks_中文字符测试数据abcdefgh");
+        let m = mask("ks_ééééééééabcdefgh");
         assert!(m.contains('…'));
-        assert!(mask("ks_短").is_ascii());
+        assert!(mask("ks_é").is_ascii());
     }
 
     #[test]

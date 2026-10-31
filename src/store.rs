@@ -72,7 +72,7 @@ pub fn init(paths: &Paths, force: bool, password: &str) -> Result<()> {
 
     if (key_exists || store_exists) && !force {
         return Err(Error::msg(format!(
-            "{} 已存在 {} 或 {}；如需重建请加 --force（会先改名备份）",
+            "{} already contains {} or {}; to rebuild, add --force (existing files are renamed to backups first)",
             paths.home.display(),
             paths.key_name,
             paths.store_name
@@ -129,30 +129,30 @@ pub fn load_identity(paths: &Paths) -> Result<age::x25519::Identity> {
         inline
     } else if let Ok(file) = std::env::var("KEYSINK_MASTER_KEY_FILE") {
         String::from_utf8(util::read_no_follow(Path::new(&file))?)
-            .map_err(|_| Error::msg("KEYSINK_MASTER_KEY_FILE 不是 UTF-8"))?
+            .map_err(|_| Error::msg("KEYSINK_MASTER_KEY_FILE is not UTF-8"))?
     } else {
         let key_path = paths.master_key();
         if !key_path.exists() {
             // When not yet initialized, give actionable guidance instead of a bare ENOENT.
             return Err(Error::msg(format!(
-                "尚未初始化：找不到 {}（{}）；请先运行 init",
+                "not initialized: {} ({}) not found; run init first",
                 key_path.display(),
                 paths.key_name
             )));
         }
         util::ensure_private_file(&key_path, paths.key_name)?;
         String::from_utf8(util::read_no_follow(&key_path)?)
-            .map_err(|_| Error::msg(format!("{} 不是 UTF-8", paths.key_name)))?
+            .map_err(|_| Error::msg(format!("{} is not UTF-8", paths.key_name)))?
     };
 
     let line = raw
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| Error::msg("master.key 为空"))?;
+        .ok_or_else(|| Error::msg("master.key is empty"))?;
 
     line.parse::<age::x25519::Identity>()
-        .map_err(|e| Error::Age(format!("master.key 解析失败: {e}")))
+        .map_err(|e| Error::Age(format!("failed to parse master.key: {e}")))
 }
 
 pub fn unlock(paths: &Paths) -> Result<Unlocked> {
@@ -174,13 +174,13 @@ pub fn load_store(paths: &Paths, identity: &age::x25519::Identity) -> Result<(St
             if paths.store_bak().exists() {
                 tracing::error!(
                     error = %primary_err,
-                    "主 store 读取失败，回落到 .bak 备份；备份可能过期（已轮换/删除的 vkey 可能重新生效），请尽快修复"
+                    "failed to read the primary store, falling back to the .bak backup; the backup may be stale (rotated/removed vkeys may become valid again); fix it as soon as possible"
                 );
                 load_store_file(&paths.store_bak(), identity)
                     .map(|store| (store, true))
                     .map_err(|backup_err| {
                         Error::msg(format!(
-                            "store 与备份都无法解密：primary={primary_err}; backup={backup_err}"
+                            "neither the store nor the backup can be decrypted: primary={primary_err}; backup={backup_err}"
                         ))
                     })
             } else {
@@ -194,8 +194,8 @@ pub fn load_store_file(path: &Path, identity: &age::x25519::Identity) -> Result<
     util::ensure_private_file(path, "vault.age")?;
     let ciphertext = util::read_no_follow(path).map_err(|e| match e {
         Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => Error::msg(format!(
-            "读取 {} 失败：Permission denied；文件属主/权限可能被 root 改写过（服务用户读不到）。\
-             请用 `sudo -u keysink keysink ...` 管理 vault，或把属主改回服务用户后重试",
+            "failed to read {}: Permission denied; the file owner/permissions may have been rewritten by root (the service user cannot read it). \
+             Use `sudo -u keysink keysink ...` to manage the vault, or restore ownership to the service user and retry",
             path.display()
         )),
         other => other,
@@ -204,7 +204,7 @@ pub fn load_store_file(path: &Path, identity: &age::x25519::Identity) -> Result<
     let store: Store = serde_json::from_slice(plaintext.as_slice())?;
     if store.version != STORE_VERSION {
         return Err(Error::msg(format!(
-            "store 版本 {} 不受支持（当前支持 {}）",
+            "store version {} is not supported (supported version: {})",
             store.version, STORE_VERSION
         )));
     }
@@ -245,10 +245,13 @@ pub fn save_store(paths: &Paths, store: &Store, identity: &age::x25519::Identity
         match sane {
             Some(bytes) => {
                 if let Err(e) = util::atomic_write(&paths.store_bak(), &bytes, 0o600) {
-                    tracing::warn!(error = %e, "写 {} 失败，继续", paths.store_bak().display());
+                    tracing::warn!(error = %e, "failed to write {}, continuing", paths.store_bak().display());
                 }
             }
-            None => tracing::warn!("当前 {} 无法解密，跳过备份覆盖", paths.store().display()),
+            None => tracing::warn!(
+                "current {} cannot be decrypted, skipping backup overwrite",
+                paths.store().display()
+            ),
         }
     }
 
@@ -323,7 +326,7 @@ fn encrypt_to(plaintext: &[u8], identities: &[&age::x25519::Identity]) -> Result
         .map(|id| Box::new(id.to_public()) as Box<dyn age::Recipient + Send>)
         .collect();
     let encryptor = age::Encryptor::with_recipients(recipients)
-        .ok_or_else(|| Error::msg("age: 没有可用的 recipient"))?;
+        .ok_or_else(|| Error::msg("age: no recipients available"))?;
     let mut out = Vec::new();
     let mut writer = encryptor.wrap_output(&mut out)?;
     writer.write_all(plaintext)?;
@@ -338,12 +341,16 @@ fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8
         age::Decryptor::Recipients(d) => {
             let mut reader = d
                 .decrypt(std::iter::once(identity as &dyn age::Identity))
-                .map_err(|e| Error::Age(format!("master.key 与 store 不匹配或文件损坏: {e}")))?;
+                .map_err(|e| {
+                    Error::Age(format!(
+                        "master.key does not match the store or the file is corrupt: {e}"
+                    ))
+                })?;
             reader.read_to_end(&mut plaintext)?;
         }
         age::Decryptor::Passphrase(_) => {
             return Err(Error::msg(
-                "这是口令加密的 age 文件，不能用 master.key 解开",
+                "this is a passphrase-encrypted age file and cannot be decrypted with master.key",
             ));
         }
     }
@@ -362,8 +369,8 @@ impl LockGuard {
         let file = opts.open(&lock_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 Error::msg(format!(
-                    "打开锁文件 {} 失败：Permission denied；属主可能是 root（用 sudo 直接管理过），\
-                         请改用 `sudo -u keysink keysink ...` 或把属主改回服务用户",
+                    "failed to open lock file {}: Permission denied; the owner may be root (it was managed directly with sudo), \
+                         switch to `sudo -u keysink keysink ...` or restore ownership to the service user",
                     lock_path.display()
                 ))
             } else {
@@ -496,16 +503,28 @@ mod tests {
         let Unlocked {
             store, from_backup, ..
         } = unlock(&paths).unwrap();
-        assert!(from_backup, "回落 .bak 时必须置 from_backup");
-        assert!(store.routes.contains_key("x"), "备份内容应是上一次的好版本");
-        assert_ne!(store.routes["x"].note, "w", ".bak 落后一代，不含最后一次写");
+        assert!(
+            from_backup,
+            "from_backup must be set when falling back to .bak"
+        );
+        assert!(
+            store.routes.contains_key("x"),
+            "backup content should be the previous good version"
+        );
+        assert_ne!(
+            store.routes["x"].note, "w",
+            ".bak lags one generation behind and does not include the last write"
+        );
     }
 
     #[test]
     fn unlock_without_init_hints_init() {
         let (_dir, paths) = tmp_paths(); // directory not created, no key
         let err = unlock(&paths).map(|_| ()).unwrap_err().to_string();
-        assert!(err.contains("init"), "错误应提示先 init：{err}");
+        assert!(
+            err.contains("init"),
+            "error should hint at running init first: {err}"
+        );
     }
 
     #[test]
@@ -547,7 +566,7 @@ mod tests {
         let ct = fs::read(&out).unwrap();
         let decryptor = age::Decryptor::new(&ct[..]).unwrap();
         let age::Decryptor::Passphrase(d) = decryptor else {
-            panic!("导出应是口令加密");
+            panic!("export should be passphrase-encrypted");
         };
         let mut plain = Vec::new();
         d.decrypt(
@@ -558,8 +577,14 @@ mod tests {
         .read_to_end(&mut plain)
         .unwrap();
         let text = String::from_utf8(plain).unwrap();
-        assert!(!text.contains("never-leak"), "导出不得包含 key 值");
-        assert!(text.contains("\"routes\""), "导出应保留路由配置");
+        assert!(
+            !text.contains("never-leak"),
+            "export must not contain key values"
+        );
+        assert!(
+            text.contains("\"routes\""),
+            "export should preserve route configuration"
+        );
     }
 
     #[test]
@@ -578,17 +603,17 @@ mod tests {
             .collect();
         assert!(
             names.iter().any(|n| n.starts_with("vault.key.old.")),
-            "旧 vault.key 应保留原名改名: {names:?}"
+            "old vault.key should be renamed keeping the original name: {names:?}"
         );
         assert!(
             names.iter().any(|n| n.starts_with("vault.age.old.")),
-            "旧 vault.age 应保留原名改名: {names:?}"
+            "old vault.age should be renamed keeping the original name: {names:?}"
         );
         assert!(
             !names
                 .iter()
                 .any(|n| n.starts_with("master.key") || n.starts_with("store.age")),
-            "vault 目录不应出现 user 库命名: {names:?}"
+            "the vault directory should not contain user-store naming: {names:?}"
         );
     }
 }

@@ -10,7 +10,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/keysink-smoke.XXXXXX")"
 VAULT="$TMP/vault"
 
 if [[ ! -x "$BIN" ]]; then
-  echo "找不到 $BIN，先 cargo build" >&2
+  echo "$BIN not found; run cargo build first" >&2
   exit 1
 fi
 
@@ -30,7 +30,7 @@ wait_health() {
     fi
     sleep 0.1
   done
-  echo "网关未启动" >&2
+  echo "gateway did not start" >&2
   cat "$TMP/gw.log" >&2 || true
   return 1
 }
@@ -54,11 +54,11 @@ python3 -c 'import os,sys; sys.exit(0 if oct(os.stat(sys.argv[1]).st_mode)[-3:]=
 
 echo "== export needs master password =="
 if ks export --output "$TMP/e1.age" --password-stdin <<< '' >/dev/null 2>&1; then
-  echo "export 在空密码下仍然成功" >&2
+  echo "export succeeded with an empty password" >&2
   exit 1
 fi
 if ks export --output "$TMP/e2.age" --password-stdin <<< 'wrong' >/dev/null 2>&1; then
-  echo "export 在错误密码下仍然成功" >&2
+  echo "export succeeded with a wrong password" >&2
   exit 1
 fi
 
@@ -104,7 +104,7 @@ SPLIT="$(curl -sS -N -X POST "http://127.0.0.1:$GW_PORT/sse_split" \
   -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{"stream":true}')"
 echo "$SPLIT" | grep -q 'data: \[DONE\]'
 if echo "$SPLIT" | grep -q 'ended prematurely'; then
-  echo "跨 chunk 终止标记误判为截断" >&2
+  echo "SSE terminator split across chunks misjudged as truncation" >&2
   exit 1
 fi
 
@@ -120,7 +120,7 @@ curl -sS -N --max-time 0.08 -X POST "http://127.0.0.1:$GW_PORT/sse" \
   -d '{"stream":true}' >/dev/null 2>&1 || true
 sleep 0.5
 curl -sf "http://127.0.0.1:$GW_PORT/__keysink/health" >/dev/null || {
-  echo "客户端断开后网关失联（疑似 SIGPIPE）" >&2
+  echo "gateway unreachable after client disconnect (suspected SIGPIPE)" >&2
   exit 1
 }
 
@@ -135,7 +135,7 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PO
   -H "Authorization: Bearer $VKEY" -H 'Content-Type: application/json' -d '{}')"
 test "$CODE" = "200"
 ks route update echo --clear-headers >/dev/null
-ks route show echo | grep 'x-static' >/dev/null && { echo "--clear-headers 未生效" >&2; exit 1; }
+ks route show echo | grep 'x-static' >/dev/null && { echo "--clear-headers did not take effect" >&2; exit 1; }
 ks route update echo --header 'x-static: from-keysink' >/dev/null
 
 echo "== hot reload (route add) =="
@@ -144,8 +144,8 @@ VKEY2="$(echo "$HOTOUT" | new_vkey)"
 # Gateway already running: route add must report the actual listen address (gateway.addr runtime file)
 # ${GW_PORT} is delimited explicitly: old bash (macOS 3.2) would parse a
 # directly following fullwidth character into the variable name
-echo "$HOTOUT" | grep -q "网关: http://127.0.0.1:${GW_PORT}（运行中）" || {
-  echo "route add 未报告运行中的监听地址: $HOTOUT" >&2
+echo "$HOTOUT" | grep -q "gateway: http://127.0.0.1:${GW_PORT} (running)" || {
+  echo "route add did not report the running listen address: $HOTOUT" >&2
   exit 1
 }
 sleep 1.5
@@ -168,7 +168,7 @@ RESP3="$(curl -sS -X POST "http://127.0.0.1:$GW_PORT/inline" -H "Authorization: 
 echo "$RESP3" | grep -q 'Bearer inline-key-xyz'
 ks export --output "$TMP/vault-export.age" --password-stdin <<< 'test-pass' >/dev/null
 if grep -q 'inline-key-xyz\|real-key-123' "$TMP/vault-export.age"; then
-  echo "导出文件包含 key 值" >&2
+  echo "export file contains key values" >&2
   exit 1
 fi
 
@@ -196,7 +196,7 @@ grep -q '"route":"echo"' "$TMP/audit.jsonl"
 grep -q '"route":"-"' "$TMP/audit.jsonl"
 grep -q '"status":401' "$TMP/audit.jsonl"
 if grep -q 'real-key-123\|ks_' "$TMP/audit.jsonl"; then
-  echo "审计日志泄漏了 secret 或 vkey" >&2
+  echo "audit log leaked a secret or vkey" >&2
   exit 1
 fi
 

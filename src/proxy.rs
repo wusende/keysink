@@ -105,12 +105,12 @@ pub fn build_upstream_client(
         Some(crate::model::PROXY_DIRECT) => builder.no_proxy(),
         Some(url) => builder.proxy(
             reqwest::Proxy::all(url)
-                .map_err(|e| Error::msg(format!("代理 URL 非法 `{url}`: {e}")))?,
+                .map_err(|e| Error::msg(format!("invalid proxy URL `{url}`: {e}")))?,
         ),
     };
     builder
         .build()
-        .map_err(|e| Error::msg(format!("构造 HTTP client 失败: {e}")))
+        .map_err(|e| Error::msg(format!("failed to build HTTP client: {e}")))
 }
 
 /// Two clients under the same proxy config: streaming / non-streaming timeout semantics differ, so they must be built separately.
@@ -245,7 +245,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             None,
             StatusCode::NOT_IMPLEMENTED,
             "unsupported",
-            "keysink 不支持 WebSocket / Upgrade",
+            "keysink does not support WebSocket / Upgrade",
         );
     }
 
@@ -255,7 +255,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             None,
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            "缺少有效的虚拟 key（Authorization: Bearer ks_... 或 x-api-key）",
+            "missing valid virtual key (Authorization: Bearer ks_... or x-api-key)",
         );
     };
 
@@ -267,7 +267,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             Some(&hash),
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            "虚拟 key 无效或已被轮换",
+            "virtual key is invalid or has been rotated",
         );
     };
     let route = &resolved.route;
@@ -278,19 +278,19 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             Some(&hash),
             StatusCode::FORBIDDEN,
             "permission_error",
-            "该路由已被禁用",
+            "route is disabled",
         );
     }
 
     let Some(value) = &route.inline_key else {
         // validate guarantees non-empty; reaching here means the snapshot came from old data that never passed validate.
-        tracing::error!(route = route_name, "路由缺少 route-only key");
+        tracing::error!(route = route_name, "route is missing route-only key");
         return deny(
             route_name,
             Some(&hash),
             StatusCode::INTERNAL_SERVER_ERROR,
             "configuration_error",
-            "路由配置不完整",
+            "incomplete route configuration",
         );
     };
     let key = Zeroizing::new(value.clone());
@@ -306,7 +306,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             Some(&hash),
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
-            &format!("请求体超过上限 {} 字节", state.body_limit),
+            &format!("request body exceeds limit of {} bytes", state.body_limit),
         );
     }
 
@@ -318,10 +318,14 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
                 (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_too_large",
-                    "请求体超过上限",
+                    "request body exceeds limit",
                 )
             } else {
-                (StatusCode::BAD_REQUEST, "invalid_request", "读取请求体失败")
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "failed to read request body",
+                )
             };
             return deny(route_name, Some(&hash), status, kind, message);
         }
@@ -332,13 +336,13 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
     let fwd_headers = match forward_headers(&in_headers, route, key.as_str(), is_stream) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(error = %e, route = route_name, "构造上游 header 失败");
+            tracing::error!(error = %e, route = route_name, "failed to build upstream headers");
             return deny(
                 route_name,
                 Some(&hash),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration_error",
-                "路由 header 配置非法",
+                "invalid route header configuration",
             );
         }
     };
@@ -352,13 +356,13 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
     ) {
         Ok(u) => u,
         Err(e) => {
-            tracing::error!(error = %e, route = route_name, "构造上游 URL 失败");
+            tracing::error!(error = %e, route = route_name, "failed to build upstream URL");
             return deny(
                 route_name,
                 Some(&hash),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration_error",
-                "路由 URL 配置非法",
+                "invalid route URL configuration",
             );
         }
     };
@@ -369,19 +373,19 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         %path,
         is_stream,
         bytes_in = body.len(),
-        "转发请求"
+        "forwarding request"
     );
 
     let client = match state.clients.for_route(route, is_stream) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, route = route_name, "路由代理 client 构建失败");
+            tracing::error!(error = %e, route = route_name, "failed to build route proxy client");
             return deny(
                 route_name,
                 Some(&hash),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration_error",
-                "路由代理配置非法",
+                "invalid route proxy configuration",
             );
         }
     };
@@ -535,7 +539,11 @@ async fn forward_with_retry(
 
         let resp = match send {
             Err(_) => {
-                tracing::warn!(attempt, route = route_name, "等待上游响应头超时");
+                tracing::warn!(
+                    attempt,
+                    route = route_name,
+                    "timed out waiting for upstream response headers"
+                );
                 if idempotent && attempt < max_retries {
                     tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
                     continue;
@@ -544,7 +552,7 @@ async fn forward_with_retry(
                     response: error_response(
                         StatusCode::GATEWAY_TIMEOUT,
                         "upstream_timeout",
-                        "上游响应头超时",
+                        "upstream response header timeout",
                         rid,
                     ),
                     attempts: attempt + 1,
@@ -556,7 +564,7 @@ async fn forward_with_retry(
                     route = route_name,
                     timeout = e.is_timeout(),
                     connect = e.is_connect(),
-                    "上游请求失败"
+                    "upstream request failed"
                 );
                 if network_retry_allowed(e.is_connect(), idempotent) && attempt < max_retries {
                     tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
@@ -566,7 +574,7 @@ async fn forward_with_retry(
                     response: error_response(
                         StatusCode::BAD_GATEWAY,
                         "upstream_error",
-                        "上游不可达",
+                        "upstream unreachable",
                         rid,
                     ),
                     attempts: attempt + 1,
@@ -582,7 +590,12 @@ async fn forward_with_retry(
                 .get(header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            tracing::warn!(attempt, status, route = route_name, "上游返回可重试状态");
+            tracing::warn!(
+                attempt,
+                status,
+                route = route_name,
+                "upstream returned retryable status"
+            );
             discard_body_limited(resp).await;
             tokio::time::sleep(policy.backoff(attempt as u32, retry_after)).await;
             continue;
@@ -603,7 +616,7 @@ async fn forward_with_retry(
         response: error_response(
             StatusCode::BAD_GATEWAY,
             "internal_error",
-            "重试循环异常退出",
+            "retry loop exited unexpectedly",
             rid,
         ),
         attempts: max_retries + 1,
@@ -690,9 +703,9 @@ fn forward_headers(
 
     for (key, value) in &route.headers {
         let name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|e| Error::msg(format!("非法 header 名 `{key}`: {e}")))?;
+            .map_err(|e| Error::msg(format!("invalid header name `{key}`: {e}")))?;
         let value = HeaderValue::from_str(value)
-            .map_err(|e| Error::msg(format!("header `{key}` 的值非法: {e}")))?;
+            .map_err(|e| Error::msg(format!("invalid value for header `{key}`: {e}")))?;
         // Static headers are only filled in when the client didn't send them, to avoid overriding version/tracing headers the client negotiated itself.
         out.entry(name).or_insert(value);
     }
@@ -702,23 +715,23 @@ fn forward_headers(
             out.insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {upstream_key}"))
-                    .map_err(|e| Error::msg(format!("Bearer 值非法: {e}")))?,
+                    .map_err(|e| Error::msg(format!("invalid Bearer value: {e}")))?,
             );
         }
         Auth::XApiKey => {
             out.insert(
                 HeaderName::from_static("x-api-key"),
                 HeaderValue::from_str(upstream_key)
-                    .map_err(|e| Error::msg(format!("x-api-key 值非法: {e}")))?,
+                    .map_err(|e| Error::msg(format!("invalid x-api-key value: {e}")))?,
             );
         }
         Auth::Header { name, prefix } => {
             let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| Error::msg(format!("非法 auth header 名 `{name}`: {e}")))?;
+                .map_err(|e| Error::msg(format!("invalid auth header name `{name}`: {e}")))?;
             out.insert(
                 header_name,
                 HeaderValue::from_str(&format!("{prefix}{upstream_key}"))
-                    .map_err(|e| Error::msg(format!("auth header 值非法: {e}")))?,
+                    .map_err(|e| Error::msg(format!("invalid auth header value: {e}")))?,
             );
         }
         Auth::Basic { username } => {
@@ -727,7 +740,7 @@ fn forward_headers(
             out.insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Basic {encoded}"))
-                    .map_err(|e| Error::msg(format!("Basic 值非法: {e}")))?,
+                    .map_err(|e| Error::msg(format!("invalid Basic value: {e}")))?,
             );
         }
         Auth::Query { .. } | Auth::None => {}
@@ -749,7 +762,7 @@ fn build_upstream_url(
     } else if path.starts_with('/') {
         path
     } else {
-        return Err(Error::msg("入站 path 不以 / 开头"));
+        return Err(Error::msg("inbound path does not start with /"));
     };
 
     let mut url =
@@ -842,7 +855,7 @@ async fn pass_through_response(resp: reqwest::Response) -> Response {
     let stream = resp.bytes_stream().map(|res| match res {
         Ok(chunk) => Ok::<Bytes, std::io::Error>(chunk),
         Err(_) => {
-            tracing::warn!("读取上游响应 body 失败");
+            tracing::warn!("failed to read upstream response body");
             Err(std::io::Error::other("upstream body error"))
         }
     });
@@ -869,7 +882,7 @@ async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: S
     // stream (that corrupts the frame tail and makes the client's decoder
     // error out, e.g. Bun's ZstdDecompressionError).
     if is_encoded(&headers) {
-        tracing::debug!(rid = %rid, "响应带内容编码，跳过 SSE 终止符检测");
+        tracing::debug!(rid = %rid, "response is content-encoded, skipping SSE terminator detection");
         return pass_through_response(resp).await;
     }
 
@@ -909,7 +922,7 @@ async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: S
                     Some(Ok::<Bytes, std::io::Error>(chunk))
                 }
                 Err(_) => {
-                    tracing::warn!(rid = %rid, "上游 SSE 流中断");
+                    tracing::warn!(rid = %rid, "upstream SSE stream interrupted");
                     seen.store(true, Ordering::Relaxed);
                     errored.store(true, Ordering::Relaxed);
                     Some(Ok(sse_error_event("upstream stream error", terminator)))
@@ -923,7 +936,7 @@ async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: S
         if seen_for_tail.load(Ordering::Relaxed) {
             Ok::<Bytes, std::io::Error>(Bytes::new())
         } else {
-            tracing::warn!(rid = %rid, "SSE 流提前结束且未见终止标记，视为截断");
+            tracing::warn!(rid = %rid, "SSE stream ended early without terminator marker, treating as truncated");
             Ok(sse_error_event(
                 "upstream stream ended prematurely",
                 terminator,
@@ -986,7 +999,7 @@ fn build_response(status: reqwest::StatusCode, headers: HeaderMap, body: Body) -
         error_response(
             StatusCode::BAD_GATEWAY,
             "internal_error",
-            "构造响应失败",
+            "failed to build response",
             "0000",
         )
     })
@@ -1045,7 +1058,7 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                             last = now;
                             if !backup_warned {
                                 tracing::error!(
-                                    "主 store 解密失败，拒绝用过期 .bak 覆盖内存快照（继续服务最近的好数据），请尽快修复主 store"
+                                    "main store failed to decrypt, refusing to overwrite in-memory snapshot with stale .bak (continuing to serve the latest good data); fix the main store ASAP"
                                 );
                                 backup_warned = true;
                             }
@@ -1070,22 +1083,22 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                         backup_warned = false;
                         if from_backup {
                             tracing::error!(
-                                "热加载回落到 .bak 备份（主 store 解密失败）：已吊销/删除的 vkey 可能重新生效，请尽快修复"
+                                "hot reload fell back to .bak backup (main store failed to decrypt): revoked/deleted vkeys may become effective again; fix ASAP"
                             );
                         }
-                        tracing::info!(routes, from_backup, "store 已热加载");
+                        tracing::info!(routes, from_backup, "store hot-reloaded");
                     }
                     Err(e) => {
                         failures += 1;
                         if failures % 10 == 1 {
-                            tracing::warn!(error = %e, "热加载校验失败，保留旧快照");
+                            tracing::warn!(error = %e, "hot reload validation failed, keeping old snapshot");
                         }
                     }
                 },
                 Err(e) => {
                     failures += 1;
                     if failures % 10 == 1 {
-                        tracing::warn!(error = %e, "热加载解密失败，保留旧快照");
+                        tracing::warn!(error = %e, "hot reload decryption failed, keeping old snapshot");
                     }
                 }
             }

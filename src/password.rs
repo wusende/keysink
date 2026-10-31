@@ -11,15 +11,15 @@ const OUT_LEN: usize = 32;
 /// Generate a storable password verification string: `scrypt$<log_n>$<r>$<p>$<salt_hex>$<hash_hex>`.
 pub fn hash_password(password: &str) -> Result<String> {
     if password.is_empty() {
-        return Err(Error::msg("master password 不能为空"));
+        return Err(Error::msg("master password must not be empty"));
     }
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let params = scrypt::Params::new(LOG_N, R, P, OUT_LEN)
-        .map_err(|e| Error::msg(format!("scrypt 参数非法: {e}")))?;
+        .map_err(|e| Error::msg(format!("invalid scrypt parameters: {e}")))?;
     let mut out = [0u8; OUT_LEN];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut out)
-        .map_err(|e| Error::msg(format!("scrypt 计算失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("scrypt computation failed: {e}")))?;
     Ok(format!(
         "scrypt${LOG_N}${R}${P}${}${}",
         util::hex(&salt),
@@ -31,41 +31,43 @@ pub fn hash_password(password: &str) -> Result<String> {
 pub fn verify_password(password: &str, encoded: &str) -> Result<bool> {
     let mut parts = encoded.split('$');
     if parts.next() != Some("scrypt") {
-        return Err(Error::msg("密码校验串格式非法"));
+        return Err(Error::msg("malformed password verification string"));
     }
     let log_n: u8 = parse(parts.next(), "log_n")?;
     let r: u32 = parse(parts.next(), "r")?;
     let p: u32 = parse(parts.next(), "p")?;
-    let salt = hex_decode(parts.next().ok_or_else(|| Error::msg("缺少 salt"))?)?;
-    let expected = hex_decode(parts.next().ok_or_else(|| Error::msg("缺少 hash"))?)?;
+    let salt = hex_decode(parts.next().ok_or_else(|| Error::msg("missing salt"))?)?;
+    let expected = hex_decode(parts.next().ok_or_else(|| Error::msg("missing hash"))?)?;
     let params = scrypt::Params::new(log_n, r, p, expected.len())
-        .map_err(|e| Error::msg(format!("scrypt 参数非法: {e}")))?;
+        .map_err(|e| Error::msg(format!("invalid scrypt parameters: {e}")))?;
     let mut out = vec![0u8; expected.len()];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut out)
-        .map_err(|e| Error::msg(format!("scrypt 计算失败: {e}")))?;
+        .map_err(|e| Error::msg(format!("scrypt computation failed: {e}")))?;
     Ok(constant_time_eq(&out, &expected))
 }
 
 fn parse<T: std::str::FromStr>(value: Option<&str>, what: &str) -> Result<T> {
     value
-        .ok_or_else(|| Error::msg(format!("密码校验串缺少 {what}")))?
+        .ok_or_else(|| Error::msg(format!("password verification string missing {what}")))?
         .parse()
-        .map_err(|_| Error::msg(format!("密码校验串 {what} 非法")))
+        .map_err(|_| Error::msg(format!("invalid {what} in password verification string")))
 }
 
 fn hex_decode(text: &str) -> Result<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
-        return Err(Error::msg("密码校验串 hex 长度非法"));
+        return Err(Error::msg(
+            "invalid hex length in password verification string",
+        ));
     }
     let mut out = Vec::with_capacity(text.len() / 2);
     let bytes = text.as_bytes();
     for pair in bytes.chunks(2) {
         let hi = (pair[0] as char)
             .to_digit(16)
-            .ok_or_else(|| Error::msg("密码校验串 hex 非法"))?;
+            .ok_or_else(|| Error::msg("invalid hex in password verification string"))?;
         let lo = (pair[1] as char)
             .to_digit(16)
-            .ok_or_else(|| Error::msg("密码校验串 hex 非法"))?;
+            .ok_or_else(|| Error::msg("invalid hex in password verification string"))?;
         out.push((hi * 16 + lo) as u8);
     }
     Ok(out)
@@ -87,19 +89,19 @@ pub fn read_new_password(from_stdin: bool) -> Result<String> {
     let password = if from_stdin {
         read_line()?
     } else if std::io::stdin().is_terminal() {
-        let first = rpassword::prompt_password("设置 master password: ")?;
-        let second = rpassword::prompt_password("再输一次: ")?;
+        let first = rpassword::prompt_password("Set master password: ")?;
+        let second = rpassword::prompt_password("Enter again: ")?;
         if first != second {
-            return Err(Error::msg("两次输入的密码不一致"));
+            return Err(Error::msg("passwords do not match"));
         }
         first
     } else {
         return Err(Error::msg(
-            "非交互环境初始化请加 --password-stdin（从 stdin 读一行）",
+            "non-interactive init requires --password-stdin (reads one line from stdin)",
         ));
     };
     if password.is_empty() {
-        return Err(Error::msg("master password 不能为空"));
+        return Err(Error::msg("master password must not be empty"));
     }
     Ok(password)
 }
@@ -112,7 +114,7 @@ pub fn read_existing_password(from_stdin: bool) -> Result<String> {
         rpassword::prompt_password("master password: ").map_err(Error::from)
     } else {
         Err(Error::msg(
-            "非交互环境读取请加 --password-stdin（从 stdin 读一行）",
+            "non-interactive read requires --password-stdin (reads one line from stdin)",
         ))
     }
 }
