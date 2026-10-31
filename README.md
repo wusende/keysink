@@ -84,6 +84,16 @@ Vault files are age-encrypted, 0600/0700, owned by the service user. Root that c
 
 Limitations: one upstream + one key per route (no pools / failover); audit off by default.
 
+## FAQ
+
+**Why isn't the vault stored in the current directory?**
+
+The vault lives at `~/.local/share/keysink` (Windows: `%LOCALAPPDATA%\keysink`, system installs: `/var/lib/keysink`) on purpose:
+
+- **One vault per user, not per directory.** The gateway runs as a daemon while the CLI is invoked from anywhere. A CWD-relative vault would give you a different vault per directory — routes would "vanish" and hot-reload would break. Use `--home` or `KEYSINK_VAULT_HOME` when you explicitly want another location.
+- **The security model needs a directory it controls.** The 0700/0600, `O_NOFOLLOW` and owner-follow checks only mean something in a dedicated directory. CWD has arbitrary permissions — and may well be a git repo or a cloud-synced folder where `vault.key` + `vault.age` could leak.
+- **It's where the OS expects app data.** XDG `$XDG_DATA_HOME` on Linux/macOS, `%LOCALAPPDATA%` on Windows, `/var/lib` for system services (FHS) — the same convention as `~/.ssh`, `~/.gnupg` or `/var/lib/docker`.
+
 ## Development
 
 ```bash

@@ -84,6 +84,16 @@ vault 文件 age 加密,0600/0700,属主为服务用户。能同时读到 `vault
 
 限制:单路由单上游单 key(无 key 池 / failover);审计默认关闭。
 
+## 常见问题
+
+**为什么 vault 不放在当前目录?**
+
+vault 固定落在 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`,系统部署:`/var/lib/keysink`),是有意的:
+
+- **一个用户一个 vault,而不是一个目录一个。** 网关是常驻进程,CLI 却可能从任何目录调用;若跟着当前目录走,每个目录一份 vault——路由"加丢了"、热加载也失灵。要换位置用 `--home` 或 `KEYSINK_VAULT_HOME` 显式指定。
+- **安全模型要求目录本身可控。** 0700/0600、`O_NOFOLLOW`、属主跟随这些检查,只有在专属目录里才有意义;当前目录权限任意,还可能是 git 仓库或网盘同步目录,`vault.key` + `vault.age` 手滑提交/同步出去就泄了。
+- **这就是操作系统给应用数据规定的位置。** Linux/macOS 按 XDG 放 `$XDG_DATA_HOME`,Windows 放 `%LOCALAPPDATA%`,系统服务按 FHS 放 `/var/lib`——和 `~/.ssh`、`~/.gnupg`、`/var/lib/docker` 是同一套约定。
+
 ## 开发
 
 ```bash
