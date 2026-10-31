@@ -73,10 +73,32 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.artifact }}.*
+      # CHANGELOG.md is the single source of truth for release notes; GitHub's
+      # auto-generated notes have nothing to diff against for a first release
+      # (no previous tag, direct pushes instead of PRs) and degrade to a bare
+      # "Full Changelog" link.
+      - name: extract changelog section
+        if: matrix.notes == true && startsWith(github.ref, 'refs/tags/')
+        id: changelog
+        run: |
+          section=$(awk -v tag="## ${GITHUB_REF_NAME}" '
+            $0 == tag { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$section" ]; then
+            echo "CHANGELOG.md has no '## ${GITHUB_REF_NAME}' section" >&2
+            exit 1
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            printf '%s\n' "$section"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.artifact }}.*
-          generate_release_notes: ${{ matrix.notes == true }}
+          body: ${{ steps.changelog.outputs.body }}
