@@ -63,6 +63,15 @@ pub enum Cmd {
     },
     /// Export a passphrase-encrypted backup (contains no key values; requires the master password)
     Export(ExportArgs),
+    /// Remove everything keysink wrote: the vault (keys and routes — gone for
+    /// good), and on system installs also the systemd unit, sudoers and the
+    /// installed binary. Standalone installs keep the binary itself; its path
+    /// is printed instead.
+    Uninstall {
+        /// Skip the confirmation prompt (non-interactive environments)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -81,6 +90,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Doctor => cmd_doctor(&paths),
         Cmd::Rekey { yes } => cmd_rekey(&paths, yes),
         Cmd::Export(args) => cmd_export(&paths, args),
+        Cmd::Uninstall { yes } => cmd_uninstall(&paths, yes),
     }
 }
 
@@ -1155,6 +1165,90 @@ pub(crate) fn cmd_doctor(paths: &Paths) -> Result<()> {
     } else {
         Err(Error::msg(format!("{failures} 项检查失败")))
     }
+}
+
+pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
+    let home = paths.home.clone();
+    let system = home == std::path::Path::new("/var/lib/keysink");
+
+    #[cfg(unix)]
+    let root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let root = false;
+
+    if system && !root {
+        return Err(Error::msg(
+            "这是系统级部署,请用 root 运行:sudo keysink uninstall",
+        ));
+    }
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(Error::msg("非交互环境请加 --yes"));
+        }
+        eprintln!(
+            "将删除 vault({})——所有 key 与路由就此丢失,不可恢复。",
+            home.display()
+        );
+        if system {
+            eprintln!("同时移除 systemd unit、sudoers 与 /usr/local/bin/keysink。");
+        }
+        eprint!("继续? [y/N] ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+            return Err(Error::msg("已取消"));
+        }
+    }
+
+    // 先停服务再删文件;unit 可能本来就不存在,失败忽略
+    if system {
+        for args in [
+            ("systemctl", ["stop", "keysink"].as_slice()),
+            ("systemctl", ["disable", "keysink"].as_slice()),
+            ("systemctl", ["daemon-reload"].as_slice()),
+        ] {
+            let _ = std::process::Command::new(args.0).args(args.1).status();
+        }
+    }
+
+    let mut removed: Vec<PathBuf> = Vec::new();
+    if home.exists() {
+        std::fs::remove_dir_all(&home)
+            .map_err(|e| Error::msg(format!("删除 {} 失败: {e}", home.display())))?;
+        removed.push(home.clone());
+    }
+    if system {
+        for f in [
+            "/etc/systemd/system/keysink.service",
+            "/etc/sudoers.d/keysink",
+            "/usr/local/bin/keysink",
+        ] {
+            let p = PathBuf::from(f);
+            if p.exists() {
+                std::fs::remove_file(&p)
+                    .map_err(|e| Error::msg(format!("删除 {} 失败: {e}", p.display())))?;
+                removed.push(p);
+            }
+        }
+    }
+
+    if removed.is_empty() {
+        println!("没有找到可删除的文件(vault 不存在:{})", home.display());
+        return Ok(());
+    }
+    println!("已卸载,删除了:");
+    for p in &removed {
+        println!("  - {}", p.display());
+    }
+    if !system {
+        // standalone 的二进制是用户自己放的(手动/cargo install/brew),替他删可能弄坏包管理器
+        if let Ok(exe) = std::env::current_exe() {
+            println!("二进制本身未删除:{},请自行清理", exe.display());
+        }
+        println!("若 serve 仍在运行请另行结束;启用过 --audit-log 的话审计文件也需自行删除。");
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_rekey(paths: &Paths, yes: bool) -> Result<()> {

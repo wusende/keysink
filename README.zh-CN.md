@@ -62,6 +62,7 @@ keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
 keysink status | doctor
 keysink export --output FILE      # 需 master password;剥离所有 key 值
 keysink rekey [--yes]             # 更换 vault 主密钥
+keysink uninstall [--yes]         # 删除 vault;系统级部署同时移除 unit/sudoers/二进制
 ```
 
 路由选项要点:

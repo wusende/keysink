@@ -62,6 +62,7 @@ keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
 keysink status | doctor
 keysink export --output FILE      # needs master password; strips all key values
 keysink rekey [--yes]             # rotate the vault master key
+keysink uninstall [--yes]         # remove the vault; system installs also lose unit/sudoers/binary
 ```
 
 Route options worth knowing:
