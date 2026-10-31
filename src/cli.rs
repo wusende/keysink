@@ -72,6 +72,13 @@ pub enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// One-shot system deployment (Linux + systemd, run as root via sudo):
+    /// creates the keysink service user, installs this binary to
+    /// /usr/local/bin/keysink, writes the systemd unit and the sudoers rule
+    /// for the invoking admin, initializes the vault interactively and
+    /// enables the service. Idempotent — re-running upgrades the binary and
+    /// unit in place and restarts the service.
+    Deploy,
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -91,6 +98,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Rekey { yes } => cmd_rekey(&paths, yes),
         Cmd::Export(args) => cmd_export(&paths, args),
         Cmd::Uninstall { yes } => cmd_uninstall(&paths, yes),
+        Cmd::Deploy => cmd_deploy(),
     }
 }
 
@@ -1167,9 +1175,220 @@ pub(crate) fn cmd_doctor(paths: &Paths) -> Result<()> {
     }
 }
 
+/// System-install locations shared by deploy and uninstall (single source of truth).
+const SYSTEM_VAULT_HOME: &str = "/var/lib/keysink";
+const SYSTEM_BIN: &str = "/usr/local/bin/keysink";
+const SYSTEM_UNIT: &str = "/etc/systemd/system/keysink.service";
+const SYSTEM_SUDOERS: &str = "/etc/sudoers.d/keysink";
+
+const SYSTEMD_UNIT: &str = r#"[Unit]
+Description=keysink vault gateway
+Documentation=https://github.com/wusende/keysink
+After=network-online.target
+Wants=network-online.target
+# Don't start before the vault exists (deploy initializes it interactively;
+# avoids a crash-restart loop on a fresh install)
+ConditionPathExists=/var/lib/keysink/vault.key
+
+[Service]
+Type=simple
+User=keysink
+Group=keysink
+ExecStart=/usr/local/bin/keysink serve --listen 127.0.0.1:8787
+Environment=KEYSINK_VAULT_HOME=/var/lib/keysink
+Environment=RUST_LOG=info
+StateDirectory=keysink
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2
+# Graceful shutdown waits at most 10s: long SSE streams can't stall a stop
+# forever; SIGKILL is the backstop
+TimeoutStopSec=10
+
+# Hardening: no core dumps, no privilege regain, read-only home
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/keysink
+# If you enable auditing, also allow the audit directory:
+# ReadWritePaths=/var/log/keysink
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+/// `__ADMIN__` is substituted with the invoking admin (SUDO_USER) at deploy time.
+const SUDOERS_TEMPLATE: &str = r#"# /etc/sudoers.d/keysink
+#
+# Vault administration: requires the admin's login password, and every
+# command re-authenticates. Never add NOPASSWD; never widen with wildcards.
+
+Cmnd_Alias KEYSINK_CMDS = /usr/local/bin/keysink
+
+Defaults!KEYSINK_CMDS timestamp_timeout=0, timestamp_type=tty
+
+__ADMIN__ ALL=(keysink) KEYSINK_CMDS
+"#;
+
+fn run_checked(what: &str, program: &str, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| Error::msg(format!("执行 {program} 失败: {e}")))?;
+    if !status.success() {
+        return Err(Error::msg(format!("{what}失败(exit {status})")));
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_deploy() -> Result<()> {
+    if !std::path::Path::new("/run/systemd/system").exists() {
+        return Err(Error::msg(
+            "系统级部署仅支持 Linux + systemd;个人使用直接 `keysink serve` 即可",
+        ));
+    }
+    #[cfg(unix)]
+    let root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let root = false;
+    if !root {
+        return Err(Error::msg("请用 sudo 运行:sudo keysink deploy"));
+    }
+    // sudoers 只放行发起部署的管理员;不知道是谁就拒绝,避免白名单写错人
+    let admin = std::env::var("SUDO_USER")
+        .map_err(|_| Error::msg("请通过管理员账号的 sudo 运行(需要 SUDO_USER 生成 sudoers 白名单)"))?;
+
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| Error::msg(format!("定位当前二进制失败: {e}")))?;
+    let exe = exe.to_string_lossy();
+
+    // 旧版双二进制部署的残留,清掉
+    let _ = std::fs::remove_file("/usr/local/bin/keysink-admin");
+    let _ = std::fs::remove_file("/etc/sudoers.d/keysink-admin");
+
+    let user_exists = std::process::Command::new("id")
+        .arg("keysink")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !user_exists {
+        run_checked(
+            "创建 keysink 用户",
+            "useradd",
+            &[
+                "--system",
+                "--home-dir",
+                SYSTEM_VAULT_HOME,
+                "--shell",
+                "/usr/sbin/nologin",
+                "keysink",
+            ],
+        )?;
+    }
+    run_checked(
+        "创建 vault 目录",
+        "install",
+        &["-d", "-o", "keysink", "-g", "keysink", "-m", "0700", SYSTEM_VAULT_HOME],
+    )?;
+    run_checked(
+        "安装二进制",
+        "install",
+        &["-m", "0755", &exe, SYSTEM_BIN],
+    )?;
+
+    std::fs::write(SYSTEM_UNIT, SYSTEMD_UNIT)
+        .map_err(|e| Error::msg(format!("写入 unit 失败: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(SYSTEM_UNIT, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| Error::msg(format!("设置 unit 权限失败: {e}")))?;
+    }
+
+    // sudoers 先写临时文件、visudo 校验通过再就位:语法错误不会留下坏配置
+    let tmp = format!("{SYSTEM_SUDOERS}.new");
+    std::fs::write(&tmp, SUDOERS_TEMPLATE.replace("__ADMIN__", &admin))
+        .map_err(|e| Error::msg(format!("写入 sudoers 失败: {e}")))?;
+    let valid = std::process::Command::new("visudo")
+        .args(["-cf", &tmp])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !valid {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::msg("sudoers 校验未通过,已放弃(原文件未动)"));
+    }
+    std::fs::rename(&tmp, SYSTEM_SUDOERS)
+        .map_err(|e| Error::msg(format!("sudoers 就位失败: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(SYSTEM_SUDOERS, std::fs::Permissions::from_mode(0o440))
+            .map_err(|e| Error::msg(format!("设置 sudoers 权限失败: {e}")))?;
+    }
+
+    // --home 必须显式:vault.key 不存在时默认目录探测会回落到调用方自己的
+    // standalone 目录,runuser 的 HOME 漂移会把首次 init 写进错误位置。
+    if !std::path::Path::new(&format!("{SYSTEM_VAULT_HOME}/vault.key")).exists() {
+        if std::io::stdin().is_terminal() {
+            println!("==> 初始化 vault(设置 master password,只用于备份导出/恢复)");
+            run_checked(
+                "初始化 vault",
+                "runuser",
+                &[
+                    "-u",
+                    "keysink",
+                    "--",
+                    SYSTEM_BIN,
+                    "--home",
+                    SYSTEM_VAULT_HOME,
+                    "init",
+                ],
+            )?;
+        } else {
+            eprintln!("vault 尚未初始化,且当前无终端;请手动执行:");
+            eprintln!("  runuser -u keysink -- {SYSTEM_BIN} --home {SYSTEM_VAULT_HOME} init");
+        }
+    }
+
+    // 换新二进制/新 unit 必须重启:enable --now 不会动在跑的旧实例
+    run_checked("systemctl daemon-reload", "systemctl", &["daemon-reload"])?;
+    let active = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "keysink"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if active {
+        run_checked("重启服务", "systemctl", &["restart", "keysink"])?;
+    } else {
+        run_checked("启动服务", "systemctl", &["enable", "--now", "keysink"])?;
+    }
+
+    println!();
+    println!("安装完成。");
+    println!();
+    println!("下一步(添加路由,管理员 {admin}):");
+    println!("  sudo -u keysink keysink route add claude --base-url https://api.anthropic.com");
+    println!("  # 终端里依次引导:名称 / base URL / 上游认证 / key 值(隐藏回显,只进不出)");
+    println!("  # 脚本里:printf %s \"$KEY\" | sudo -u keysink keysink route add <name> --base-url ...");
+    println!();
+    println!("agent 侧配置(route add 末尾会打印这两行):");
+    println!("  BASE_URL=http://127.0.0.1:8787");
+    println!("  TOKEN=ks_...");
+    println!();
+    println!("vault 文件:{SYSTEM_VAULT_HOME}");
+    println!("服务状态:systemctl status keysink");
+    println!("卸载:keysink uninstall");
+    Ok(())
+}
+
 pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
     let home = paths.home.clone();
-    let system = home == std::path::Path::new("/var/lib/keysink");
+    let system = home == std::path::Path::new(SYSTEM_VAULT_HOME);
 
     #[cfg(unix)]
     let root = unsafe { libc::geteuid() } == 0;
@@ -1219,11 +1438,7 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
         removed.push(home.clone());
     }
     if system {
-        for f in [
-            "/etc/systemd/system/keysink.service",
-            "/etc/sudoers.d/keysink",
-            "/usr/local/bin/keysink",
-        ] {
+        for f in [SYSTEM_UNIT, SYSTEM_SUDOERS, SYSTEM_BIN] {
             let p = PathBuf::from(f);
             if p.exists() {
                 std::fs::remove_file(&p)

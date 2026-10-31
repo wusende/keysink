@@ -41,10 +41,10 @@ Vault lives at `~/.local/share/keysink` (Windows: `%LOCALAPPDATA%\keysink`). Mov
 ## Linux system service (systemd)
 
 ```bash
-sudo bash contrib/deploy.sh
+sudo keysink deploy
 ```
 
-One shot: creates the `keysink` system user and a 0700 vault dir, installs the binary, systemd unit and sudoers, initializes the vault interactively (hidden password, entered twice), then `systemctl enable --now keysink`. Idempotent — safe to re-run.
+One shot — the binary installs itself: creates the `keysink` system user and a 0700 vault dir, copies this binary to `/usr/local/bin/keysink`, writes the systemd unit and the sudoers rule (for the admin invoking sudo), initializes the vault interactively (hidden password, entered twice), then enables the service. Idempotent — re-running upgrades in place and restarts. Removal is symmetric: `sudo keysink uninstall`.
 
 The unit refuses to start until the vault exists (`ConditionPathExists`). Without a terminal, init manually:
 
@@ -63,6 +63,7 @@ keysink status | doctor
 keysink export --output FILE      # needs master password; strips all key values
 keysink rekey [--yes]             # rotate the vault master key
 keysink uninstall [--yes]         # remove the vault; system installs also lose unit/sudoers/binary
+keysink deploy                    # one-shot system install (Linux + systemd, via sudo)
 ```
 
 Route options worth knowing:

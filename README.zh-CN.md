@@ -41,10 +41,10 @@ vault 落在 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`),可用 `
 ## Linux 系统服务(systemd)
 
 ```bash
-sudo bash contrib/deploy.sh
+sudo keysink deploy
 ```
 
-一次做完:创建 `keysink` 系统用户与 0700 vault 目录、安装二进制、systemd unit 与 sudoers、交互初始化 vault(密码隐藏回显两遍),然后 `systemctl enable --now keysink`。幂等,重复执行安全。
+一键完成——二进制自己安装自己:创建 `keysink` 系统用户与 0700 vault 目录、把当前二进制装到 `/usr/local/bin/keysink`、写 systemd unit 与 sudoers(放行发起 sudo 的管理员)、交互初始化 vault(密码隐藏回显两遍)、启用服务。幂等,重复执行即原地升级并重启。卸载对称:`sudo keysink uninstall`。
 
 vault 未初始化时 unit 不启动(`ConditionPathExists`)。无终端环境手动初始化:
 
@@ -63,6 +63,7 @@ keysink status | doctor
 keysink export --output FILE      # 需 master password;剥离所有 key 值
 keysink rekey [--yes]             # 更换 vault 主密钥
 keysink uninstall [--yes]         # 删除 vault;系统级部署同时移除 unit/sudoers/二进制
+keysink deploy                    # 一键系统级部署(Linux + systemd,需 sudo)
 ```
 
 路由选项要点:
