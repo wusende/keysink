@@ -41,7 +41,7 @@ fn next_rid() -> String {
 }
 
 /// At least 4 base36 digits; it naturally lengthens past 36^4, avoiding duplicate rids after wraparound.
-fn rid_from(n: u64) -> String {
+pub(crate) fn rid_from(n: u64) -> String {
     let mut digits = Vec::with_capacity(4);
     let mut m = n;
     loop {
@@ -627,7 +627,7 @@ async fn forward_with_retry(
     }
 }
 
-fn extract_vkey(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_vkey(headers: &HeaderMap) -> Option<String> {
     for name in ["authorization", "x-api-key", "x-goog-api-key", "api-key"] {
         let Some(value) = headers.get(name) else {
             continue;
@@ -680,7 +680,7 @@ fn is_auth_header(name: &str) -> bool {
     AUTH.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
-fn forward_headers(
+pub(crate) fn forward_headers(
     src: &HeaderMap,
     route: &Route,
     upstream_key: &str,
@@ -706,6 +706,12 @@ fn forward_headers(
     }
 
     for (key, value) in &route.headers {
+        // Streaming requests must not negotiate a compressed encoding upstream
+        // (same rationale as the inbound accept-encoding strip above); static
+        // route config gets no exemption.
+        if is_stream && key.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
         let name = HeaderName::from_bytes(key.as_bytes())
             .map_err(|e| Error::msg(format!("invalid header name `{key}`: {e}")))?;
         let value = HeaderValue::from_str(value)
@@ -753,7 +759,7 @@ fn forward_headers(
     Ok(out)
 }
 
-fn build_upstream_url(
+pub(crate) fn build_upstream_url(
     base_url: &str,
     path: &str,
     query: Option<&str>,
@@ -808,7 +814,7 @@ fn build_upstream_url(
     Ok(url)
 }
 
-fn is_stream_request(body: &[u8]) -> bool {
+pub(crate) fn is_stream_request(body: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Probe {
         #[serde(default)]
@@ -840,7 +846,7 @@ fn convert_resp_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 /// Whether the response carries a content encoding (`identity` counts as
 /// unencoded). When encoded, the body is compressed bytes that cannot be
 /// scanned for SSE terminators as plain text, so it can only be passed through as-is.
-fn is_encoded(headers: &HeaderMap) -> bool {
+pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
     match headers.get(header::CONTENT_ENCODING) {
         None => false,
         Some(value) => match value.to_str() {
@@ -964,7 +970,7 @@ fn sse_error_event(message: &str, terminator: Terminator) -> Bytes {
     }
 }
 
-fn contains_terminator(chunk: &[u8], terminator: Terminator) -> bool {
+pub(crate) fn contains_terminator(chunk: &[u8], terminator: Terminator) -> bool {
     let openai = || find_memmem(chunk, b"data: [DONE]") || find_memmem_ci(chunk, b"data: [DONE]");
     let anthropic = || {
         find_memmem(chunk, b"event: message_stop")
@@ -1273,6 +1279,19 @@ mod tests {
             plain.get(header::ACCEPT_ENCODING).unwrap(),
             "gzip, deflate, br, zstd"
         );
+    }
+
+    #[test]
+    fn streaming_route_static_accept_encoding_is_dropped() {
+        // A statically configured accept-encoding blinds the SSE terminator
+        // scan just the same, so streaming must drop it too.
+        let mut r = route(Auth::Bearer);
+        r.headers.insert("accept-encoding".into(), "gzip".into());
+        r.headers.insert("ACCEPT-ENCODING".into(), "br".into());
+        let out = forward_headers(&HeaderMap::new(), &r, "k", true).unwrap();
+        assert!(out.get(header::ACCEPT_ENCODING).is_none());
+        let plain = forward_headers(&HeaderMap::new(), &r, "k", false).unwrap();
+        assert_eq!(plain.get(header::ACCEPT_ENCODING).unwrap(), "br");
     }
 
     #[test]

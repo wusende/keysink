@@ -1,6 +1,8 @@
 pub mod audit;
 pub mod cli;
 pub mod error;
+#[cfg(test)]
+pub(crate) mod fuzz;
 pub mod model;
 pub mod password;
 pub mod proxy;

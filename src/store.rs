@@ -320,7 +320,10 @@ pub fn export(paths: &Paths, output: &Path, passphrase: &str) -> Result<usize> {
     Ok(stripped)
 }
 
-fn encrypt_to(plaintext: &[u8], identities: &[&age::x25519::Identity]) -> Result<Vec<u8>> {
+pub(crate) fn encrypt_to(
+    plaintext: &[u8],
+    identities: &[&age::x25519::Identity],
+) -> Result<Vec<u8>> {
     let recipients: Vec<Box<dyn age::Recipient>> = identities
         .iter()
         .map(|id| Box::new(id.to_public()) as Box<dyn age::Recipient>)
@@ -336,7 +339,7 @@ fn encrypt_to(plaintext: &[u8], identities: &[&age::x25519::Identity]) -> Result
     Ok(out)
 }
 
-fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8>> {
+pub(crate) fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8>> {
     let decryptor = age::Decryptor::new(ciphertext)?;
     if decryptor.is_scrypt() {
         return Err(Error::msg(

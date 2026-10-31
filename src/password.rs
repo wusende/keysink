@@ -38,6 +38,17 @@ pub fn verify_password(password: &str, encoded: &str) -> Result<bool> {
     let p: u32 = parse(parts.next(), "p")?;
     let salt = hex_decode(parts.next().ok_or_else(|| Error::msg("missing salt"))?)?;
     let expected = hex_decode(parts.next().ok_or_else(|| Error::msg("missing hash"))?)?;
+    // scrypt's own Params::new only rejects log_n >= 64 (overflow), so a
+    // tampered password_hash string could otherwise push scrypt() into a
+    // multi-GB state allocation and abort the process. Legit hashes are
+    // minted by hash_password at log_n=15/r=8 (~32 MiB); cap at 256 MiB.
+    let state_mem = (1u64 << log_n.min(62))
+        .checked_mul(r as u64)
+        .and_then(|v| v.checked_mul(128));
+    match state_mem {
+        Some(mem) if mem <= 256 * 1024 * 1024 => {}
+        _ => return Err(Error::msg("password hash scrypt params too large")),
+    }
     let params = scrypt::Params::new(log_n, r, p)
         .map_err(|e| Error::msg(format!("invalid scrypt parameters: {e}")))?;
     let mut out = vec![0u8; expected.len()];
@@ -142,5 +153,18 @@ mod tests {
     #[test]
     fn rejects_empty_password() {
         assert!(hash_password("").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_scrypt_params_before_allocating() {
+        // Without the memory guard, scrypt::Params::new happily accepts
+        // log_n=40 / r=2^28 and scrypt() then aborts the process trying to
+        // touch tens of GB of state.
+        let huge_log_n =
+            "scrypt$40$8$1$00112233445566778899aabbccddeeff$00112233445566778899aabbccddeeff";
+        assert!(verify_password("x", huge_log_n).is_err());
+
+        let huge_r = "scrypt$15$268435456$1$00112233445566778899aabbccddeeff$00112233445566778899aabbccddeeff";
+        assert!(verify_password("x", huge_r).is_err());
     }
 }
