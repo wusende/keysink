@@ -1033,6 +1033,16 @@ fn fuzz_age_decrypt_corpus() {
 // ---------- performance scenarios for pure helpers ----------
 
 fn timed(name: &str, budget: std::time::Duration, elapsed: std::time::Duration) {
+    // Debug builds are 30-50x slower than release here (no inlining, bounds
+    // checks, no SIMD in memchr), so the same absolute budget that is generous
+    // for release flakes on a loaded CI runner. Scale instead of loosening the
+    // release budget: a real regression still shows up as a multiple, not a few
+    // percent.
+    let budget = if cfg!(debug_assertions) {
+        budget * 8
+    } else {
+        budget
+    };
     println!("perf/{name}: {elapsed:?} (budget {budget:?})");
     assert!(
         elapsed <= budget,
