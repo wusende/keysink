@@ -1007,6 +1007,37 @@ fn replay_corpus(name: &str, mut target: impl FnMut(&[u8])) {
 }
 
 #[test]
+fn fuzz_is_stream_request_deep_nesting() {
+    // Stack-overflow audit lock: serde_json's ignored-field skipper is
+    // iterative (explicit heap stack, not call-stack recursion), so
+    // attacker-controlled nesting depth must neither overflow the stack nor
+    // change stream semantics. Regression guard for the depth direction,
+    // which the generative targets above never reach (they stay 1-4 deep).
+    for depth in [200usize, 10_000, 200_000] {
+        let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let cases: [(String, bool); 4] = [
+            // no "stream" substring anywhere: memchr prefilter short-circuits
+            (format!(r#"{{"model":"m","pad":{deep}}}"#), false),
+            // stream present after a deeply nested ignored field: full parse
+            (format!(r#"{{"pad":{deep},"stream":true}}"#), true),
+            // "stream" only inside a string value: must parse, result false
+            (format!(r#"{{"noise":"stream","pad":{deep}}}"#), false),
+            // deep nesting at the top level: struct probe fails fast
+            (deep.clone(), false),
+        ];
+        for (i, (body, expect)) in cases.into_iter().enumerate() {
+            let body = body.into_bytes();
+            assert_eq!(
+                is_stream_request(&body),
+                expect,
+                "case {i} depth={depth}: head={:?}",
+                String::from_utf8_lossy(&body[..body.len().min(48)])
+            );
+        }
+    }
+}
+
+#[test]
 fn fuzz_is_stream_request_corpus() {
     replay_corpus("is_stream_request", |b| {
         let _ = is_stream_request(b);

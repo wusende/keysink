@@ -721,6 +721,43 @@ async fn query_auth_replaces_inbound_param() {
 }
 
 #[tokio::test]
+async fn deeply_nested_body_survives_the_full_proxy_path() {
+    // Stack-overflow audit PoC, kept as a regression: an attacker-controlled
+    // request body can be arbitrarily deep JSON. serde_json's ignored-field
+    // skipper is iterative, so the real axum → handler → reqwest path must
+    // survive it — this drives the full stack, not just the parser.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (gw, vks) = spawn_gateway(store, RetryPolicy::default(), 1 << 20).await;
+    let client = reqwest::Client::new();
+
+    let depth = 100_000usize;
+    let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    let body = format!(r#"{{"pad":{deep},"stream":false}}"#).into_bytes();
+    assert!(body.len() < 1 << 20, "PoC body must fit the 1MB test limit");
+
+    let resp = client
+        .post(format!("http://{gw}/v1/x"))
+        .header("authorization", format!("Bearer {}", vks["main"]))
+        .body(body)
+        .send()
+        .await
+        .expect("gateway must survive a deeply nested body");
+    assert_eq!(resp.status(), 200);
+    let echo: Echo = resp.json().await.unwrap();
+    assert_eq!(echo.path, "/v1/x");
+}
+
+#[tokio::test]
 async fn health_endpoint_reports_route_count() {
     let (mock, _hits) = spawn_mock().await;
     let mut store = Store::new();
