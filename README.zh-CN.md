@@ -76,7 +76,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 ```
 keysink init                     # 脚本/无终端环境的首次入口(交互终端里 serve 会自动初始化)
 keysink route add|ls|show|rotate|update|rm|enable|disable
-keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
+keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N]
 keysink status | doctor
 keysink export --output FILE      # 需要主密码;剥离所有 key 值
 keysink rekey [--yes]             # 轮换保险库主密钥
@@ -87,7 +87,7 @@ keysink deploy | uninstall        # 系统安装 / 对称卸载
 
 - `--auth bearer|x-api-key|header|basic|query|none`——OpenAI 是 Bearer,Claude 是 `x-api-key`,Gemini 是 `x-goog-api-key`。其它情况用 `--auth header` 配 `--auth-header 名字`,需要前缀再加 `--auth-prefix 'Bearer '`
 - `--header 'K:V'` 注入静态 header(可重复);`--proxy URL|direct` 设单路由上游代理,默认跟随 `HTTP(S)_PROXY`
-- `--retry-on-status CODE` 按路由覆盖可重试的状态码集合
+- `--retry-on-status CODE` 按路由覆盖可重试的状态码集合(400..=599)
 
 ## 保险库在哪
 
@@ -127,7 +127,7 @@ runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
 
 `--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。
 
-`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。
+`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。
 
 ## 它不是什么
 

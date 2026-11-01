@@ -105,7 +105,7 @@ talk to two different providers, or to the same provider with different keys.
 ```
 keysink init                     # first entry point in scripts / headless environments (interactive serve auto-initializes)
 keysink route add|ls|show|rotate|update|rm|enable|disable
-keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
+keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N]
 keysink status | doctor
 keysink export --output FILE      # needs master password; strips all key values
 keysink rekey [--yes]             # rotate the vault master key
@@ -119,7 +119,7 @@ Route options worth knowing:
   plus `--auth-header NAME` and optional `--auth-prefix 'Bearer '`
 - `--header 'K:V'` injects static headers (repeatable); `--proxy URL|direct` sets
   a per-route upstream proxy, defaulting to `HTTP(S)_PROXY`
-- `--retry-on-status CODE` overrides the retryable set per route
+- `--retry-on-status CODE` overrides the retryable set per route (400..=599)
 
 ## Where the vault lives
 
@@ -173,6 +173,9 @@ headers, body or query. Off by default.
 
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.
+Everything a request touches is bounded by default — body size, in-flight
+requests, connections, time — so a hung upstream or a misbehaving agent can't
+take the gateway down.
 
 ## What this is not
 
