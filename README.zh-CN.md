@@ -2,6 +2,10 @@
 
 [English](README.md) | 简体中文
 
+[![CI](https://github.com/wusende/keysink/actions/workflows/ci.yml/badge.svg)](https://github.com/wusende/keysink/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 本地小型凭证网关:让真 API key 远离你的 agent。agent 只持有可随时吊销的虚拟 key(`ks_...`),keysink 把真 key 加密存在本机,仅在转发请求时注入上游。
 
 真 key **没有任何读取通道**:CLI 打印不出、备份导出会剥离、网关只绑 loopback。

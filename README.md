@@ -2,6 +2,11 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/wusende/keysink/actions/workflows/ci.yml/badge.svg)](https://github.com/wusende/keysink/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/wusende/keysink/releases/latest)
+
 A tiny local gateway that keeps real API keys away from your agents. The agent only ever holds a revocable virtual key (`ks_...`); keysink stores the real keys encrypted on your machine and injects them only when forwarding a request.
 
 There is **no read channel for real keys**: the CLI cannot print them, backups strip them, and the gateway binds loopback only.
