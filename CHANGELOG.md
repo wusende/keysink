@@ -58,3 +58,6 @@ First public release.
 Download the archive for your platform, verify against the matching `.sha256`, put the binary on your `PATH`.
 
 中文说明见 [README.zh-CN.md](https://github.com/wusende/keysink/blob/main/README.zh-CN.md)。
+- Client connections are capped in the serve loop (`--max-concurrent`-derived, 8x clamped to 256..=16384): excess connections are closed on accept instead of accumulating tasks and file descriptors — the remaining exposure after the request bound, relevant with `--allow-remote`
+- Upstream body-error logs record summary fields only (timeout/connect/status), never the full reqwest error: its `Display` appends `for url (<url>)` when a URL is attached, and with `--auth query` that URL carries the upstream key
+- The serve loop survives descriptor pressure: `EMFILE`/`ENFILE` on accept backs off 1s and keeps serving instead of exiting the process, and the systemd unit ships `LimitNOFILE=16384` so the OS limit stops being the real ceiling; hitting the connection cap now leaves visible evidence (a warn per 100 shed connections, previously debug-silent)

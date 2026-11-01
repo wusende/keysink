@@ -812,6 +812,7 @@ async fn serve_inbound_reaps_stalled_request_head() {
         app,
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_millis(300),
+            max_connections: 16,
         },
         std::future::pending(),
     ));
@@ -847,6 +848,79 @@ async fn serve_inbound_reaps_stalled_request_head() {
         started.elapsed() < Duration::from_secs(5),
         "reap must be prompt, took {:?}",
         started.elapsed()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn serve_inbound_sheds_connections_beyond_the_cap() {
+    // --allow-remote hardening: connections beyond the cap are closed on
+    // accept instead of accumulating tasks and fds. A held idle connection
+    // occupies its slot; the next one is shed; after it closes, the slot
+    // frees and new connections are served again.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (state, _vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
+    );
+    let app = keysink::proxy::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(keysink::proxy::serve_inbound(
+        listener,
+        app,
+        keysink::proxy::InboundLimits {
+            header_timeout: Duration::from_secs(30),
+            max_connections: 1,
+        },
+        std::future::pending(),
+    ));
+
+    use tokio::io::AsyncReadExt;
+    // Slot holder: an open connection parked before sending anything.
+    let mut holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Next connection is shed (closed promptly, no response).
+    let mut shed = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 16];
+    let closed = tokio::time::timeout(Duration::from_secs(3), shed.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "connection beyond the cap must be closed promptly, got {closed:?}"
+    );
+    // The slot holder is untouched and can still complete a request over its
+    // own socket (reqwest would open a new connection, which is shed).
+    let req = b"GET /__keysink/health HTTP/1.1\r\nHost: gw\r\nConnection: close\r\n\r\n";
+    use tokio::io::AsyncWriteExt;
+    holder.write_all(req).await.unwrap();
+    let mut response = Vec::new();
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(3), holder.read(&mut buf))
+            .await
+            .expect("holder connection must stay usable")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "slot holder must still be served, got: {text}"
     );
     server.abort();
 }
@@ -945,6 +1019,7 @@ async fn serve_inbound_passes_sse_streams() {
         app,
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_secs(30),
+            max_connections: 64,
         },
         std::future::pending(),
     ));

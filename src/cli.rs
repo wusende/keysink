@@ -1100,6 +1100,10 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
             app,
             proxy::InboundLimits {
                 header_timeout: proxy::CLIENT_HEADER_TIMEOUT,
+                // Connections legitimately outnumber in-flight requests:
+                // idle keep-alive and long-lived SSE hold a connection but
+                // no request permit.
+                max_connections: (args.max_concurrent * 8).clamp(256, 16_384),
             },
             shutdown_signal(),
         )
@@ -1272,6 +1276,10 @@ Type=simple
 User=keysink
 Group=keysink
 ExecStart=/usr/local/bin/keysink serve --listen 127.0.0.1:8787
+# Headroom for the serve loop's connection cap (max 16384) plus upstream
+# sockets; the Linux default (often 1024) would be the real ceiling long
+# before the gateway's own limits.
+LimitNOFILE=16384
 Environment=KEYSINK_VAULT_HOME=/var/lib/keysink
 Environment=RUST_LOG=info
 StateDirectory=keysink

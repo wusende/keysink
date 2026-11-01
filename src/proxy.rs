@@ -251,6 +251,12 @@ pub struct InboundLimits {
     /// Whole-head bound: a client that does not finish sending its request
     /// head within this time is disconnected (slowloris defense).
     pub header_timeout: Duration,
+    /// Cap on concurrently open client connections: excess connections are
+    /// closed on accept instead of accumulating tasks and file descriptors
+    /// (matters once the gateway is exposed with --allow-remote). Higher
+    /// than the request bound on purpose: idle keep-alive and long-lived SSE
+    /// connections hold a connection slot but no request permit.
+    pub max_connections: usize,
 }
 
 /// Serves the gateway on `listener` until `shutdown` resolves — the same
@@ -269,6 +275,8 @@ pub async fn serve_inbound(
 ) -> std::io::Result<()> {
     let mut shutdown = std::pin::pin!(shutdown);
     let mut conns = tokio::task::JoinSet::new();
+    let conn_slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let mut shed = 0u64;
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => None,
@@ -277,12 +285,45 @@ pub async fn serve_inbound(
         let Some(accepted) = accepted else {
             break;
         };
-        let (stream, _peer) = accepted?;
+        let (stream, _peer) = match accepted {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Descriptor pressure is transient (a burst above the OS fd
+                // limit); back off and keep serving instead of turning it
+                // into a full outage. Everything else stays fatal, as before.
+                #[cfg(unix)]
+                if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
+                    tracing::warn!(error = %e, "out of file descriptors while accepting; backing off 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        // Shed beyond the connection cap: close immediately instead of
+        // accumulating tasks and fds. The permit lives exactly as long as
+        // the connection task. Warn cadence matches the audit-drop counter:
+        // a flood sheds fast, so one line per 100 keeps the default info
+        // log sane while still leaving evidence a cap was ever hit.
+        let Ok(_conn_slot) = conn_slots.clone().try_acquire_owned() else {
+            shed += 1;
+            if shed % 100 == 1 {
+                tracing::warn!(
+                    shed,
+                    "connection cap reached; dropping incoming connections"
+                );
+            }
+            drop(stream);
+            continue;
+        };
         let _ = stream.set_nodelay(true);
         // The connection future owns its builder (cheap config clone) so it
         // stays 'static and can outlive this loop while draining.
         let app = app.clone();
         conns.spawn(async move {
+            // Hold the connection slot for the task's whole life: dropped
+            // when the connection ends, freeing the slot for the next accept.
+            let _conn_slot = _conn_slot;
             let mut builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             builder.http1().timer(hyper_util::rt::TokioTimer::new());
@@ -1184,7 +1225,18 @@ where
                         "upstream stopped sending the response body (read idle); aborting the response"
                     );
                 } else {
-                    tracing::warn!(error = %e, "failed to read upstream response body");
+                    // Summary fields only, deliberately not the error object:
+                    // reqwest Display appends "for url (<url>)" when one is
+                    // attached, and with Auth::Query that URL carries the
+                    // upstream key. Today body-kind errors carry no URL, but
+                    // logging the full object would turn that reqwest
+                    // invariant into a silent leak the next time it changes.
+                    tracing::warn!(
+                        timeout = e.is_timeout(),
+                        connect = e.is_connect(),
+                        status = e.status().map(|s| s.as_u16()),
+                        "failed to read upstream response body"
+                    );
                 }
                 Some((
                     Err(std::io::Error::other("upstream body error")),
