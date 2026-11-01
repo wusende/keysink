@@ -27,11 +27,22 @@ static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Read-idle timeout for streaming (SSE) clients: if the upstream sends no
 /// bytes for this long, it is deemed hung. Applies only to the streaming
-/// client — non-streaming requests must not set a read idle, otherwise slow
+/// client — at the client level, non-streaming requests must not set a read
+/// idle, because reqwest applies it to the response-header wait too: slow
 /// models that only send response headers after generation completes
-/// (non-streaming long reasoning) get killed at 60s and then retried as a
-/// network error POST (double billing).
+/// (non-streaming long reasoning) would be killed at 60s and then retried as
+/// a network error POST (double billing). The header wait is backstopped by
+/// the outer header_timeout (tokio timeout) instead.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read-idle bound for a non-streaming response body, applied per chunk at
+/// the passthrough layer (see `idle_bounded`). The plain client has no
+/// client-level read_timeout (see STREAM_READ_TIMEOUT), so without this an
+/// upstream that sends response headers and then goes silent mid-body would
+/// hang the handler forever — and with it, graceful shutdown. Aligned with
+/// the header-phase bound on purpose: one story, "no upstream progress ⇒
+/// give up". SSE bodies are bounded by STREAM_READ_TIMEOUT instead.
+pub const BODY_READ_IDLE: Duration = crate::retry::DEFAULT_HEADER_TIMEOUT;
 
 const RID_DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -71,6 +82,8 @@ pub struct AppState {
     pub clients: ProxyClients,
     pub retry: RetryPolicy,
     pub body_limit: usize,
+    /// Per-chunk read-idle bound for non-streaming upstream bodies (BODY_READ_IDLE in production; tests inject a small value).
+    pub body_read_idle: Duration,
     pub audit: Audit,
     pub started: Instant,
 }
@@ -119,7 +132,7 @@ pub fn build_upstream_client(
 
 /// Two clients under the same proxy config: streaming / non-streaming timeout semantics differ, so they must be built separately.
 struct ClientPair {
-    /// Non-streaming: no read idle; "waiting for response headers" is backstopped by the outer header_timeout (tokio timeout).
+    /// Non-streaming: no client-level read idle (see STREAM_READ_TIMEOUT); the header wait is backstopped by the outer header_timeout (tokio timeout), the body phase by the per-chunk BODY_READ_IDLE at the passthrough layer.
     plain: reqwest::Client,
     /// Streaming: 60s read idle, used to detect hung SSE.
     streaming: reqwest::Client,
@@ -609,9 +622,15 @@ async fn forward_with_retry(
         }
 
         let response = if is_stream {
-            stream_response(resp, route.sse_terminator, rid.to_string()).await
+            stream_response(
+                resp,
+                route.sse_terminator,
+                rid.to_string(),
+                state.body_read_idle,
+            )
+            .await
         } else {
-            pass_through_response(resp).await
+            pass_through_response(resp, state.body_read_idle).await
         };
         return Forwarded {
             response,
@@ -862,20 +881,68 @@ pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
     }
 }
 
-async fn pass_through_response(resp: reqwest::Response) -> Response {
+async fn pass_through_response(resp: reqwest::Response, body_idle: Duration) -> Response {
     let status = resp.status();
     let headers = convert_resp_headers(resp.headers());
-    let stream = resp.bytes_stream().map(|res| match res {
-        Ok(chunk) => Ok::<Bytes, std::io::Error>(chunk),
-        Err(_) => {
-            tracing::warn!("failed to read upstream response body");
-            Err(std::io::Error::other("upstream body error"))
-        }
-    });
+    let stream = idle_bounded(resp.bytes_stream(), body_idle);
     build_response(status, headers, Body::from_stream(stream))
 }
 
-async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: String) -> Response {
+/// Per-chunk read-idle bound for a forwarded response body: chunks pass
+/// through unchanged; if the upstream goes silent past `idle`, or errors, the
+/// body ends with an error so hyper aborts the response instead of hanging on
+/// it forever. Ends after the first error rather than looping errors if the
+/// consumer polls again.
+fn idle_bounded<S>(
+    inner: S,
+    idle: Duration,
+) -> impl futures_util::Stream<Item = std::result::Result<Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>>,
+{
+    let inner = Box::pin(inner);
+    stream::unfold((inner, false), move |(mut inner, done)| async move {
+        if done {
+            return None;
+        }
+        match tokio::time::timeout(idle, inner.next()).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), (inner, false))),
+            Ok(Some(Err(e))) => {
+                if e.is_timeout() {
+                    tracing::warn!(
+                        "upstream stopped sending the response body (read idle); aborting the response"
+                    );
+                } else {
+                    tracing::warn!(error = %e, "failed to read upstream response body");
+                }
+                Some((
+                    Err(std::io::Error::other("upstream body error")),
+                    (inner, true),
+                ))
+            }
+            Ok(None) => None,
+            Err(_) => {
+                tracing::warn!(
+                    "upstream response body stalled past the read idle; aborting the response"
+                );
+                Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upstream body read idle timeout",
+                    )),
+                    (inner, true),
+                ))
+            }
+        }
+    })
+}
+
+async fn stream_response(
+    resp: reqwest::Response,
+    terminator: Terminator,
+    rid: String,
+    body_idle: Duration,
+) -> Response {
     let status = resp.status();
     let headers = convert_resp_headers(resp.headers());
 
@@ -886,7 +953,7 @@ async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: S
         .unwrap_or(false);
 
     if !is_sse || terminator == Terminator::None {
-        return pass_through_response(resp).await;
+        return pass_through_response(resp, body_idle).await;
     }
 
     // A content-encoded response is compressed bytes, so terminator scanning
@@ -896,7 +963,7 @@ async fn stream_response(resp: reqwest::Response, terminator: Terminator, rid: S
     // error out, e.g. Bun's ZstdDecompressionError).
     if is_encoded(&headers) {
         tracing::debug!(rid = %rid, "response is content-encoded, skipping SSE terminator detection");
-        return pass_through_response(resp).await;
+        return pass_through_response(resp, body_idle).await;
     }
 
     let seen_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1060,7 +1127,16 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
             if now == last {
                 continue;
             }
-            match crate::store::unlock(&paths) {
+            // File I/O + age decryption + JSON parse + validate are blocking:
+            // run them on the blocking pool so a slow disk or a large vault
+            // never occupies a tokio worker while requests are being forwarded.
+            let unlocked = {
+                let paths = paths.clone();
+                tokio::task::spawn_blocking(move || crate::store::unlock(&paths))
+                    .await
+                    .unwrap_or_else(|e| Err(Error::msg(format!("hot reload worker failed: {e}"))))
+            };
+            match unlocked {
                 Ok(unlocked) => match RouteTable::build(&unlocked.store) {
                     Ok(table) => {
                         let from_backup = unlocked.from_backup;
@@ -1448,5 +1524,44 @@ mod tests {
         assert!(network_retry_allowed(false, true));
         // POST + non-connect error (timeout/disconnect): upstream may have billed → not replayable
         assert!(!network_retry_allowed(false, false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_passes_chunks_and_ends_cleanly() {
+        let inner = stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"b")),
+        ]);
+        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(60)));
+        assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"a"));
+        assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"b"));
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_aborts_stalled_body_and_stops() {
+        // one chunk, then the upstream goes silent forever
+        let inner = stream::once(async { Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"x")) })
+            .chain(stream::pending::<reqwest::Result<Bytes>>());
+        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(30)));
+        assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"x"));
+        let err = s.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // after the timeout error the stream must end, not loop errors
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_tolerates_slow_but_alive_upstream() {
+        // gaps well under the idle bound must not trip the abort
+        let inner = stream::iter(0u8..3).then(|i| async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<Bytes, reqwest::Error>(Bytes::from(vec![i]))
+        });
+        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(60)));
+        for i in 0u8..3 {
+            assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from(vec![i]));
+        }
+        assert!(s.next().await.is_none());
     }
 }

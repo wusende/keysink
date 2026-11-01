@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Stability fixes from a performance/stability review:
+
+- Non-streaming responses now abort when the upstream goes silent mid-body (per-chunk read idle, aligned with the response-header timeout): an upstream that sent headers and then stalled used to hang the handler forever — blocking the connection, its memory, and graceful shutdown with it. SSE streams keep their own 60s idle; the header wait keeps its 120s `header_timeout`
+- Store hot-reload decryption (file I/O + age decrypt + JSON parse + validate) now runs on tokio's blocking pool instead of a worker thread: a slow disk or a large vault no longer stalls concurrent request forwarding for the duration of a reload
+
 UX fixes from a scenario-based review (fresh install → route add → agent onboarding → key rotation → revocation → recovery):
 
 - `route add` no longer prints a fabricated default address (`127.0.0.1:8787`) when the gateway is not running — it reports the address as unknown and points at `keysink serve`; the `TOKEN=` line (shown only once) is still printed (`current_gateway` now returns `Option`)

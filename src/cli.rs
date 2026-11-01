@@ -1048,6 +1048,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         clients,
         retry,
         body_limit: args.body_limit_mb * 1024 * 1024,
+        body_read_idle: proxy::BODY_READ_IDLE,
         audit,
         started: Instant::now(),
     });

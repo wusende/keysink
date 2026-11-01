@@ -317,6 +317,7 @@ async fn watcher_hot_reload_scenarios() {
         clients: keysink::proxy::ProxyClients::new().unwrap(),
         retry: keysink::retry::RetryPolicy::default(),
         body_limit: 32 * 1024 * 1024,
+        body_read_idle: keysink::proxy::BODY_READ_IDLE,
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
     });

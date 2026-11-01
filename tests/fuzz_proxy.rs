@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all};
 use keysink::model::{Auth, Route, Store, Terminator};
 use keysink::retry::RetryPolicy;
 use keysink::vkey;
@@ -76,6 +76,20 @@ async fn mock_handler(State(hits): State<Arc<AtomicUsize>>, req: Request<Body>) 
     if path == "/hang" {
         std::future::pending::<()>().await;
         unreachable!();
+    }
+    if path == "/stall-body" {
+        // Headers arrive, one chunk is delivered, then the upstream goes
+        // silent forever — the non-streaming body read idle must abort it.
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"partial-"))
+        })
+        .chain(futures_util::stream::pending());
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            Body::from_stream(stream),
+        )
+            .into_response();
     }
     if let Some(code) = path.strip_prefix("/status/") {
         let status = StatusCode::from_u16(code.parse().unwrap_or(500)).unwrap_or(StatusCode::OK);
@@ -231,6 +245,15 @@ async fn spawn_gateway(
     retry: RetryPolicy,
     body_limit: usize,
 ) -> (SocketAddr, HashMap<String, String>) {
+    spawn_gateway_with_idle(store, retry, body_limit, keysink::proxy::BODY_READ_IDLE).await
+}
+
+async fn spawn_gateway_with_idle(
+    store: Store,
+    retry: RetryPolicy,
+    body_limit: usize,
+    body_read_idle: Duration,
+) -> (SocketAddr, HashMap<String, String>) {
     let mut vkeys = HashMap::new();
     for (name, r) in &store.routes {
         vkeys.insert(name.clone(), r.vkey.clone());
@@ -246,6 +269,7 @@ async fn spawn_gateway(
         clients: keysink::proxy::ProxyClients::new().unwrap(),
         retry,
         body_limit,
+        body_read_idle,
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
     });
@@ -548,6 +572,53 @@ async fn upstream_failures_map_to_clean_errors() {
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "timeout must fire promptly"
+    );
+}
+
+#[tokio::test]
+async fn stalled_non_streaming_body_aborts_instead_of_hanging() {
+    // Regression: an upstream that sent response headers and then went
+    // silent mid-body used to hang the handler forever on the non-streaming
+    // path (the plain client has no client-level read idle) — and a hung
+    // handler also stalled graceful shutdown.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (gw, vks) = spawn_gateway_with_idle(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        Duration::from_millis(300),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let started = Instant::now();
+    let resp = client
+        .post(format!("http://{gw}/stall-body"))
+        .header("authorization", format!("Bearer {}", vks["main"]))
+        .body(b"{}".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "response headers must still arrive");
+    let body = resp.bytes().await;
+    assert!(
+        body.is_err(),
+        "stalled body must be aborted, not delivered: {body:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "abort must be prompt, took {:?}",
+        started.elapsed()
     );
 }
 
