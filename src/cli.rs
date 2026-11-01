@@ -1708,8 +1708,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let live = listener.local_addr().unwrap();
         util::atomic_write(&paths.gateway_addr(), format!("{live}\n").as_bytes(), 0o600).unwrap();
-        let (addr, alive) =
-            current_gateway(&paths).expect("gateway.addr written, current_gateway must return Some");
+        let (addr, alive) = current_gateway(&paths)
+            .expect("gateway.addr written, current_gateway must return Some");
         assert_eq!(addr, live.to_string());
         assert!(alive);
 
