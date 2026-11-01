@@ -1049,6 +1049,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         retry,
         body_limit: args.body_limit_mb * 1024 * 1024,
         body_read_idle: proxy::BODY_READ_IDLE,
+        inbound_body_timeout: proxy::CLIENT_BODY_TIMEOUT,
         audit,
         started: Instant::now(),
     });
@@ -1087,10 +1088,16 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         } else {
             tracing::info!("audit disabled (enable with --audit-log)");
         }
-        let serve_result = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|e| Error::msg(format!("server exited abnormally: {e}")));
+        let serve_result = proxy::serve_inbound(
+            listener,
+            app,
+            proxy::InboundLimits {
+                header_timeout: proxy::CLIENT_HEADER_TIMEOUT,
+            },
+            shutdown_signal(),
+        )
+        .await
+        .map_err(|e| Error::msg(format!("server exited abnormally: {e}")));
         // Remove gateway.addr on shutdown; it can still linger after SIGKILL, so route add falls back to TCP probing
         let _ = std::fs::remove_file(paths.gateway_addr());
         serve_result

@@ -43,6 +43,20 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// give up". SSE bodies are bounded by STREAM_READ_TIMEOUT instead.
 pub const BODY_READ_IDLE: Duration = crate::retry::DEFAULT_HEADER_TIMEOUT;
 
+/// Whole-head bound on the inbound request from an agent client: a
+/// connection that never finishes sending its head (slowloris) is closed
+/// within this window. Bounds the head as a whole, matching hyper-util's
+/// semantics (not per read).
+pub const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-body bound on the handler reading the inbound request body: a
+/// client that trickles a body forever gets a 408 instead of holding the
+/// handler (and its buffered bytes) indefinitely. Generous next to the 32MB
+/// byte limit — legit payloads are small (LLM prompts) and, once flowing,
+/// arrive continuously. Streaming responses are NOT affected: this bounds
+/// reads from the client only.
+pub const CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+
 const RID_DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 fn next_rid() -> String {
@@ -83,6 +97,8 @@ pub struct AppState {
     pub body_limit: usize,
     /// Per-chunk read-idle bound for non-streaming upstream bodies (BODY_READ_IDLE in production; tests inject a small value).
     pub body_read_idle: Duration,
+    /// Whole-body bound on reading the inbound request body (CLIENT_BODY_TIMEOUT in production; tests inject a small value).
+    pub inbound_body_timeout: Duration,
     pub audit: Audit,
     pub started: Instant,
 }
@@ -222,6 +238,71 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Inbound read bounds applied by serve_inbound.
+#[derive(Clone, Copy)]
+pub struct InboundLimits {
+    /// Whole-head bound: a client that does not finish sending its request
+    /// head within this time is disconnected (slowloris defense).
+    pub header_timeout: Duration,
+}
+
+/// Serves the gateway on `listener` until `shutdown` resolves — the same
+/// shape as axum::serve(listener, app).with_graceful_shutdown(shutdown),
+/// except the inbound head read is time-bounded: axum::serve exposes no
+/// header_read_timeout, so a client that opens a connection and stalls
+/// mid-head would hold a task + socket forever. That matters once the
+/// gateway is exposed with --allow-remote, but reaping dead connections is
+/// cheap insurance everywhere. The body phase is bounded app-side (see
+/// CLIENT_BODY_TIMEOUT), where it can never touch streaming responses.
+pub async fn serve_inbound(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: InboundLimits,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut conns = tokio::task::JoinSet::new();
+    loop {
+        let accepted = tokio::select! {
+            _ = &mut shutdown => None,
+            accepted = listener.accept() => Some(accepted),
+        };
+        let Some(accepted) = accepted else {
+            break;
+        };
+        let (stream, _peer) = accepted?;
+        let _ = stream.set_nodelay(true);
+        // The connection future owns its builder (cheap config clone) so it
+        // stays 'static and can outlive this loop while draining.
+        let app = app.clone();
+        conns.spawn(async move {
+            let mut builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            builder.http1().timer(hyper_util::rt::TokioTimer::new());
+            builder
+                .http1()
+                .header_read_timeout(Some(limits.header_timeout));
+            if let Err(e) = builder
+                .serve_connection_with_upgrades(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper_util::service::TowerToHyperService::new(app.clone()),
+                )
+                .await
+            {
+                // Client aborts mid-stream are routine for a proxy; keep the
+                // noise down but leave a trace for debugging.
+                tracing::debug!(error = %e, "inbound connection ended");
+            }
+        });
+    }
+    // Graceful: stop accepting, then let in-flight requests (including long
+    // SSE streams) run to completion on their own — same semantics as
+    // axum::serve's graceful shutdown; the service manager's stop timeout is
+    // the hard cap.
+    while conns.join_next().await.is_some() {}
+    Ok(())
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snap = state.snapshot.load();
     Json(json!({
@@ -343,9 +424,14 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         );
     }
 
-    let body = match axum::body::to_bytes(body, state.body_limit).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    let read = tokio::time::timeout(
+        state.inbound_body_timeout,
+        axum::body::to_bytes(body, state.body_limit),
+    )
+    .await;
+    let body = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
             let too_large = is_length_limit_error(&e);
             let (status, kind, message) = if too_large {
                 (
@@ -361,6 +447,16 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
                 )
             };
             return deny(route_name, Some(&hash), status, kind, message);
+        }
+        // The client never finished sending its body: 408, and drop it.
+        Err(_elapsed) => {
+            return deny(
+                route_name,
+                Some(&hash),
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+                "timed out reading request body",
+            );
         }
     };
 

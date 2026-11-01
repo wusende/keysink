@@ -21,6 +21,10 @@ fs2 = "0.4"
 futures-util = "0.3"
 http-body-util = "0.1"
 httpdate = "1"
+# Serve loop drives hyper-util's auto builder directly (see proxy::serve_inbound):
+# axum::serve exposes no header_read_timeout, so a client stalling mid-head
+# cannot be reaped.
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "service", "tokio"] }
 libc = "0.2"
 memchr = "2"
 rand = "0.10"

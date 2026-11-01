@@ -248,12 +248,13 @@ async fn spawn_gateway(
     spawn_gateway_with_idle(store, retry, body_limit, keysink::proxy::BODY_READ_IDLE).await
 }
 
-async fn spawn_gateway_with_idle(
+fn build_state(
     store: Store,
     retry: RetryPolicy,
     body_limit: usize,
     body_read_idle: Duration,
-) -> (SocketAddr, HashMap<String, String>) {
+    inbound_body_timeout: Duration,
+) -> (Arc<keysink::proxy::AppState>, HashMap<String, String>) {
     let mut vkeys = HashMap::new();
     for (name, r) in &store.routes {
         vkeys.insert(name.clone(), r.vkey.clone());
@@ -270,9 +271,26 @@ async fn spawn_gateway_with_idle(
         retry,
         body_limit,
         body_read_idle,
+        inbound_body_timeout,
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
     });
+    (state, vkeys)
+}
+
+async fn spawn_gateway_with_idle(
+    store: Store,
+    retry: RetryPolicy,
+    body_limit: usize,
+    body_read_idle: Duration,
+) -> (SocketAddr, HashMap<String, String>) {
+    let (state, vkeys) = build_state(
+        store,
+        retry,
+        body_limit,
+        body_read_idle,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+    );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -755,6 +773,195 @@ async fn deeply_nested_body_survives_the_full_proxy_path() {
     assert_eq!(resp.status(), 200);
     let echo: Echo = resp.json().await.unwrap();
     assert_eq!(echo.path, "/v1/x");
+}
+
+// ---------- inbound read bounds (serve_inbound) ----------
+
+#[tokio::test]
+async fn serve_inbound_reaps_stalled_request_head() {
+    // slowloris defense: a client that opens a connection and stalls mid-head
+    // must be disconnected within the header bound — while healthy requests
+    // on other connections keep working.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (state, _vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+    );
+    let app = keysink::proxy::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(keysink::proxy::serve_inbound(
+        listener,
+        app,
+        keysink::proxy::InboundLimits {
+            header_timeout: Duration::from_millis(300),
+        },
+        std::future::pending(),
+    ));
+
+    // healthy requests on other connections are unaffected
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/__keysink/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // stalled head: hyper closes the connection within the bound
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /__keysink/health HTTP/1.1\r\nHost: gw\r\n")
+        .await
+        .unwrap(); // head deliberately not terminated (no final CRLF)
+    let started = Instant::now();
+    let mut buf = [0u8; 64];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("connection must close within the header bound")
+            .unwrap_or(0);
+        if n == 0 {
+            break; // EOF or reset: the server reaped the stalled connection
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "reap must be prompt, took {:?}",
+        started.elapsed()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbound_body_trickle_times_out() {
+    // A client that sends the head and then trickles the body forever must
+    // get a 408 instead of holding the handler — the byte limit alone does
+    // not provide this bound.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (state, vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        Duration::from_millis(300),
+    );
+    let app = keysink::proxy::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /v1/x HTTP/1.1\r\nHost: gw\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\n\r\n{{",
+        vks["main"]
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+
+    let started = Instant::now();
+    let mut buf = Vec::new();
+    loop {
+        let mut chunk = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk))
+            .await
+            .expect("response must arrive within the body bound")
+            .unwrap();
+        if n == 0 {
+            break; // server closed the connection after the 408
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 408"), "got: {text}");
+    assert!(text.contains("request_timeout"), "got: {text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "timeout must fire promptly, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn serve_inbound_passes_sse_streams() {
+    // serve_inbound is the production serve loop: an SSE request must stream
+    // through it byte-for-byte, terminator detection included.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "openai".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Openai,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (state, vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+    );
+    let app = keysink::proxy::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(keysink::proxy::serve_inbound(
+        listener,
+        app,
+        keysink::proxy::InboundLimits {
+            header_timeout: Duration::from_secs(30),
+        },
+        std::future::pending(),
+    ));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://{addr}/sse?marker=openai&seed=1&truncate=0&tail=1"
+        ))
+        .header("authorization", format!("Bearer {}", vks["openai"]))
+        .body(br#"{"stream":true,"model":"m"}"#.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let got = resp.bytes().await.unwrap();
+    let raw = raw_sse_body(1, b"data: [DONE]\n\n", false, true);
+    assert_eq!(
+        got.as_ref(),
+        raw.as_slice(),
+        "SSE bytes must pass through serve_inbound untouched"
+    );
+    server.abort();
 }
 
 #[tokio::test]
