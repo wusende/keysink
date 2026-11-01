@@ -1169,13 +1169,35 @@ fn find_memmem(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
+/// ASCII case-insensitive search, memchr-accelerated: a case-insensitive hit
+/// at position `i` requires `haystack[i]` to equal the needle's first byte in
+/// either case, so SIMD memchr2 locates the only positions worth verifying —
+/// an O(n) scan plus a handful of O(m) checks, instead of an O(n*m) windows
+/// sweep on every chunk of every SSE stream until the terminator shows up.
 fn find_memmem_ci(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w.eq_ignore_ascii_case(needle))
+    let first = needle[0];
+    let (cand1, cand2) = if first.is_ascii_alphabetic() {
+        (first.to_ascii_lowercase(), first.to_ascii_uppercase())
+    } else {
+        // Non-letter first byte (e.g. '"' for the anthropic json marker):
+        // case folding never touches it, so the exact byte is the candidate.
+        (first, first)
+    };
+    let mut from = 0;
+    while let Some(at) = memchr::memchr2(cand1, cand2, &haystack[from..]) {
+        let start = from + at;
+        if start + needle.len() > haystack.len() {
+            return false;
+        }
+        if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn build_response(status: reqwest::StatusCode, headers: HeaderMap, body: Body) -> Response {
@@ -1555,6 +1577,29 @@ mod tests {
             Terminator::Anthropic
         ));
         assert!(!contains_terminator(b"data: [DONE]\n\n", Terminator::None));
+    }
+
+    #[test]
+    fn finds_sse_terminators_in_all_case_variants() {
+        // find_memmem_ci edge positions: exact-length haystack (hit at 0),
+        // hit at the very end, dense candidate bytes exercising the rescan
+        // loop, non-letter first byte ('"' for the anthropic json marker),
+        // and the miss paths (needle does not fit, no candidate at all).
+        assert!(find_memmem_ci(b"data: [DONE]", b"data: [DONE]"));
+        assert!(find_memmem_ci(
+            b"xxxxxxxxxxxxxdata: [DONE]",
+            b"data: [DONE]"
+        ));
+        let dense: Vec<u8> = [vec![b'd'; 30], b"data: [DONE]".to_vec()].concat();
+        assert!(find_memmem_ci(&dense, b"data: [DONE]"));
+        assert!(find_memmem_ci(
+            b"{\"i\":0} \"TYPE\":\"MESSAGE_STOP\"",
+            b"\"type\":\"message_stop\""
+        ));
+        // candidate present but the needle does not fit past it
+        assert!(!find_memmem_ci(b"xxdata: [DON", b"data: [DONE]"));
+        assert!(!find_memmem_ci(b"data: [DON", b"data: [DONE]"));
+        assert!(!find_memmem_ci(b"no marker here", b"data: [DONE]"));
     }
 
     #[test]

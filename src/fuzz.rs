@@ -1174,9 +1174,12 @@ fn perf_contains_terminator_large_chunk() {
     for _ in 0..4 {
         assert!(!contains_terminator(&chunk, Terminator::Auto));
     }
+    // The ci fallback used to sweep every window position byte-by-byte
+    // (O(n*m) per chunk); the memchr2 candidate scan should hold this budget
+    // with orders of magnitude to spare, even in debug builds.
     timed(
         "scan_2mb_x4",
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(1),
         t0.elapsed(),
     );
 }
