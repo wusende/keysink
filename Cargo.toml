@@ -4,6 +4,11 @@ version = "0.1.1"
 edition = "2024"
 description = "Local credential gateway: virtual key → upstream endpoint + real-credential byte-level passthrough, with an age-encrypted centralized vault"
 license = "MIT"
+repository = "https://github.com/wusende/keysink"
+homepage = "https://github.com/wusende/keysink#readme"
+keywords = ["api-keys", "secrets", "credential", "proxy", "llm"]
+categories = ["authentication", "command-line-utilities", "network-programming"]
+exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts"]
 
 [dependencies]
 age = "0.12"
