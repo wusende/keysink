@@ -378,16 +378,32 @@ fn fuzz_is_stream_request_matches_json_semantics() {
                 #[serde(default)]
                 stream: Option<bool>,
             }
-            let expect = serde_json::from_slice::<Probe>(&body)
-                .ok()
-                .and_then(|p| p.stream)
-                .unwrap_or(false);
-            assert_eq!(
-                is_stream_request(&body),
-                expect,
-                "body={:?}",
-                String::from_utf8_lossy(&body)
-            );
+            // Reference semantics: a fully parsed, valid, object-typed body —
+            // the class real LLM requests live in (single `stream` member;
+            // duplicates are a documented divergence where the streaming
+            // probe's first member wins). The streaming probe deliberately
+            // diverges further outside this class (documented on StreamProbe):
+            // it does not validate the document tail after a seen
+            // `stream: true`, and it no longer honors serde's
+            // struct-from-seq quirk on array bodies.
+            match (body.first(), serde_json::from_slice::<Probe>(&body).ok()) {
+                (Some(b'{'), Some(p)) => {
+                    assert_eq!(
+                        is_stream_request(&body),
+                        p.stream.unwrap_or(false),
+                        "body={:?}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                (Some(b'['), Some(_)) => {
+                    assert!(
+                        !is_stream_request(&body),
+                        "array-topped bodies must not report stream:true: {:?}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                _ => {}
+            }
         });
         (desc, exec)
     });
@@ -1163,6 +1179,19 @@ fn perf_is_stream_request_large_bodies() {
         "parse_2mb_with_marker",
         std::time::Duration::from_secs(5),
         t1.elapsed(),
+    );
+
+    // stream member first: the probe answers at the member and never
+    // tokenizes the remaining megabytes
+    let mut body = br#"{"stream":true,"pad":""#.to_vec();
+    body.extend(std::iter::repeat_n(b'x', 8 * 1024 * 1024));
+    body.extend_from_slice(br#""}"#);
+    let t2 = std::time::Instant::now();
+    assert!(is_stream_request(&body));
+    timed(
+        "early_exit_8mb_stream_true",
+        std::time::Duration::from_secs(1),
+        t2.elapsed(),
     );
 }
 

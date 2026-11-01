@@ -964,21 +964,165 @@ pub(crate) fn build_upstream_url(
 }
 
 pub(crate) fn is_stream_request(body: &[u8]) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Probe {
-        #[serde(default)]
-        stream: Option<bool>,
-    }
     // Byte-level pre-filter first: a body not containing the `"stream"`
-    // substring cannot be stream:true, which avoids fully JSON-parsing a body
-    // of up to 32MB just to probe one field.
+    // substring cannot be stream:true, which avoids scanning a body of up to
+    // 32MB just to probe one field.
     if memchr::memmem::find(body, b"\"stream\"").is_none() {
         return false;
     }
-    serde_json::from_slice::<Probe>(body)
-        .ok()
-        .and_then(|p| p.stream)
-        .unwrap_or(false)
+    top_level_stream_true(body)
+}
+
+/// Whether the top-level JSON object contains a `stream` member whose value
+/// is the literal `true`. Byte-level scan: member names and value extents
+/// are tokenized with full JSON semantics (memchr-jumped strings with
+/// escapes, numbers, literals, string-aware nesting), so a `"stream"` inside
+/// a string value or a nested object can never be mistaken for a member,
+/// and the scan answers at the first `stream: true` instead of walking the
+/// remaining body — a full `from_slice::<Probe>` used to tokenize up to the
+/// 32MB limit on every request, the gateway's largest self-inflicted CPU
+/// cost. Nesting depth stays off the call stack (iterative skips).
+///
+/// Compared to the old full parse this deliberately diverges only on bodies
+/// that are not valid LLM requests (which upstream will 4xx anyway; the
+/// verdict merely selects the client pair):
+/// - the first `stream: true` decides; later `stream` members and a
+///   malformed tail do not void it
+/// - a wrong-typed `stream` member is skipped instead of failing the probe
+/// - array-topped bodies report false (the old probe accepted serde's
+///   struct-from-seq quirk where `[true]` meant stream:true)
+fn top_level_stream_true(body: &[u8]) -> bool {
+    let mut i = skip_ws(body, 0);
+    if body.get(i) != Some(&b'{') {
+        return false;
+    }
+    i += 1;
+    loop {
+        i = skip_ws(body, i);
+        match body.get(i) {
+            Some(b'}') => return false,
+            Some(b'"') => {}
+            _ => return false,
+        }
+        // Member name: the raw interior between the quotes.
+        let name_start = i + 1;
+        let Some(name_end) = skip_string(body, i) else {
+            return false;
+        };
+        let name = &body[name_start..name_end - 1];
+        i = skip_ws(body, name_end);
+        if body.get(i) != Some(&b':') {
+            return false;
+        }
+        i = skip_ws(body, i + 1);
+        if name == b"stream" || unescapes_to_stream(name) {
+            // The literal `true` followed by a structural char decides;
+            // anything else (false, null, string, ...) is skipped below.
+            if body[i..].starts_with(b"true")
+                && matches!(
+                    body.get(i + 4),
+                    None | Some(b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+                )
+            {
+                return true;
+            }
+        }
+        let Some(next) = skip_value(body, i) else {
+            return false;
+        };
+        i = skip_ws(body, next);
+        match body.get(i) {
+            Some(b',') => i += 1,
+            _ => return false, // '}' ends the object; anything else is malformed
+        }
+    }
+}
+
+/// Only consulted for names that failed the exact `stream` compare: whether
+/// the escaped JSON string interior decodes to `stream` (e.g. `stre\u0061m`).
+fn unescapes_to_stream(name: &[u8]) -> bool {
+    if !name.contains(&b'\\') {
+        return false;
+    }
+    // Re-quote and let serde_json do the (rare) unescaping.
+    let mut quoted = Vec::with_capacity(name.len() + 2);
+    quoted.push(b'"');
+    quoted.extend_from_slice(name);
+    quoted.push(b'"');
+    serde_json::from_slice::<String>(&quoted).is_ok_and(|s| s == "stream")
+}
+
+fn skip_ws(body: &[u8], mut i: usize) -> usize {
+    while matches!(body.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i += 1;
+    }
+    i
+}
+
+/// `at` is the opening quote; returns the index just past the closing quote,
+/// or None when the string never ends. memchr jumps between escapes so a
+/// plain megabyte string costs a handful of SIMD scans.
+fn skip_string(body: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    loop {
+        i += memchr::memchr2(b'"', b'\\', &body[i..])?;
+        match body.get(i)? {
+            b'"' => return Some(i + 1),
+            _ => i += 2, // backslash: skip it and the escaped byte
+        }
+    }
+}
+
+/// Skips one JSON value starting at `i`; returns the index just past it.
+/// Structural tokenization: strings, numbers, the three literals, and
+/// nested containers with string-aware tracking of the outer pair — inner
+/// same-type brackets nest, other bracket types are inert data positions.
+/// Malformed input yields None (the caller reports false, matching the old
+/// parse-error path).
+fn skip_value(body: &[u8], i: usize) -> Option<usize> {
+    match *body.get(i)? {
+        b'"' => skip_string(body, i),
+        b'[' | b'{' => {
+            let (open, close) = if body[i] == b'[' {
+                (b'[', b']')
+            } else {
+                (b'{', b'}')
+            };
+            let mut depth = 0usize;
+            let mut j = i;
+            loop {
+                match body.get(j)? {
+                    b'"' => {
+                        j = skip_string(body, j)?;
+                        continue;
+                    }
+                    &c if c == open => depth += 1,
+                    &c if c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        b't' if body[i..].starts_with(b"true") => Some(i + 4),
+        b'f' if body[i..].starts_with(b"false") => Some(i + 5),
+        b'n' if body[i..].starts_with(b"null") => Some(i + 4),
+        c if c == b'-' || c.is_ascii_digit() => {
+            let mut j = i + 1;
+            while matches!(
+                body.get(j),
+                Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            ) {
+                j += 1;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
 }
 
 fn convert_resp_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
@@ -1595,6 +1739,28 @@ mod tests {
             Terminator::Anthropic
         ));
         assert!(!contains_terminator(b"data: [DONE]\n\n", Terminator::None));
+    }
+
+    #[test]
+    fn stream_probe_semantics() {
+        // shapes real clients send
+        assert!(is_stream_request(br#"{"model":"m","stream":true}"#));
+        assert!(is_stream_request(br#"{"stream":true,"model":"m"}"#));
+        assert!(!is_stream_request(br#"{"stream":null}"#));
+        assert!(!is_stream_request(br#"{"stream":"true"}"#));
+        assert!(!is_stream_request(br#"{"stream":1}"#));
+        // escaped keys decode to the same member name; the prefilter needs a
+        // literal `"stream"` somewhere, so pair the escaped key with one
+        assert!(is_stream_request(
+            br#"{"stre\u0061m":true,"note":"stream"}"#
+        ));
+        assert!(!is_stream_request(br#"{"stre\u0061m":true}"#));
+        // documented divergences from the old full-parse probe (see
+        // top_level_stream_true): only reachable on bodies that are not
+        // valid LLM requests
+        assert!(is_stream_request(br#"{"stream":true} trailing garbage"#));
+        assert!(is_stream_request(br#"{"stream":true,"stream":false}"#));
+        assert!(!is_stream_request(b"[true]"));
     }
 
     #[test]
