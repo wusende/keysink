@@ -1,7 +1,8 @@
 # assets
 
-`social-preview.png` — 1200×630 GitHub social preview card, generated from
-`social-preview.html` (source of truth; edit the HTML, don't retouch the PNG).
+`social-preview.html` — source of truth for the 1200×630 GitHub social preview
+card. The rendered PNG is **not tracked** (GitHub keeps its own copy once you
+upload it under Settings → Social preview); regenerate it when you need the file.
 
 Regenerate:
 
