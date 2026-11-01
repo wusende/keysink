@@ -99,6 +99,13 @@ pub struct AppState {
     pub body_read_idle: Duration,
     /// Whole-body bound on reading the inbound request body (CLIENT_BODY_TIMEOUT in production; tests inject a small value).
     pub inbound_body_timeout: Duration,
+    /// Bounds concurrent handler executions — the memory-heavy phase (whole
+    /// inbound body buffered + waiting for upstream response headers). The
+    /// permit is held until the handler returns; the response body, including
+    /// long-lived SSE, streams afterwards without one, so streams can never
+    /// starve new requests. The health endpoint is not routed through the
+    /// handler and stays available under load.
+    pub inbound_permits: Arc<tokio::sync::Semaphore>,
     pub audit: Audit,
     pub started: Instant,
 }
@@ -324,6 +331,17 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
 
 async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> Response {
     let started = Instant::now();
+    // Queue until a permit frees up: saturating the gateway makes extra
+    // requests wait rather than pile up unbounded memory. Never closed, so
+    // acquisition only fails in a shutdown race.
+    let Ok(_permit) = state.inbound_permits.clone().acquire_owned().await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "gateway is not accepting requests",
+            &rid,
+        );
+    };
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();

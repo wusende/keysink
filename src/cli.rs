@@ -344,6 +344,9 @@ pub struct ServeArgs {
     pub allow_remote: bool,
     #[arg(long, default_value_t = 32)]
     pub body_limit_mb: usize,
+    /// Bound on concurrent in-flight requests (body read + upstream header wait); extra requests queue
+    #[arg(long, default_value_t = 64)]
+    pub max_concurrent: usize,
     #[arg(long, default_value_t = crate::retry::DEFAULT_MAX_RETRIES)]
     pub max_retries: u8,
 }
@@ -986,6 +989,9 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     if args.body_limit_mb == 0 || args.body_limit_mb > 1024 {
         return Err(Error::msg("body-limit-mb must be within 1..=1024"));
     }
+    if args.max_concurrent == 0 || args.max_concurrent > 4096 {
+        return Err(Error::msg("max-concurrent must be within 1..=4096"));
+    }
     let audit = match &args.audit_log {
         Some(path) => {
             let parent = path
@@ -1050,6 +1056,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         body_limit: args.body_limit_mb * 1024 * 1024,
         body_read_idle: proxy::BODY_READ_IDLE,
         inbound_body_timeout: proxy::CLIENT_BODY_TIMEOUT,
+        inbound_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent)),
         audit,
         started: Instant::now(),
     });

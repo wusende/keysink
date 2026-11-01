@@ -254,6 +254,7 @@ fn build_state(
     body_limit: usize,
     body_read_idle: Duration,
     inbound_body_timeout: Duration,
+    max_inbound: usize,
 ) -> (Arc<keysink::proxy::AppState>, HashMap<String, String>) {
     let mut vkeys = HashMap::new();
     for (name, r) in &store.routes {
@@ -272,6 +273,7 @@ fn build_state(
         body_limit,
         body_read_idle,
         inbound_body_timeout,
+        inbound_permits: Arc::new(tokio::sync::Semaphore::new(max_inbound)),
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
     });
@@ -290,6 +292,7 @@ async fn spawn_gateway_with_idle(
         body_limit,
         body_read_idle,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -799,6 +802,7 @@ async fn serve_inbound_reaps_stalled_request_head() {
         1 << 20,
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -869,6 +873,7 @@ async fn inbound_body_trickle_times_out() {
         1 << 20,
         keysink::proxy::BODY_READ_IDLE,
         Duration::from_millis(300),
+        64,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -930,6 +935,7 @@ async fn serve_inbound_passes_sse_streams() {
         1 << 20,
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -962,6 +968,104 @@ async fn serve_inbound_passes_sse_streams() {
         "SSE bytes must pass through serve_inbound untouched"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_requests_bounded_by_inbound_permits() {
+    // The permit spans body read + upstream response-header wait: a second
+    // request must queue while the first is still waiting for its upstream,
+    // and proceed as soon as the permit is released. (SSE body streaming
+    // happens after the handler returns, so streams never hold a permit.)
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let gate_for_mock = gate.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let app: Router = Router::new().fallback(move |req: axum::extract::Request<Body>| {
+            let gate = gate_for_mock.clone();
+            async move {
+                if req.uri().path() == "/gate" {
+                    gate.notified().await;
+                }
+                (StatusCode::OK, "ok").into_response()
+            }
+        });
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (state, vks) = build_state(
+        store,
+        RetryPolicy {
+            max_retries: 0,
+            ..RetryPolicy::default()
+        },
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        1,
+    );
+    let app = keysink::proxy::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let vk = vks["main"].clone();
+
+    // A takes the only permit and parks on the gated upstream.
+    let a = {
+        let client = client.clone();
+        let vk = vk.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("http://{gw}/gate"))
+                .header("authorization", format!("Bearer {vk}"))
+                .body(b"{}".to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // B must still be queued while A holds the permit.
+    let b = {
+        let client = client.clone();
+        let vk = vk.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("http://{gw}/echo"))
+                .header("authorization", format!("Bearer {vk}"))
+                .body(b"{}".to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!b.is_finished(), "B must queue while A holds the permit");
+
+    gate.notify_one();
+    assert_eq!(a.await.unwrap(), 200);
+    let b_status = tokio::time::timeout(Duration::from_secs(5), b)
+        .await
+        .expect("B must proceed once the permit frees")
+        .unwrap();
+    assert_eq!(b_status, 200);
 }
 
 #[tokio::test]
