@@ -103,6 +103,7 @@ talk to two different providers, or to the same provider with different keys.
 ## Everyday commands
 
 ```
+keysink init                     # first entry point in scripts / headless environments (interactive serve auto-initializes)
 keysink route add|ls|show|rotate|update|rm|enable|disable
 keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
 keysink status | doctor

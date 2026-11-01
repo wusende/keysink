@@ -15,6 +15,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+/// Long help for `--home`, matching what `default_vault_home()` actually resolves to on
+/// the current platform (the static doc-comment text was Linux-only and misled macOS/Windows
+/// users checking where their vault lives).
+const VAULT_HOME_LONG_HELP: &str = if cfg!(target_os = "windows") {
+    "vault directory (default: $KEYSINK_VAULT_HOME or %LOCALAPPDATA%\\keysink)"
+} else if cfg!(target_os = "macos") {
+    "vault directory (default: $KEYSINK_VAULT_HOME or ~/.local/share/keysink)"
+} else {
+    "vault directory (default: $KEYSINK_VAULT_HOME or ~/.local/share/keysink; system installs: /var/lib/keysink)"
+};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "keysink",
@@ -23,8 +34,14 @@ use zeroize::Zeroizing;
     long_about = None
 )]
 pub struct Cli {
-    /// vault directory (default: $KEYSINK_VAULT_HOME or /var/lib/keysink)
-    #[arg(long, global = true, env = "KEYSINK_VAULT_HOME", value_name = "DIR")]
+    /// vault directory
+    #[arg(
+        long,
+        global = true,
+        env = "KEYSINK_VAULT_HOME",
+        value_name = "DIR",
+        long_help = VAULT_HOME_LONG_HELP
+    )]
     pub home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -397,18 +414,32 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             println!(
                 "(vkey is shown only this once; if lost, only `keysink route rotate {name}` can issue a new one)"
             );
-            let (gw, alive) = current_gateway(paths);
-            println!(
-                "gateway: http://{gw} ({})",
-                if alive {
-                    "running"
-                } else {
-                    "not responding — make sure serve is running"
+            match current_gateway(paths) {
+                Some((gw, alive)) => {
+                    println!(
+                        "gateway: http://{gw} ({})",
+                        if alive {
+                            "running"
+                        } else {
+                            "not responding — make sure serve is running"
+                        }
+                    );
+                    println!(
+                        "agent-side config (OpenAI-compatible clients usually need /v1 in base_url):"
+                    );
+                    println!("  BASE_URL=http://{gw}");
+                    println!("  TOKEN={token_out}");
                 }
-            );
-            println!("agent-side config (OpenAI-compatible clients usually need /v1 in base_url):");
-            println!("  BASE_URL=http://{gw}");
-            println!("  TOKEN={token_out}");
+                None => {
+                    // gateway.addr is removed when serve exits: no trustworthy address
+                    // exists, so never substitute the compile-time default port here
+                    println!("gateway: (not running — address unknown)");
+                    println!(
+                        "agent-side config: start `keysink serve` and point the agent at the address it prints (OpenAI-compatible clients usually need /v1 appended):"
+                    );
+                    println!("  TOKEN={token_out}");
+                }
+            }
             Ok(())
         }
         RouteCmd::Ls => {
@@ -599,7 +630,8 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
                     .ok_or_else(|| Error::msg(format!("route `{name}` does not exist")))?;
                 Ok(())
             })?;
-            println!("route `{name}` deleted");
+            println!("route `{name}` deleted (its vkey stops working immediately)");
+            println!("to bring it back, re-create it: `keysink route add {name} --base-url ...`");
             Ok(())
         }
         RouteCmd::Enable { name } => set_route_enabled(paths, &name, true),
@@ -1030,9 +1062,19 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
             .await
             .map_err(|e| {
                 let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
-                    " (port already in use: another keysink may be running; `systemctl status keysink` or change --listen)"
+                    // platform-appropriate way to see what holds the port
+                    let probe = if cfg!(target_os = "macos") {
+                        "`lsof -iTCP -sTCP:LISTEN | grep keysink`"
+                    } else if cfg!(target_os = "linux") {
+                        "`systemctl status keysink` (system installs) or `ss -ltnp | grep keysink`"
+                    } else {
+                        "check what is listening on the port"
+                    };
+                    format!(
+                        " (port already in use: another keysink may be running; {probe}, or change --listen)"
+                    )
                 } else {
-                    ""
+                    String::new()
                 };
                 Error::msg(format!("failed to listen on {addr}: {e}{hint}"))
             })?;
@@ -1573,23 +1615,22 @@ pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
 }
 
 /// Current gateway location: serve writes the actual listen address into `<home>/gateway.addr`
-/// at startup; read it here and probe TCP reachability, falling back to the default listen
-/// address when the runtime file is absent. Returns (host:port, reachable).
-fn current_gateway(paths: &Paths) -> (String, bool) {
-    let fallback = "127.0.0.1:8787".to_string();
+/// at startup and removes the file on exit; `None` here means the gateway is not running and
+/// no trustworthy address is known — callers must not substitute the compile-time default.
+/// `Some((host:port, reachable))`: the address serve actually bound, plus a TCP probe.
+fn current_gateway(paths: &Paths) -> Option<(String, bool)> {
     let addr = std::fs::read_to_string(paths.gateway_addr())
         .ok()
         .and_then(|text| {
             let line = text.lines().next()?.trim();
             (!line.is_empty()).then(|| line.to_string())
-        })
-        .unwrap_or(fallback);
+        })?;
     let reachable = addr
         .parse::<std::net::SocketAddr>()
         .ok()
         .map(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
         .unwrap_or(false);
-    (addr, reachable)
+    Some((addr, reachable))
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -1660,13 +1701,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::vault(dir.path().join("v"));
         util::create_private_dir_all(&paths.home).unwrap();
-        let (addr, _) = current_gateway(&paths);
-        assert_eq!(addr, "127.0.0.1:8787");
+        // no runtime file: serve is not running and the address is unknown —
+        // callers must not fall back to the compile-time default port
+        assert_eq!(current_gateway(&paths), None);
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let live = listener.local_addr().unwrap();
         util::atomic_write(&paths.gateway_addr(), format!("{live}\n").as_bytes(), 0o600).unwrap();
-        let (addr, alive) = current_gateway(&paths);
+        let (addr, alive) =
+            current_gateway(&paths).expect("gateway.addr written, current_gateway must return Some");
         assert_eq!(addr, live.to_string());
         assert!(alive);
 
@@ -1679,7 +1722,8 @@ mod tests {
             0o600,
         )
         .unwrap();
-        let (_, alive) = current_gateway(&paths);
+        let (_, alive) = current_gateway(&paths)
+            .expect("gateway.addr written, current_gateway must return Some");
         assert!(!alive);
     }
 }

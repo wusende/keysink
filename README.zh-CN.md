@@ -74,6 +74,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 ## 日常命令
 
 ```
+keysink init                     # 脚本/无终端环境的首次入口(交互终端里 serve 会自动初始化)
 keysink route add|ls|show|rotate|update|rm|enable|disable
 keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
 keysink status | doctor

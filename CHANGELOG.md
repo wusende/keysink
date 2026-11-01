@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+UX fixes from a scenario-based review (fresh install → route add → agent onboarding → key rotation → revocation → recovery):
+
+- `route add` no longer prints a fabricated default address (`127.0.0.1:8787`) when the gateway is not running — it reports the address as unknown and points at `keysink serve`; the `TOKEN=` line (shown only once) is still printed (`current_gateway` now returns `Option`)
+- The unknown-vkey 401 error body now mentions the hot-reload window: a vkey added/rotated a second ago is indistinguishable from an invalid one, and the old message blamed a rotation that never happened
+- `--home` help text states the platform's real default (`~/.local/share/keysink` on macOS, `%LOCALAPPDATA%\keysink` on Windows) instead of the Linux-only `/var/lib/keysink`
+- `route rm` output states the consequence (vkey stops working immediately) and how to re-create the route
+- Port-in-use hint on `serve` is platform-appropriate (`lsof` on macOS, `systemctl`/`ss` on Linux) instead of always suggesting systemctl
+- README "Everyday commands" lists `keysink init`, the first entry point in scripts / headless environments
+
 ## v0.1.1
 
 *Released 2026-11-01.*

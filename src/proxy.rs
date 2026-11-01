@@ -266,12 +266,15 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
     let snapshot = state.snapshot.load_full();
     let hash = vkey::hash(&token);
     let Some(resolved) = snapshot.table.lookup_hash(&hash) else {
+        // an unknown vkey is indistinguishable from one whose hot reload (fs-watch
+        // debounce, ~1s) has not reached this gateway yet — say so instead of
+        // blaming a rotation the caller may not have done
         return deny(
             "-",
             Some(&hash),
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            "virtual key is invalid or has been rotated",
+            "virtual key is invalid or has been rotated (if it was just added or rotated, hot reload may not have reached the gateway yet — retry in a second)",
         );
     };
     let route = &resolved.route;
