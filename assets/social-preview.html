@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1200px; height:630px; }
+  body {
+    background:#080B10;
+    font-family:"Inter",system-ui,sans-serif;
+    color:#E6EDF3;
+    position:relative;
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  .glow-a, .glow-b, .grid { position:absolute; inset:0; }
+  .glow-a {
+    background:radial-gradient(620px 420px at 8% 0%, rgba(45,212,191,.20), transparent 70%);
+  }
+  .glow-b {
+    background:radial-gradient(700px 500px at 100% 110%, rgba(59,130,246,.16), transparent 70%);
+  }
+  .grid {
+    background-image:
+      linear-gradient(to right, rgba(148,163,184,.055) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148,163,184,.055) 1px, transparent 1px);
+    background-size:40px 40px;
+    mask-image:radial-gradient(900px 600px at 50% 40%, #000 30%, transparent 85%);
+  }
+  .inner { position:absolute; inset:0; padding:56px 68px; display:flex; flex-direction:column; }
+
+  .brand { display:flex; align-items:center; gap:16px; }
+  .mark {
+    width:46px; height:46px; border-radius:12px;
+    background:linear-gradient(150deg,#12312E,#0E1A22);
+    border:1px solid rgba(94,234,212,.35);
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 0 26px rgba(45,212,191,.22), inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  .wordmark { font-size:38px; font-weight:600; letter-spacing:-.025em; }
+  .wordmark .dim { color:#64748B; font-weight:500; }
+
+  h1 { margin-top:44px; font-size:70px; line-height:1.06; letter-spacing:-.035em; font-weight:600; }
+  h1 .teal { color:#5EEAD4; }
+  h1 .sub { color:#7C8AA0; }
+  .lede { margin-top:22px; font-size:27px; line-height:1.45; color:#94A3B8; letter-spacing:-.01em; max-width:1010px; }
+  .lede b { color:#CBD5E1; font-weight:500; }
+
+  .flow { margin-top:auto; display:flex; align-items:center; gap:18px; }
+  .chip {
+    font-family:"Fira Code",monospace; font-size:20px;
+    padding:16px 22px; border-radius:14px;
+    background:rgba(15,23,32,.85); border:1px solid rgba(148,163,184,.20);
+    color:#C9D4E0; white-space:nowrap;
+  }
+  .chip .muted { color:#5A6B80; }
+  .chip .masked { color:#5EEAD4; }
+  .chip.gw { border-color:rgba(94,234,212,.45); box-shadow:0 0 30px rgba(45,212,191,.16); color:#E6EDF3; }
+  .arrow { color:#3F5064; font-size:26px; }
+  .foot { margin-top:30px; display:flex; align-items:center; justify-content:space-between; }
+  .install {
+    font-family:"Fira Code",monospace; font-size:21px;
+    color:#CBD5E1; padding:12px 18px; border-radius:12px;
+    background:rgba(20,30,40,.9); border:1px solid rgba(148,163,184,.16);
+  }
+  .install .p { color:#5EEAD4; }
+  .watermark {
+    position:absolute; right:28px; top:96px; opacity:.07; pointer-events:none;
+  }
+  .url { font-family:"Fira Code",monospace; font-size:19px; color:#64748B; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="glow-a"></div>
+  <div class="glow-b"></div>
+  <svg class="watermark" width="400" height="400" viewBox="0 0 24 24" fill="none" stroke="#5EEAD4" stroke-width=".8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="4" y="10.5" width="16" height="10.5" rx="2.6"/>
+    <path d="M8 10.5V7.4a4 4 0 0 1 8 0v3.1"/>
+    <circle cx="12" cy="15.8" r="1.5" fill="#5EEAD4" stroke="none"/>
+  </svg>
+  <div class="inner">
+    <div class="brand">
+      <div class="mark">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#5EEAD4" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="10.5" width="16" height="10.5" rx="2.6"/>
+          <path d="M8 10.5V7.4a4 4 0 0 1 8 0v3.1"/>
+          <circle cx="12" cy="15.8" r="1.5" fill="#5EEAD4" stroke="none"/>
+        </svg>
+      </div>
+      <div class="wordmark">keysink <span class="dim">/ local credential gateway</span></div>
+    </div>
+
+    <h1>Keys go in.<br><span class="teal">Nothing comes out.</span></h1>
+    <div class="lede">Agents only ever hold a <b>revocable virtual key</b>. Real keys stay in an age-encrypted local vault and are injected at forward time — the CLI cannot print them, backups strip them.</div>
+
+    <div class="flow">
+      <div class="chip">agent&nbsp; <span class="masked">ks_9f2c…</span></div>
+      <div class="arrow">→</div>
+      <div class="chip gw">keysink&nbsp; <span class="muted">:8787</span></div>
+      <div class="arrow">→</div>
+      <div class="chip">upstream&nbsp; <span class="muted">sk-ant-••••</span></div>
+    </div>
+
+    <div class="foot">
+      <div class="install"><span class="p">$</span> cargo install keysink</div>
+      <div class="url">github.com/wusende/keysink</div>
+    </div>
+  </div>
+</body>
+</html>
