@@ -7,63 +7,69 @@
 [![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-本地小型凭证网关:让真 API key 远离你的 agent。agent 只持有可随时吊销的虚拟 key(`ks_...`),keysink 把真 key 加密存在本机,仅在转发请求时注入上游。
+本机小型网关:真 API key 不进 agent。agent 只拿到可随时吊销的虚拟 key(`ks_…`),真 key 加密存在本地保险库,只在转发那一刻替换进去。
 
-真 key **没有任何读取通道**:CLI 打印不出、备份导出会剥离、网关只绑 loopback。
+```
+agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
+```
+
+真 key **没有任何读取通道**:CLI 打印不出来,`export` 备份会剥离,网关只绑 loopback。
+
+## 为什么值得装
+
+**换 key 不用碰 agent。** agent 配置里只写一次 base URL 和那个 `ks_…` token。之后换供应商、换账号、换真 key,都是 `keysink route update` 一句话的事——路由热重载进运行中的网关,大约 1 秒。不改配置、不重启 agent。
+
+**一个真 key,拆成多个可独立吊销的虚拟 key。** 每个 agent 一条路由:同一个上游,各自的 vkey,各管各的。吊销或停用其中一个,其余照常。
+
+**重试不会重复扣费。** `429`/`503`/`504` 重试两次,但**网络层失败的 POST 绝不重放**,SSE 一旦开始流式输出就不再重试。很多简易代理在这里做错,一次重放就是一次重复计费。
+
+最后才是名字里那件事:agent 被 prompt 注入后能泄露它环境里的一切,但真 key 从来没在它环境里。
 
 ## 快速开始
 
-1. 安装——二选一:
+1. 安装,二选一:
 
    ```bash
-   cargo install keysink      # 从 crates.io 编译安装(需要 Rust 工具链)
+   cargo install keysink      # 从 crates.io 编译,需要 Rust 工具链
    ```
 
-   或者从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64。加执行权限并放进 `PATH`。
+   或者从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。
 
 2. 启动网关(standalone 模式,无需 root、无需装服务):
 
    ```bash
    keysink serve
-   # 首次运行:交互初始化(设置 master password),然后网关启动
+   # 首次运行会交互式初始化(设主密码),然后网关启动
    ```
 
-3. 添加路由(另开一个终端):
+3. 另开一个终端加路由:
 
    ```bash
    keysink route add claude --base-url https://api.anthropic.com
-   # 引导式输入:名称 → base URL → 上游认证方式 → key(隐藏回显)
-   # 非交互:printf %s "$KEY" | keysink route add claude --base-url ... --auth x-api-key
+   # 引导式提问:名称 → base URL → 上游鉴权方式 → key(隐藏输入)
+   # 非交互:printf %s "$KEY" | keysink route add claude --base-url … --auth x-api-key
    ```
 
-   `route add` 结束时打印 agent 需要的两行配置。路由改动约 1s 内热加载进运行中的网关。
+   它会打印 agent 需要的那两行。路由热重载进运行中的网关,大约 1 秒,加路由不需要重启。
 
-4. 把 agent 指向网关:
+4. 把 agent 指过来:
 
    ```
    BASE_URL=http://127.0.0.1:8787
    TOKEN=ks_...
    ```
 
-   Claude Code:在 `settings.json` 里配 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`。其他客户端:provider 的 `base_url` + `apiKey`。
+   Claude Code:`settings.json` 里 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`。其它客户端:provider 的 `base_url` + `apiKey`。
 
-vault 落在 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`),可用 `--home` 或 `KEYSINK_VAULT_HOME` 换位置。master password 只用于 `export` 备份的加密与恢复——serve、加 key、轮换都不需要它。
+   vkey 走的就是客户端本来就在发的那个头——`Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `api-key`——所以对多数客户端来说,这只是一次 base URL 改动,客户端代码、SDK、鉴权流程全都不用动。
 
-## Linux 系统服务(systemd)
+## 路由是怎么走的
 
-```bash
-sudo keysink deploy
-```
+一个 loopback 端口服务所有路由。**请求里的 vkey 决定走哪条路由**,而路由上挂着所有跟上游相关的东西:base URL、鉴权方式(`bearer` / `x-api-key` / 自定义 header / `basic` / query 参数)、要注入的静态 header、重试策略,以及可选的单路由上游代理。
 
-一键完成——二进制自己安装自己:创建 `keysink` 系统用户与 0700 vault 目录、把当前二进制装到 `/usr/local/bin/keysink`、写 systemd unit 与 sudoers(放行发起 sudo 的管理员)、交互初始化 vault(密码隐藏回显两遍)、启用服务。幂等,重复执行即原地升级并重启。卸载对称:`sudo keysink uninstall`。
+客户端发来的鉴权头会被剥掉、按路由重建,所以客户端没法夹带自己的凭证。其余原样透传:方法、路径、body、`Accept`、流式响应,query string 也保留(鉴权参数由路由管理)。SSE 按块转发,不会把整个响应缓冲起来。
 
-vault 未初始化时 unit 不启动(`ConditionPathExists`)。无终端环境手动初始化:
-
-```bash
-runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
-```
-
-此后管理命令走 `sudo -u keysink keysink ...`;sudoers 每条重新认证(`timestamp_timeout=0`),agent 无法自动执行管理命令。
+因为 vkey 决定路由,"这个 agent 到底打哪个上游"就变成了 keysink 侧的决策,而不是客户端侧的。同一个端口上的两个 agent,可以打两个不同的供应商,也可以打同一个供应商但用不同的真 key。
 
 ## 日常命令
 
@@ -71,48 +77,83 @@ runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
 keysink route add|ls|show|rotate|update|rm|enable|disable
 keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE]
 keysink status | doctor
-keysink export --output FILE      # 需 master password;剥离所有 key 值
-keysink rekey [--yes]             # 更换 vault 主密钥
-keysink uninstall [--yes]         # 删除 vault;系统级部署同时移除 unit/sudoers/二进制
-keysink deploy                    # 一键系统级部署(Linux + systemd,需 sudo)
+keysink export --output FILE      # 需要主密码;剥离所有 key 值
+keysink rekey [--yes]             # 轮换保险库主密钥
+keysink deploy | uninstall        # 系统安装 / 对称卸载
 ```
 
-路由选项要点:
+值得知道的路由选项:
 
-- `--auth bearer|x-api-key|<自定义 header>|basic|query|none`——OpenAI 用 Bearer,Claude 用 `x-api-key`,Gemini 用 `x-goog-api-key`
-- `--header 'K:V'` 注入静态头;`--proxy URL|direct` 按路由设置上游代理(默认跟随 `HTTP(S)_PROXY`)
-- 429/503/504 重试 2 次;POST 网络错误不重放(防重复计费);SSE 开始转发后不再重试
+- `--auth bearer|x-api-key|header|basic|query|none`——OpenAI 是 Bearer,Claude 是 `x-api-key`,Gemini 是 `x-goog-api-key`。其它情况用 `--auth header` 配 `--auth-header 名字`,需要前缀再加 `--auth-prefix 'Bearer '`
+- `--header 'K:V'` 注入静态 header(可重复);`--proxy URL|direct` 设单路由上游代理,默认跟随 `HTTP(S)_PROXY`
+- `--retry-on-status CODE` 按路由覆盖可重试的状态码集合
 
-## 安全模型:key 只进不出
+## 保险库在哪
 
-| 通道 | key 值 |
+`~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`;系统安装:`/var/lib/keysink`)。用 `--home` 或 `KEYSINK_VAULT_HOME` 换位置。
+
+主密码只用于加密和恢复 `export` 备份——服务、加 key、轮换、停用都不问主密码,所以忘了密码不会卡住守护进程重启。
+
+## Linux 系统服务
+
+```bash
+sudo keysink deploy
+```
+
+一条命令:创建 `keysink` 系统用户和 0700 保险库目录,把二进制装到 `/usr/local/bin/keysink`,写好 systemd unit 和 sudoers 规则(给执行 sudo 的管理员),交互式初始化保险库(隐藏输入、输两遍),然后启用服务。幂等——重复执行就是原地升级并重启。卸载对称:`sudo keysink uninstall`。
+
+unit 在保险库不存在时拒绝启动(`ConditionPathExists`)。没有终端时手动初始化:
+
+```bash
+runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
+```
+
+之后管理命令走 `sudo -u keysink keysink …`,每次调用都重新鉴权(`timestamp_timeout=0`),agent 没法静默执行。
+
+## 安全模型
+
+| 通道 | 能看到什么 |
 |---|---|
-| `route ls` / `route show` | 打码 |
-| CLI 读取命令 | 不存在 |
-| `export` 备份 | 刻意剥离 |
-| agent 进程 | 只接触 vkey |
-| 上游 | 转发时注入真 key;入站认证头一律剥离 |
+| `route ls` / `route show` | 打码的 vkey,没有真 key |
+| CLI | 不存在读取命令 |
+| `export` 备份 | 路由和元数据,key 值被剥离 |
+| agent 进程 / 环境变量 / 日志 | 只有 vkey |
+| 上游 | 真 key,在转发时注入 |
 
-vault 文件 age 加密,0600/0700,属主为服务用户。能同时读到 `vault.key` 和 `vault.age` 的 root 仍可离线解密——机器级隔离要靠自己(收紧 sudo、独立 UID)。可选的 `--audit-log` 记录 route、vkey 指纹、状态与耗时,绝不记录 header、body、query。
+保险库文件是 age 加密的,`0600`/`0700`,属主是服务用户。能同时读到 `vault.key` 和 `vault.age` 的 root 仍然可以离线解密——机器级隔离仍然是你的事(收紧 sudo、独立 UID)。
 
-限制:单路由单上游单 key(无 key 池 / failover);审计默认关闭。
+客户端发来的 `authorization`、`x-api-key`、`x-goog-api-key`、`api-key`、`anthropic-api-key`、`openai-api-key` 都会在转发前丢弃。
+
+`--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。
+
+`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。
+
+## 它不是什么
+
+- 不是 secret manager:单用户,没有 RBAC、HA、KMS 集成。
+- 不是 LLM 网关:不做 token 计量、预算、模型路由、缓存、限流。要这些,把 LiteLLM 或 one-api 放在它旁边。
+- 不是多机方案:一个进程、一台机器、loopback。
+- 不是 key 池:一条路由一个上游一个 key,没有 failover。
+- 不是 agent 沙箱:vkey 本身就是能力凭证,收权靠 `route disable` / `rotate`。
 
 ## 常见问题
 
-**为什么 vault 不放在当前目录?**
+**为什么保险库不放在当前目录?**
 
-vault 固定落在 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`,系统部署:`/var/lib/keysink`),是有意的:
+- **一个用户一个保险库,不是一个目录一个。** 网关作为守护进程跑,CLI 从任何地方调用;CWD 相对路径意味着每个目录一个保险库,路由会"凭空消失",热重载也会坏掉。确实想换位置就用 `--home` / `KEYSINK_VAULT_HOME`。
+- **加固措施需要它自己掌控的目录。** `0700`/`0600`、`O_NOFOLLOW`、属主校验只有在一个专用目录里才有意义。CWD 权限随意,而且很可能是个 git 仓库或同步盘,`vault.key` + `vault.age` 会漏出去。
+- **这是操作系统期望应用数据待的地方**——XDG `$XDG_DATA_HOME`、`%LOCALAPPDATA%`、服务的 `/var/lib`。和 `~/.ssh`、`~/.gnupg`、`/var/lib/docker` 一个约定。
 
-- **一个用户一个 vault,而不是一个目录一个。** 网关是常驻进程,CLI 却可能从任何目录调用;若跟着当前目录走,每个目录一份 vault——路由"加丢了"、热加载也失灵。要换位置用 `--home` 或 `KEYSINK_VAULT_HOME` 显式指定。
-- **安全模型要求目录本身可控。** 0700/0600、`O_NOFOLLOW`、属主跟随这些检查,只有在专属目录里才有意义;当前目录权限任意,还可能是 git 仓库或网盘同步目录,`vault.key` + `vault.age` 手滑提交/同步出去就泄了。
-- **这就是操作系统给应用数据规定的位置。** Linux/macOS 按 XDG 放 `$XDG_DATA_HOME`,Windows 放 `%LOCALAPPDATA%`,系统服务按 FHS 放 `/var/lib`——和 `~/.ssh`、`~/.gnupg`、`/var/lib/docker` 是同一套约定。
+**本地代理岂不是单点故障?**
+
+是个本地进程,所以是的——它挂了请求就失败。`keysink status` 会报当前监听地址并探测可达性,systemd 下 unit 失败会自动重启。保险库是普通文件,进程崩了不会丢 key。
 
 ## 开发
 
 ```bash
 cargo test
 cargo build --release
-bash scripts/smoke.sh    # 端到端:本地假上游,覆盖转发 / SSE / 重试 / 热加载 / 导出剥离
+bash scripts/smoke.sh    # 端到端:假上游、转发 / SSE / 重试 / 热重载 / 导出剥离
 ```
 
-推送 `v*` tag 后 GitHub Actions 自动构建并发布全平台 release 产物。
+`cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加带预算的性能场景。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物。
