@@ -1,6 +1,6 @@
 [package]
 name = "keysink"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Local credential gateway: virtual key → upstream endpoint + real-credential byte-level passthrough, with an age-encrypted centralized vault"
 license = "MIT"

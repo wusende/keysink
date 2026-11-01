@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.1.2
+
+*Released 2026-11-02.*
 
 Stability fixes from a performance/stability review:
 
@@ -14,6 +16,9 @@ Stability fixes from a performance/stability review:
 - Proxy client lookup for per-route upstream proxies is now lock-free (ArcSwap copy-on-write): no per-request mutex on proxied routes
 - Audit lines batch in an 8KB buffer (flushed at capacity, when the queue goes idle for 50ms, before rotation, and on shutdown) instead of one write syscall per line; `tail -f` tail latency stays bounded
 - Per-request retry policy override no longer allocates (retryable statuses are an Arc'd slice)
+- Client connections are capped in the serve loop (`--max-concurrent`-derived, 8x clamped to 256..=16384): excess connections are closed on accept instead of accumulating tasks and file descriptors — the remaining exposure after the request bound, relevant with `--allow-remote`
+- Upstream body-error logs record summary fields only (timeout/connect/status), never the full reqwest error: its `Display` appends `for url (<url>)` when a URL is attached, and with `--auth query` that URL carries the upstream key
+- The serve loop survives descriptor pressure: `EMFILE`/`ENFILE` on accept backs off 1s and keeps serving instead of exiting the process, and the systemd unit ships `LimitNOFILE=16384` so the OS limit stops being the real ceiling; hitting the connection cap now leaves visible evidence (a warn per 100 shed connections, previously debug-silent)
 
 Hardening from a security review:
 
@@ -42,6 +47,7 @@ commands and the English surface — **this is the release to download**.
 - Dependencies on current majors: age 0.12, reqwest 0.13, rand 0.10, base64 0.23, scrypt 0.12, sha2 0.11
 - MIT license file, `SECURITY.md` with the threat model and disclosure process, README badges
 - Windows test/runtime fixes, arm64 release builds on native runners, CI green on Linux/macOS/Windows (perf budgets now scale for debug builds)
+
 ## v0.1.0
 
 *Released 2026-11-01.*
@@ -58,6 +64,3 @@ First public release.
 Download the archive for your platform, verify against the matching `.sha256`, put the binary on your `PATH`.
 
 中文说明见 [README.zh-CN.md](https://github.com/wusende/keysink/blob/main/README.zh-CN.md)。
-- Client connections are capped in the serve loop (`--max-concurrent`-derived, 8x clamped to 256..=16384): excess connections are closed on accept instead of accumulating tasks and file descriptors — the remaining exposure after the request bound, relevant with `--allow-remote`
-- Upstream body-error logs record summary fields only (timeout/connect/status), never the full reqwest error: its `Display` appends `for url (<url>)` when a URL is attached, and with `--auth query` that URL carries the upstream key
-- The serve loop survives descriptor pressure: `EMFILE`/`ENFILE` on accept backs off 1s and keeps serving instead of exiting the process, and the systemd unit ships `LimitNOFILE=16384` so the OS limit stops being the real ceiling; hitting the connection cap now leaves visible evidence (a warn per 100 shed connections, previously debug-silent)
