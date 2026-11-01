@@ -15,6 +15,11 @@ Stability fixes from a performance/stability review:
 - Audit lines batch in an 8KB buffer (flushed at capacity, when the queue goes idle for 50ms, before rotation, and on shutdown) instead of one write syscall per line; `tail -f` tail latency stays bounded
 - Per-request retry policy override no longer allocates (retryable statuses are an Arc'd slice)
 
+Hardening from a security review:
+
+- Route config is validated at save time with the same rules forwarding uses: static header values, auth header prefixes, and basic usernames are now checked with `HeaderValue::from_str` when a route is written — a value that would fail there used to brick the whole route at request time (500 `configuration_error` on every request) with only `doctor` hinting at it. `HeaderValue` accepts obs-text (0x80-0xFF), so non-ASCII values stay legal
+- `retry_on_status` now rejects status codes outside 400..=599 at save time: a configured 2xx/3xx used to discard successful responses and replay POSTs (double billing)
+
 UX fixes from a scenario-based review (fresh install → route add → agent onboarding → key rotation → revocation → recovery):
 
 - `route add` no longer prints a fabricated default address (`127.0.0.1:8787`) when the gateway is not running — it reports the address as unknown and points at `keysink serve`; the `TOKEN=` line (shown only once) is still printed (`current_gateway` now returns `Option`)

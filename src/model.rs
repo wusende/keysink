@@ -177,12 +177,24 @@ impl Route {
                         "route `{name}` auth header name contains invalid characters"
                     )));
                 }
-                let _ = prefix;
+                // Forward time builds `HeaderValue::from_str(prefix)` into the
+                // auth header — reject now, at save time, instead of turning
+                // every request on the route into a 500 later.
+                if axum::http::HeaderValue::from_str(prefix).is_err() {
+                    return Err(Error::msg(format!(
+                        "route `{name}` auth header prefix contains invalid characters (visible ASCII only)"
+                    )));
+                }
             }
             Auth::Basic { username } => {
                 if username.is_empty() {
                     return Err(Error::msg(format!(
                         "route `{name}` has an empty basic username"
+                    )));
+                }
+                if axum::http::HeaderValue::from_str(username).is_err() {
+                    return Err(Error::msg(format!(
+                        "route `{name}` basic username contains invalid characters (visible ASCII only)"
                     )));
                 }
             }
@@ -203,7 +215,7 @@ impl Route {
                 }
             }
         }
-        for key in self.headers.keys() {
+        for (key, value) in &self.headers {
             if key.is_empty() {
                 return Err(Error::msg(format!(
                     "route `{name}` has an empty header name"
@@ -222,12 +234,29 @@ impl Route {
                     "route `{name}` must not override `{key}` with a static header"
                 )));
             }
+            // Forward time builds `HeaderValue::from_str(value)` — reject now,
+            // at save time, instead of turning every request on the route
+            // into a 500 later.
+            if axum::http::HeaderValue::from_str(value).is_err() {
+                return Err(Error::msg(format!(
+                    "route `{name}` header `{key}` value contains invalid characters (visible ASCII only)"
+                )));
+            }
         }
         if let Some(retries) = self.max_retries
             && retries > 10
         {
             return Err(Error::msg(format!(
                 "route `{name}` max_retries must not exceed 10"
+            )));
+        }
+        if let Some(statuses) = &self.retry_on_status
+            && let Some(bad) = statuses.iter().find(|s| !(400..=599).contains(*s))
+        {
+            // A success code here would discard good responses and replay
+            // POSTs (double billing); anything above 599 is not a status.
+            return Err(Error::msg(format!(
+                "route `{name}` retry_on_status contains {bad}: only status codes 400..=599 can be retried"
             )));
         }
         if let Some(proxy) = &self.proxy
@@ -419,6 +448,72 @@ mod tests {
         s.routes.get_mut("r").unwrap().auth = Auth::Query {
             param: "api_key-x.1".into(),
         };
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_header_values_headervalue_would_refuse() {
+        // Forward time builds HeaderValue::from_str(value): a value it would
+        // refuse used to brick the whole route at request time (500 on every
+        // request); it must be rejected at save time instead. from_str
+        // rejects control chars (<0x20 except \t) and DEL; obs-text
+        // (0x80-0xFF) passes and stays legal to forward.
+        for bad in [
+            "bad\nvalue",
+            "bad\rvalue",
+            "bad\u{0}value",
+            "bad\u{7f}value",
+        ] {
+            let mut s = sample();
+            s.routes
+                .get_mut("r")
+                .unwrap()
+                .headers
+                .insert("x-trace".into(), bad.into());
+            assert!(s.validate().is_err(), "value `{bad}` should be rejected");
+        }
+        let mut s = sample();
+        s.routes
+            .get_mut("r")
+            .unwrap()
+            .headers
+            .insert("x-trace".into(), "2023-06-01".into());
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_auth_fields_headervalue_would_refuse() {
+        let mut s = sample();
+        s.routes.get_mut("r").unwrap().auth = Auth::Header {
+            name: "x-custom-auth".into(),
+            prefix: "Bearer\n".into(),
+        };
+        assert!(s.validate().is_err());
+        let mut s = sample();
+        s.routes.get_mut("r").unwrap().auth = Auth::Basic {
+            username: "user\rname".into(),
+        };
+        assert!(s.validate().is_err());
+        // An empty prefix is legal: raw key, no scheme.
+        let mut s = sample();
+        s.routes.get_mut("r").unwrap().auth = Auth::Header {
+            name: "x-custom-auth".into(),
+            prefix: String::new(),
+        };
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_retry_on_status_outside_4xx_5xx() {
+        // A success code here would discard good responses and replay POSTs
+        // (double billing); above 599 is not a status code at all.
+        for bad in [200u16, 302, 399, 600] {
+            let mut s = sample();
+            s.routes.get_mut("r").unwrap().retry_on_status = Some(vec![bad]);
+            assert!(s.validate().is_err(), "status {bad} should be rejected");
+        }
+        let mut s = sample();
+        s.routes.get_mut("r").unwrap().retry_on_status = Some(vec![429, 500, 503]);
         s.validate().unwrap();
     }
 
