@@ -3,6 +3,8 @@
 English | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/wusende/keysink/actions/workflows/ci.yml/badge.svg)](https://github.com/wusende/keysink/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/keysink.svg)](https://crates.io/crates/keysink)
+[![docs.rs](https://img.shields.io/docsrs/keysink)](https://docs.rs/keysink)
 [![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/wusende/keysink/releases/latest)
@@ -11,9 +13,15 @@ A tiny local gateway that keeps real API keys away from your agents. The agent o
 
 There is **no read channel for real keys**: the CLI cannot print them, backups strip them, and the gateway binds loopback only.
 
-## Quick start (download & run)
+## Quick start
 
-1. Grab the binary for your OS from [Releases](https://github.com/wusende/keysink/releases) — Linux / macOS / Windows, amd64 / arm64. Make it executable and put it on your `PATH`.
+1. Install it — either way:
+
+   ```bash
+   cargo install keysink      # from crates.io (needs a Rust toolchain)
+   ```
+
+   or grab the binary for your OS from [Releases](https://github.com/wusende/keysink/releases) — Linux / macOS / Windows, amd64 / arm64. Make it executable and put it on your `PATH`.
 
 2. Start the gateway (standalone mode — no root, no service):
 

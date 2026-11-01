@@ -3,6 +3,7 @@
 [English](README.md) | 简体中文
 
 [![CI](https://github.com/wusende/keysink/actions/workflows/ci.yml/badge.svg)](https://github.com/wusende/keysink/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/keysink.svg)](https://crates.io/crates/keysink)
 [![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -10,9 +11,15 @@
 
 真 key **没有任何读取通道**:CLI 打印不出、备份导出会剥离、网关只绑 loopback。
 
-## 快速开始(下载即用)
+## 快速开始
 
-1. 从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64。加执行权限并放进 `PATH`。
+1. 安装——二选一:
+
+   ```bash
+   cargo install keysink      # 从 crates.io 编译安装(需要 Rust 工具链)
+   ```
+
+   或者从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64。加执行权限并放进 `PATH`。
 
 2. 启动网关(standalone 模式,无需 root、无需装服务):
 
