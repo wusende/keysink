@@ -1,4 +1,5 @@
 use crate::model::Route;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 pub const DEFAULT_MAX_RETRIES: u8 = 2;
@@ -11,7 +12,9 @@ pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_retries: u8,
-    pub statuses: Vec<u16>,
+    /// Arc'd slice, not Vec: for_route clones the policy once per request,
+    /// and the Arc keeps that clone allocation-free.
+    pub statuses: Arc<[u16]>,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub header_timeout: Duration,
@@ -21,7 +24,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: DEFAULT_MAX_RETRIES,
-            statuses: DEFAULT_STATUSES.to_vec(),
+            statuses: Arc::from(DEFAULT_STATUSES),
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
             header_timeout: DEFAULT_HEADER_TIMEOUT,
@@ -36,7 +39,7 @@ impl RetryPolicy {
             policy.max_retries = retries.min(10);
         }
         if let Some(statuses) = &route.retry_on_status {
-            policy.statuses = statuses.clone();
+            policy.statuses = statuses.clone().into();
         }
         policy
     }

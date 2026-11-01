@@ -1,16 +1,22 @@
 use crate::util;
 use serde::Serialize;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 const MAX_AUDIT_BYTES: u64 = 10 * 1024 * 1024;
 /// Bounded queue depth: under disk-write jitter, prefer dropping audit lines (with a counted warning) over blocking the request path.
 const QUEUE_DEPTH: usize = 1024;
+/// How long the writer idles before flushing buffered lines: under load,
+/// lines batch into the BufWriter (flushed at its 8KB capacity), so one
+/// syscall carries many lines; when the queue goes quiet, this bounds how
+/// long a `tail -f` style consumer waits for the tail.
+const FLUSH_IDLE: Duration = Duration::from_millis(50);
 
 /// Audit disk writes run on a dedicated thread + bounded channel:
 /// - the request path only does try_send, never a synchronous open/write/chmod on a tokio worker;
@@ -98,23 +104,48 @@ impl Audit {
 }
 
 fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>) {
-    // The handle stays open: one write per line, not the open+write+close
-    // syscall triple per line; on rotation or write failure it becomes None
-    // and the next record reopens.
+    // The handle stays open, buffered: lines batch in a BufWriter instead of
+    // costing one write syscall each; the buffer flushes at capacity, when
+    // the queue goes idle (FLUSH_IDLE), and before rotation or shutdown. On
+    // rotation or write failure the handle becomes None and the next record
+    // reopens.
     let mut log = OpenLog {
         file: None,
         written: 0,
     };
-    while let Ok(entry) = rx.recv() {
-        if let Err(e) = append(&path, &mut log, &entry) {
-            tracing::warn!(error = %e, "failed to write audit log");
-            log.file = None;
+    loop {
+        match rx.recv_timeout(FLUSH_IDLE) {
+            Ok(entry) => {
+                if let Err(e) = append(&path, &mut log, &entry) {
+                    tracing::warn!(error = %e, "failed to write audit log");
+                    // Dropping the BufWriter attempts a best-effort flush of
+                    // whatever is still buffered; the next record reopens.
+                    log.file = None;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => flush_dirty(&mut log),
+            // Disconnected (after close): drain, flush, exit so tail audit lines are not lost.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    flush_dirty(&mut log);
+}
+
+fn flush_dirty(log: &mut OpenLog) {
+    let Some(writer) = log.file.as_mut() else {
+        return;
+    };
+    if writer.buffer().is_empty() {
+        return;
+    }
+    if let Err(e) = writer.flush() {
+        tracing::warn!(error = %e, "failed to flush audit log");
+        log.file = None;
     }
 }
 
 struct OpenLog {
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
     written: u64,
 }
 
@@ -128,12 +159,16 @@ fn append(path: &Path, log: &mut OpenLog, entry: &AuditEntry) -> std::io::Result
             .append(true)
             .open(path)?;
         log.written = file.metadata()?.len();
-        log.file = Some(file);
+        log.file = Some(BufWriter::new(file));
     }
     log.file.as_mut().unwrap().write_all(&line)?;
     log.written += line.len() as u64;
     if log.written >= MAX_AUDIT_BYTES {
-        // Close the handle before the rename: Windows refuses to rename an open file.
+        // Flush before the handle is dropped: the rotation rename happens on
+        // the next reopen, and buffered-but-unwritten tail lines must not be
+        // left behind in a file that is about to be renamed. (Windows also
+        // refuses to rename an open file.)
+        log.file.as_mut().unwrap().flush()?;
         log.file = None;
     }
     Ok(())

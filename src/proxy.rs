@@ -17,7 +17,6 @@ use futures_util::{StreamExt, stream};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -131,6 +130,7 @@ pub fn build_upstream_client(
 }
 
 /// Two clients under the same proxy config: streaming / non-streaming timeout semantics differ, so they must be built separately.
+#[derive(Clone)]
 struct ClientPair {
     /// Non-streaming: no client-level read idle (see STREAM_READ_TIMEOUT); the header wait is backstopped by the outer header_timeout (tokio timeout), the body phase by the per-chunk BODY_READ_IDLE at the passthrough layer.
     plain: reqwest::Client,
@@ -157,14 +157,16 @@ impl ClientPair {
 
 /// Client pool cached per route proxy config. reqwest has no per-request
 /// proxy override and proxy URLs are hot-reload mutable, so cache by
-/// "proxy config → client": base/direct prebuilt, URLs built lazily.
+/// "proxy config → client": base/direct prebuilt, URLs built lazily. Reads
+/// are lock-free (ArcSwap copy-on-write): the per-request path never takes a
+/// lock; first use and hot-reload cleanup publish whole new maps.
 /// After a successful hot reload, retain_urls converges to the URLs still in
 /// use, releasing clients (and their connection pools) left behind by
 /// obsolete configs.
 pub struct ProxyClients {
     base: ClientPair,
     direct: ClientPair,
-    by_url: Mutex<HashMap<String, ClientPair>>,
+    by_url: ArcSwap<HashMap<String, ClientPair>>,
 }
 
 impl ProxyClients {
@@ -172,7 +174,7 @@ impl ProxyClients {
         Ok(Self {
             base: ClientPair::build(None)?,
             direct: ClientPair::build(Some(crate::model::PROXY_DIRECT))?,
-            by_url: Mutex::new(HashMap::new()),
+            by_url: ArcSwap::from_pointee(HashMap::new()),
         })
     }
 
@@ -182,13 +184,19 @@ impl ProxyClients {
             None => Ok(self.base.pick(is_stream)),
             Some(crate::model::PROXY_DIRECT) => Ok(self.direct.pick(is_stream)),
             Some(url) => {
-                let mut cache = self.by_url.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pair) = cache.get(url) {
+                if let Some(pair) = self.by_url.load().get(url) {
                     return Ok(pair.pick(is_stream));
                 }
                 let pair = ClientPair::build(Some(url))?;
                 let client = pair.pick(is_stream);
-                cache.insert(url.to_string(), pair);
+                // Publish copy-on-write; under a race with another builder the
+                // first insertion wins and the duplicate client is dropped.
+                // rcu hands the closure &Arc<HashMap>, hence HashMap::clone.
+                self.by_url.rcu(|cache| {
+                    let mut next = HashMap::clone(cache);
+                    next.entry(url.to_string()).or_insert_with(|| pair.clone());
+                    next
+                });
                 Ok(client)
             }
         }
@@ -197,8 +205,13 @@ impl ProxyClients {
     /// Called after a successful hot reload: drops cached proxy URLs no longer referenced by any route.
     /// In-flight requests hold Client clones (Arc) and are unaffected.
     pub fn retain_urls(&self, live: &HashSet<String>) {
-        let mut cache = self.by_url.lock().unwrap_or_else(|e| e.into_inner());
-        cache.retain(|url, _| live.contains(url));
+        self.by_url.rcu(|cache| {
+            cache
+                .iter()
+                .filter(|(url, _)| live.contains(url.as_str()))
+                .map(|(url, pair)| (url.clone(), pair.clone()))
+                .collect::<HashMap<_, _>>()
+        });
     }
 }
 
@@ -1112,6 +1125,19 @@ fn adopt_snapshot(incoming_from_backup: bool, current_from_backup: Option<bool>)
     !incoming_from_backup || current_from_backup.is_none_or(|current| current)
 }
 
+/// Poll cadence for the store watcher while things are healthy.
+const RELOAD_POLL: Duration = Duration::from_secs(1);
+/// Backoff ceiling for repeated hot-reload failures on the same on-disk
+/// state: a corrupt or undecryptable store would otherwise be re-read and
+/// re-decrypted every second forever. Any success restores the 1s cadence,
+/// so a fix is picked up within one backoff window (≤30s) of landing.
+const MAX_RELOAD_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Next wait after a failed reload: doubles per consecutive failure, capped.
+fn next_reload_backoff(after: Duration) -> Duration {
+    after.saturating_mul(2).min(MAX_RELOAD_BACKOFF)
+}
+
 /// Polls the store.age / master.key mtime+size and swaps in a whole new snapshot on change.
 pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
     tokio::spawn(async move {
@@ -1121,8 +1147,9 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
         let mut last = (0u64, 0u64, 0u64);
         let mut failures = 0u32;
         let mut backup_warned = false;
+        let mut delay = RELOAD_POLL;
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(delay).await;
             let now = stamp(&paths);
             if now == last {
                 continue;
@@ -1145,6 +1172,7 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                             // downgrade. .bak lags one generation and would revive
                             // revoked/deleted vkeys; memory still holds the latest good data.
                             last = now;
+                            delay = RELOAD_POLL;
                             if !backup_warned {
                                 tracing::error!(
                                     "main store failed to decrypt, refusing to overwrite in-memory snapshot with stale .bak (continuing to serve the latest good data); fix the main store ASAP"
@@ -1169,6 +1197,7 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                         state.clients.retain_urls(&live_urls);
                         last = now;
                         failures = 0;
+                        delay = RELOAD_POLL;
                         backup_warned = false;
                         if from_backup {
                             tracing::error!(
@@ -1179,6 +1208,7 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                     }
                     Err(e) => {
                         failures += 1;
+                        delay = next_reload_backoff(delay);
                         if failures % 10 == 1 {
                             tracing::warn!(error = %e, "hot reload validation failed, keeping old snapshot");
                         }
@@ -1186,6 +1216,7 @@ pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
                 },
                 Err(e) => {
                     failures += 1;
+                    delay = next_reload_backoff(delay);
                     if failures % 10 == 1 {
                         tracing::warn!(error = %e, "hot reload decryption failed, keeping old snapshot");
                     }
@@ -1524,6 +1555,20 @@ mod tests {
         assert!(network_retry_allowed(false, true));
         // POST + non-connect error (timeout/disconnect): upstream may have billed → not replayable
         assert!(!network_retry_allowed(false, false));
+    }
+
+    #[test]
+    fn reload_backoff_doubles_and_caps() {
+        let mut d = RELOAD_POLL;
+        for _ in 0..10 {
+            d = next_reload_backoff(d);
+        }
+        assert_eq!(d, MAX_RELOAD_BACKOFF);
+        assert_eq!(
+            next_reload_backoff(d),
+            d,
+            "once capped, backoff stays capped"
+        );
     }
 
     #[tokio::test(start_paused = true)]

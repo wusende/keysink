@@ -637,7 +637,7 @@ async fn retry_policy_replays_and_returns_final_status() {
     );
     let policy = RetryPolicy {
         max_retries: 2,
-        statuses: vec![503],
+        statuses: vec![503].into(),
         initial_backoff: Duration::from_millis(10),
         max_backoff: Duration::from_millis(30),
         header_timeout: Duration::from_secs(5),
