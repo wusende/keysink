@@ -25,7 +25,3 @@ rustc-ice-*.txt
 
 # Fuzz hit artifacts (crashing inputs land here for triage)
 fuzz/artifacts/
-
-# Generated social preview card (regenerate from assets/social-preview.html; GitHub keeps its own copy)
-assets/social-preview.png
-assets/raw.png
