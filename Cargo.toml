@@ -38,14 +38,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "local-offset"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Parsing is only needed to assert RFC 3339 round-trips in tests; dev-only so
+# the release build does not carry the parser.
+time = { version = "0.3", features = ["parsing"] }
 # start_paused (auto-advancing timers) for the stream-idle unit tests;
 # dev-only: the released build keeps tokio's production features.
 tokio = { version = "1", features = ["test-util"] }

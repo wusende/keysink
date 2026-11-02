@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Timestamps**
+
+- `route show`'s `created:`, the audit log's `ts` and the log-line prefixes are
+  now rendered in the system's local time zone with an explicit offset
+  (`2026-11-02T17:46:16+08:00`) instead of always UTC, so they match the wall
+  clock on the machine that wrote them. The offset is resolved per instant, so
+  entries written across a DST change keep the right offset. Storage is
+  unchanged (epoch seconds); `TZ=UTC` restores the old output, and an
+  unresolvable zone falls back to UTC rather than dropping the line
+
 ## v0.1.3
 
 *Released 2026-11-02.*

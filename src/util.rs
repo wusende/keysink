@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use time::OffsetDateTime;
+use time::UtcOffset;
 use time::format_description::well_known::Rfc3339;
 
 #[cfg(unix)]
@@ -24,17 +25,47 @@ pub fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-pub fn ts(secs: u64) -> String {
-    OffsetDateTime::from_unix_timestamp(secs as i64)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| secs.to_string())
+/// The system's UTC offset at `at`, falling back to UTC when the platform
+/// cannot resolve one (no `/etc/localtime`, an unreadable `TZ`, ...).
+///
+/// Resolved per instant rather than once at startup, so timestamps written
+/// across a DST change keep the wall-clock offset that was in force then.
+fn local_offset(at: OffsetDateTime) -> UtcOffset {
+    UtcOffset::local_offset_at(at).unwrap_or(UtcOffset::UTC)
 }
 
+/// Renders an instant as RFC 3339 in `offset`.
+fn ts_at(at: OffsetDateTime, offset: UtcOffset) -> String {
+    at.to_offset(offset)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| at.unix_timestamp().to_string())
+}
+
+/// Renders an epoch-second timestamp in the system's local time zone.
+///
+/// The offset is part of the output (`+08:00`), so the instant stays
+/// unambiguous; only the wall-clock rendering follows the machine.
+pub fn ts(secs: u64) -> String {
+    let at = OffsetDateTime::from_unix_timestamp(secs as i64).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    ts_at(at, local_offset(at))
+}
+
+/// Current time as RFC 3339 in the system's local time zone (UTC fallback).
 pub fn now_ts() -> String {
-    OffsetDateTime::now_utc()
+    let now = OffsetDateTime::now_utc();
+    now.to_offset(local_offset(now))
         .format(&Rfc3339)
         .unwrap_or_else(|_| now_secs().to_string())
+}
+
+/// tracing timer: local wall-clock time, with the same UTC fallback as
+/// [`now_ts`], so an unresolvable zone never drops a log line.
+pub struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        w.write_str(&now_ts())
+    }
 }
 
 pub fn allow_insecure() -> bool {
@@ -286,6 +317,37 @@ mod tests {
     #[test]
     fn hex_roundtrip_shape() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+    }
+
+    #[test]
+    fn ts_at_honours_the_offset() {
+        let epoch = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(ts_at(epoch, UtcOffset::UTC), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            ts_at(epoch, UtcOffset::from_hms(8, 0, 0).unwrap()),
+            "1970-01-01T08:00:00+08:00"
+        );
+        assert_eq!(
+            ts_at(epoch, UtcOffset::from_hms(-5, 0, 0).unwrap()),
+            "1969-12-31T19:00:00-05:00"
+        );
+    }
+
+    #[test]
+    fn ts_round_trips_to_the_same_instant() {
+        // 2026-03-08T07:30:00Z: inside the US DST switch window, so a machine
+        // with a DST zone must still resolve the offset in force at that time.
+        let secs = 1_772_955_000_u64;
+        let parsed = OffsetDateTime::parse(&ts(secs), &Rfc3339).unwrap();
+        assert_eq!(parsed.unix_timestamp(), secs as i64);
+    }
+
+    #[test]
+    fn now_ts_is_rfc3339_and_close_to_now() {
+        let text = now_ts();
+        let parsed = OffsetDateTime::parse(&text, &Rfc3339).unwrap();
+        let skew = (parsed.unix_timestamp() - now_secs() as i64).abs();
+        assert!(skew <= 5, "now_ts drifted: {text}");
     }
 
     #[test]

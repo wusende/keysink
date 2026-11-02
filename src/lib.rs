@@ -25,6 +25,7 @@ fn bootstrap() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_new(&filter).unwrap_or_else(|_| "info".into()),
         )
+        .with_timer(crate::util::LocalTimer)
         .with_target(false)
         .init();
 }
