@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**Performance**
+
+- SSE terminator scanning no longer allocates per chunk: the scan state moved
+  into the response stream itself, each upstream chunk is now searched in
+  place, and a fixed 40-byte stack window catches markers split across chunk
+  boundaries. Previously every chunk of every stream cloned the request id
+  String, locked a carry mutex, and copied carry + chunk into a fresh Vec —
+  every stream byte copied twice. Marker detection is unit-tested at every
+  split point, including byte-by-byte arrival, and the searched needles are
+  asserted against the window size so a future longer needle cannot silently
+  blind the boundary check
+- Upstream response headers are now moved out of the response, hop-by-hop
+  entries dropped in place, and the map moved whole into the client response;
+  the old path cloned every header twice (once into a fresh HeaderMap, again
+  through the response builder)
+
 **Timestamps**
 
 - `route show`'s `created:`, the audit log's `ts` and the log-line prefixes are

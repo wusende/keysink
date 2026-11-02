@@ -1166,15 +1166,19 @@ fn skip_value(body: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-fn convert_resp_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::with_capacity(src.len());
-    for (name, value) in src.iter() {
-        if is_hop_by_hop(name.as_str()) {
-            continue;
-        }
-        out.append(name.clone(), value.clone());
+/// Drops hop-by-hop entries from an upstream response's header map in place.
+/// The map was moved out of the response wholesale, so header values (the
+/// byte-expensive part) are never copied; only the few matching names are
+/// cloned (refcount bumps) on their way to `remove`.
+fn drop_hop_by_hop(headers: &mut HeaderMap) {
+    let hop: Vec<HeaderName> = headers
+        .iter()
+        .filter(|(name, _)| is_hop_by_hop(name.as_str()))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in hop {
+        headers.remove(&name);
     }
-    out
 }
 
 /// Whether the response carries a content encoding (`identity` counts as
@@ -1193,9 +1197,14 @@ pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
     }
 }
 
-async fn pass_through_response(resp: reqwest::Response, body_idle: Duration) -> Response {
+async fn pass_through_response(mut resp: reqwest::Response, body_idle: Duration) -> Response {
     let status = resp.status();
-    let headers = convert_resp_headers(resp.headers());
+    // Move the header map out of the upstream response and drop hop-by-hop
+    // entries in place; build_response then moves the map straight into the
+    // client response. The old path cloned every header twice (once into a
+    // fresh map, again through the response builder).
+    let mut headers = std::mem::take(resp.headers_mut());
+    drop_hop_by_hop(&mut headers);
     let stream = idle_bounded(resp.bytes_stream(), body_idle);
     build_response(status, headers, Body::from_stream(stream))
 }
@@ -1261,15 +1270,15 @@ where
 }
 
 async fn stream_response(
-    resp: reqwest::Response,
+    mut resp: reqwest::Response,
     terminator: Terminator,
     rid: String,
     body_idle: Duration,
 ) -> Response {
-    let status = resp.status();
-    let headers = convert_resp_headers(resp.headers());
-
-    let is_sse = headers
+    // The passthrough fallbacks below consume `resp` whole, so the content
+    // checks borrow its headers before the map is moved out for the SSE path.
+    let is_sse = resp
+        .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase().starts_with("text/event-stream"))
@@ -1284,69 +1293,131 @@ async fn stream_response(
     // truncation detection than to append plain-text events to a compressed
     // stream (that corrupts the frame tail and makes the client's decoder
     // error out, e.g. Bun's ZstdDecompressionError).
-    if is_encoded(&headers) {
+    if is_encoded(resp.headers()) {
         tracing::debug!(rid = %rid, "response is content-encoded, skipping SSE terminator detection");
         return pass_through_response(resp, body_idle).await;
     }
 
-    let seen_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let status = resp.status();
+    // Same in-place hop-by-hop filter as pass_through_response: the map is
+    // moved out of the upstream response instead of cloned per header.
+    let mut headers = std::mem::take(resp.headers_mut());
+    drop_hop_by_hop(&mut headers);
 
-    let seen_for_scan = seen_done.clone();
-    let errored_for_scan = errored.clone();
-    let rid_for_scan = rid.clone();
-    // carry keeps the tail of the previous chunk so a terminator marker split across a chunk boundary is not missed.
-    let carry = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let carry_for_scan = carry.clone();
-    let stream = resp.bytes_stream();
-    let mapped = stream.scan((), move |(), res| {
-        let seen = seen_for_scan.clone();
-        let errored = errored_for_scan.clone();
-        let rid = rid_for_scan.clone();
-        let carry = carry_for_scan.clone();
-        async move {
-            if errored.load(Ordering::Relaxed) {
+    // Terminator scanning rides an unfold that owns all scan state: each
+    // upstream chunk is scanned in place (plus a fixed stack window at the
+    // chunk boundary) and passed through unmodified. The previous scan
+    // closure had to own its captures per invocation, so every chunk of every
+    // stream cloned the rid String and copied carry + chunk into a fresh Vec.
+    let inner = Box::pin(resp.bytes_stream());
+    let mapped = stream::unfold(
+        (inner, SseScan::new(terminator, rid)),
+        move |(mut inner, mut scan)| async move {
+            if scan.done {
                 return None;
             }
-            match res {
-                Ok(chunk) => {
-                    if !seen.load(Ordering::Relaxed) {
-                        let mut carry = carry.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut window = Vec::with_capacity(carry.len() + chunk.len());
-                        window.extend_from_slice(&carry);
-                        window.extend_from_slice(&chunk);
-                        if contains_terminator(&window, terminator) {
-                            seen.store(true, Ordering::Relaxed);
-                        }
-                        let keep = window.len().min(64);
-                        carry.clear();
-                        carry.extend_from_slice(&window[window.len() - keep..]);
-                    }
-                    Some(Ok::<Bytes, std::io::Error>(chunk))
+            match inner.next().await {
+                Some(Ok(chunk)) => {
+                    scan.feed(&chunk);
+                    Some((Ok::<Bytes, std::io::Error>(chunk), (inner, scan)))
                 }
-                Err(_) => {
-                    tracing::warn!(rid = %rid, "upstream SSE stream interrupted");
-                    seen.store(true, Ordering::Relaxed);
-                    errored.store(true, Ordering::Relaxed);
-                    Some(Ok(sse_error_event("upstream stream error", terminator)))
+                Some(Err(_)) => {
+                    tracing::warn!(rid = %scan.rid, "upstream SSE stream interrupted");
+                    let event = sse_error_event("upstream stream error", terminator);
+                    scan.finish();
+                    Some((Ok(event), (inner, scan)))
+                }
+                None => {
+                    if scan.seen {
+                        return None;
+                    }
+                    tracing::warn!(
+                        rid = %scan.rid,
+                        "SSE stream ended early without terminator marker, treating as truncated"
+                    );
+                    let event = sse_error_event("upstream stream ended prematurely", terminator);
+                    scan.finish();
+                    Some((Ok(event), (inner, scan)))
                 }
             }
-        }
-    });
+        },
+    );
+    build_response(status, headers, Body::from_stream(mapped))
+}
 
-    let seen_for_tail = seen_done.clone();
-    let tail = stream::once(async move {
-        if seen_for_tail.load(Ordering::Relaxed) {
-            Ok::<Bytes, std::io::Error>(Bytes::new())
-        } else {
-            tracing::warn!(rid = %rid, "SSE stream ended early without terminator marker, treating as truncated");
-            Ok(sse_error_event(
-                "upstream stream ended prematurely",
-                terminator,
-            ))
+/// Longest terminator needle searched by `contains_terminator` (the needle-fit
+/// test keeps it honest). The carry window keeps one fewer byte, so a marker
+/// split across a chunk boundary always fits in the stack window below.
+const TERMINATOR_MAX_NEEDLE: usize = 21;
+
+/// Per-stream state for SSE terminator detection, owned by the response
+/// stream's unfold: no Arcs, no Mutex, and nothing allocated per chunk.
+struct SseScan {
+    terminator: Terminator,
+    /// Terminator marker seen (or the stream ended/errored): scanning stops.
+    seen: bool,
+    /// The stream must end after the synthetic error event has been emitted.
+    done: bool,
+    /// Tail of the previous chunk, at most `TERMINATOR_MAX_NEEDLE - 1` bytes.
+    carry: Vec<u8>,
+    /// Request id for the (cold) interruption/truncation log lines.
+    rid: String,
+}
+
+impl SseScan {
+    fn new(terminator: Terminator, rid: String) -> Self {
+        Self {
+            terminator,
+            seen: false,
+            done: false,
+            carry: Vec::with_capacity(TERMINATOR_MAX_NEEDLE - 1),
+            rid,
         }
-    });
-    build_response(status, headers, Body::from_stream(mapped.chain(tail)))
+    }
+
+    /// Marks the stream complete: one more item (the synthetic error event)
+    /// is emitted, the next poll ends the stream.
+    fn finish(&mut self) {
+        self.seen = true;
+        self.done = true;
+    }
+
+    /// Scans one upstream chunk. The chunk itself is searched in place; a
+    /// marker straddling the previous carry and this chunk can only start
+    /// within the last L-1 carry bytes and reach at most L-1 bytes into the
+    /// chunk, so a fixed stack window of 2·(L-1) bytes covers the boundary
+    /// and the chunk body is never copied.
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.seen || self.terminator == Terminator::None {
+            return;
+        }
+        if contains_terminator(chunk, self.terminator) {
+            self.seen = true;
+            return;
+        }
+        let overlap = TERMINATOR_MAX_NEEDLE - 1;
+        let head = chunk.len().min(overlap);
+        if !self.carry.is_empty() && head > 0 {
+            let mut window = [0u8; 2 * (TERMINATOR_MAX_NEEDLE - 1)];
+            window[..self.carry.len()].copy_from_slice(&self.carry);
+            window[self.carry.len()..self.carry.len() + head].copy_from_slice(&chunk[..head]);
+            if contains_terminator(&window[..self.carry.len() + head], self.terminator) {
+                self.seen = true;
+                return;
+            }
+        }
+        // Keep the tail for the next boundary pass.
+        if chunk.len() >= overlap {
+            self.carry.clear();
+            self.carry.extend_from_slice(&chunk[chunk.len() - overlap..]);
+        } else {
+            let total = self.carry.len() + chunk.len();
+            if total > overlap {
+                self.carry.drain(..total - overlap);
+            }
+            self.carry.extend_from_slice(chunk);
+        }
+    }
 }
 
 fn sse_error_event(message: &str, terminator: Terminator) -> Bytes {
@@ -1415,19 +1486,14 @@ fn find_memmem_ci(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn build_response(status: reqwest::StatusCode, headers: HeaderMap, body: Body) -> Response {
-    let mut out = Response::builder()
-        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
-    for (name, value) in headers.iter() {
-        out = out.header(name, value);
-    }
-    out.body(body).unwrap_or_else(|_| {
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            "internal_error",
-            "failed to build response",
-            "0000",
-        )
-    })
+    // Assemble from parts: the status and the already-filtered header map
+    // move in wholesale instead of being re-copied header by header through a
+    // response builder. Infallible, so the old builder-failure fallback is
+    // gone too.
+    let mut out = Response::new(body);
+    *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    *out.headers_mut() = headers;
+    out
 }
 
 pub fn error_response(status: StatusCode, kind: &str, message: &str, rid: &str) -> Response {
@@ -1643,6 +1709,62 @@ mod tests {
         assert!(!is_stream_request(br#"{"model":"x"}"#));
         assert!(!is_stream_request(b"not json"));
         assert!(!is_stream_request(b""));
+    }
+
+    #[test]
+    fn terminator_needles_fit_the_carry_window() {
+        for needle in [
+            &b"data: [DONE]"[..],
+            b"event: message_stop",
+            b"\"type\":\"message_stop\"",
+        ] {
+            assert!(
+                needle.len() <= TERMINATOR_MAX_NEEDLE,
+                "needle {needle:?} is longer than TERMINATOR_MAX_NEEDLE; raise the const so the boundary window still covers straddling markers"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_finds_markers_split_at_every_point() {
+        for marker in [
+            &b"data: [DONE]"[..],
+            b"event: message_stop",
+            b"\"type\":\"message_stop\"",
+        ] {
+            // two-chunk split at every interior point
+            for split in 1..marker.len() {
+                let mut scan = SseScan::new(Terminator::Auto, "R".into());
+                scan.feed(&marker[..split]);
+                assert!(
+                    !scan.seen,
+                    "{marker:?} split {split}: a partial marker must not match"
+                );
+                scan.feed(&marker[split..]);
+                assert!(
+                    scan.seen,
+                    "{marker:?} split {split}: a completed marker must be found"
+                );
+            }
+            // byte-by-byte arrival
+            let mut scan = SseScan::new(Terminator::Auto, "R".into());
+            for (i, byte) in marker.iter().enumerate() {
+                scan.feed(std::slice::from_ref(byte));
+                assert_eq!(
+                    scan.seen,
+                    i + 1 == marker.len(),
+                    "{marker:?} byte {i}: seen must flip exactly at the last byte"
+                );
+            }
+            // an ordinary event stream must not trip the scanner
+            let mut scan = SseScan::new(Terminator::Auto, "R".into());
+            scan.feed(b"event: delta\ndata: {\"i\":0}\n\n");
+            assert!(!scan.seen);
+            // terminator disabled: never scans, carry stays empty
+            let mut scan = SseScan::new(Terminator::None, "R".into());
+            scan.feed(b"event: message_stop\n\n");
+            assert!(!scan.seen && scan.carry.is_empty());
+        }
     }
 
     #[test]
