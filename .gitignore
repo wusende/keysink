@@ -28,3 +28,6 @@ fuzz/artifacts/
 
 # Staged npm packages (scripts/npm-pack.sh); regenerated, never committed
 npm/dist/
+
+# Perf run artifacts (scripts/perf.sh); curated numbers live in docs/perf-report-*.md
+perf/results/
