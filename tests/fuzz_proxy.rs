@@ -1405,13 +1405,23 @@ async fn perf_concurrent_e2e_throughput() {
         let client = client.clone();
         let vk = vk.clone();
         async move {
-            let resp = client
+            let req = client
                 .post(format!("http://{gw}/v1/concurrent-{i}"))
                 .header("authorization", format!("Bearer {vk}"))
-                .body(b"{\"stream\":false}".to_vec())
-                .send()
-                .await
-                .unwrap();
+                .body(b"{\"stream\":false}".to_vec());
+            // Same pooled-connection race as the e2e fuzz below: with all 100
+            // requests in flight on one runtime, a pooled connection can die
+            // between checkout and send and POST is not retried by the client.
+            // No response was received, so one retry is faithful to the
+            // throughput invariant under test.
+            let retry = req.try_clone().expect("request must be cloneable");
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) if e.status().is_none() && !e.is_timeout() => {
+                    retry.send().await.expect("gateway must answer")
+                }
+                Err(e) => panic!("gateway must answer: {e}"),
+            };
             assert_eq!(resp.status(), 200);
             let echo: Echo = resp.json().await.unwrap();
             assert_eq!(echo.path, format!("/v1/concurrent-{i}"));
