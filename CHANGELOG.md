@@ -4,35 +4,29 @@
 
 *Released 2026-11-02.*
 
-Stability fixes from a performance/stability review:
+A stability and hardening pass: every request phase is now bounded and the hot
+path is cheaper. Drop-in upgrade — no config changes, one new flag.
 
-- Non-streaming responses now abort when the upstream goes silent mid-body (per-chunk read idle, aligned with the response-header timeout): an upstream that sent headers and then stalled used to hang the handler forever — blocking the connection, its memory, and graceful shutdown with it. SSE streams keep their own 60s idle; the header wait keeps its 120s `header_timeout`
-- Store hot-reload decryption (file I/O + age decrypt + JSON parse + validate) now runs on tokio's blocking pool instead of a worker thread: a slow disk or a large vault no longer stalls concurrent request forwarding for the duration of a reload
-- Repeated hot-reload failures back off exponentially (1s → 30s cap) instead of re-reading and re-decrypting a corrupt store every second forever; any success restores the 1s poll
-- Inbound reads are now time-bounded: a client that stalls mid-request-head (slowloris) is disconnected after 30s — the serve loop drives hyper-util's auto builder directly because `axum::serve` exposes no `header_read_timeout` — and a handler reading a trickled request body gives up with `408 request_timeout` after 120s. Both matter mainly with `--allow-remote`; streaming responses are unaffected
-- SSE terminator scanning is memchr-accelerated: the case-insensitive fallback swept the whole scan window byte-by-byte on every chunk of every stream until the terminator showed up; it now SIMD-scans for the marker's first byte in either case and verifies only those candidates — same matching semantics, ~67x less CPU on the scan path (2MB chunk: 1.8ms → 27µs)
-- `stream` detection no longer tokenizes the whole request body: a byte-level top-member scan answers at the first `stream: true`, so multi-megabyte LLM requests stop paying a full JSON parse per request (8MB body: ~100ms → 584ns). Divergences from the old parse are deliberate and only reachable on bodies that are not valid LLM requests (documented on the scanner); the serde_json iterative skipper keeps nesting depth off the call stack
-- Concurrent in-flight requests are bounded (`--max-concurrent`, default 64): extra requests queue instead of piling up unbounded memory. A permit spans the body read + upstream response-header wait only, so SSE streams never hold one, and the health endpoint stays reachable under load
-- Proxy client lookup for per-route upstream proxies is now lock-free (ArcSwap copy-on-write): no per-request mutex on proxied routes
-- Audit lines batch in an 8KB buffer (flushed at capacity, when the queue goes idle for 50ms, before rotation, and on shutdown) instead of one write syscall per line; `tail -f` tail latency stays bounded
-- Per-request retry policy override no longer allocates (retryable statuses are an Arc'd slice)
-- Client connections are capped in the serve loop (`--max-concurrent`-derived, 8x clamped to 256..=16384): excess connections are closed on accept instead of accumulating tasks and file descriptors — the remaining exposure after the request bound, relevant with `--allow-remote`
-- Upstream body-error logs record summary fields only (timeout/connect/status), never the full reqwest error: its `Display` appends `for url (<url>)` when a URL is attached, and with `--auth query` that URL carries the upstream key
-- The serve loop survives descriptor pressure: `EMFILE`/`ENFILE` on accept backs off 1s and keeps serving instead of exiting the process, and the systemd unit ships `LimitNOFILE=16384` so the OS limit stops being the real ceiling; hitting the connection cap now leaves visible evidence (a warn per 100 shed connections, previously debug-silent)
+**Resilience**
 
-Hardening from a security review:
+- In-flight requests are capped (`--max-concurrent`, default 64); extra requests queue instead of growing memory, and SSE streams never hold a permit
+- Connections are capped too, and excess is closed on accept; `EMFILE`/`ENFILE` now backs off a second and keeps serving instead of exiting, with `LimitNOFILE=16384` in the systemd unit
+- Every phase has a timeout: 30s to finish request headers, 120s for a trickled body, and a silent upstream mid-body aborts instead of hanging the handler
+- Hot-reload failures back off 1s → 30s instead of re-decrypting a corrupt store every second, and decryption runs off the async workers
 
-- Route config is validated at save time with the same rules forwarding uses: static header values, auth header prefixes, and basic usernames are now checked with `HeaderValue::from_str` when a route is written — a value that would fail there used to brick the whole route at request time (500 `configuration_error` on every request) with only `doctor` hinting at it. `HeaderValue` accepts obs-text (0x80-0xFF), so non-ASCII values stay legal
-- `retry_on_status` now rejects status codes outside 400..=599 at save time: a configured 2xx/3xx used to discard successful responses and replay POSTs (double billing)
+**Performance**
 
-UX fixes from a scenario-based review (fresh install → route add → agent onboarding → key rotation → revocation → recovery):
+- `stream` detection answers at the first `stream: true` without parsing the whole body (8MB request: ~100ms → 584ns)
+- SSE terminator scanning is SIMD-accelerated (~67× less CPU on the scan path), proxy lookup is lock-free, and audit writes are batched
 
-- `route add` no longer prints a fabricated default address (`127.0.0.1:8787`) when the gateway is not running — it reports the address as unknown and points at `keysink serve`; the `TOKEN=` line (shown only once) is still printed (`current_gateway` now returns `Option`)
-- The unknown-vkey 401 error body now mentions the hot-reload window: a vkey added/rotated a second ago is indistinguishable from an invalid one, and the old message blamed a rotation that never happened
-- `--home` help text states the platform's real default (`~/.local/share/keysink` on macOS, `%LOCALAPPDATA%\keysink` on Windows) instead of the Linux-only `/var/lib/keysink`
-- `route rm` output states the consequence (vkey stops working immediately) and how to re-create the route
-- Port-in-use hint on `serve` is platform-appropriate (`lsof` on macOS, `systemctl`/`ss` on Linux) instead of always suggesting systemctl
-- README "Everyday commands" lists `keysink init`, the first entry point in scripts / headless environments
+**Hardening**
+
+- Route config is validated at save time: header values that would 500 every request, and `retry_on_status` outside 400–599 (which could replay POSTs), are rejected up front
+- Upstream error logs no longer include the request URL, which could carry the upstream key with `--auth query`
+
+**UX**
+
+- `route add` no longer invents a gateway address when the gateway is down; 401s explain the hot-reload window; `route rm` says what it breaks; hints are platform-correct
 
 ## v0.1.1
 
