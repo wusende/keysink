@@ -57,6 +57,15 @@ pub const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// reads from the client only.
 pub const CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Inbound h2 keep-alive cadence: after this long without inbound frames the
+/// server PINGs the peer; see serve_inbound for why h2 needs its own bound.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the server waits for the keep-alive PING ACK before closing an
+/// unresponsive h2 connection. A peer that answers is actively maintaining
+/// the connection (equivalent to sending traffic), so only silent stalers
+/// are reaped.
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Bound on how long a request may queue for an inbound permit. A wedged
 /// upstream (accepts TCP, never sends response headers) holds every permit
 /// for up to attempts × header_timeout + backoff, so an open-ended queue
@@ -370,6 +379,19 @@ pub async fn serve_inbound(
             builder
                 .http1()
                 .header_read_timeout(Some(limits.header_timeout));
+            // The http1 bounds above do not reach h2c connections (the auto
+            // builder accepts prior-knowledge h2): without a keep-alive an
+            // established h2 connection that goes silent holds its connection
+            // slot forever, and silently parking max_connections of them is a
+            // one-shot remote DoS on an --allow-remote deployment. The server
+            // PINGs after the interval and closes the connection when the
+            // PING is not ACKed within the timeout (timer required — the
+            // default () timer makes both options inert).
+            builder.http2().timer(hyper_util::rt::TokioTimer::new());
+            builder
+                .http2()
+                .keep_alive_interval(Some(HTTP2_KEEPALIVE_INTERVAL));
+            builder.http2().keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
             if let Err(e) = builder
                 .serve_connection_with_upgrades(
                     hyper_util::rt::TokioIo::new(stream),
@@ -743,7 +765,9 @@ fn record_reject(
     );
     entry.status = status.as_u16();
     entry.ms = started.elapsed().as_millis() as u64;
-    state.audit.record(entry);
+    // Rejection rows are attacker-rateable without any credential, so they go
+    // through the throttled entry point instead of plain record().
+    state.audit.record_reject(entry);
 }
 
 struct Forwarded {
@@ -1513,7 +1537,8 @@ impl SseScan {
         // Keep the tail for the next boundary pass.
         if chunk.len() >= overlap {
             self.carry.clear();
-            self.carry.extend_from_slice(&chunk[chunk.len() - overlap..]);
+            self.carry
+                .extend_from_slice(&chunk[chunk.len() - overlap..]);
         } else {
             let total = self.carry.len() + chunk.len();
             if total > overlap {
@@ -2177,16 +2202,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn transient_accept_errors_are_the_descriptor_pressure_kinds() {
-        assert!(is_transient_accept_error(&std::io::Error::from_raw_os_error(
-            libc::EMFILE
-        )));
-        assert!(is_transient_accept_error(&std::io::Error::from_raw_os_error(
-            libc::ENFILE
-        )));
+        assert!(is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::EMFILE)
+        ));
+        assert!(is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::ENFILE)
+        ));
         // A peer resetting mid-accept is none of our pressure; it stays fatal.
-        assert!(!is_transient_accept_error(&std::io::Error::from_raw_os_error(
-            libc::ECONNABORTED
-        )));
+        assert!(!is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::ECONNABORTED)
+        ));
         assert!(!is_transient_accept_error(&std::io::Error::other("boom")));
     }
 
@@ -2305,8 +2330,10 @@ mod serve_inbound_tests {
                 // Indirect probe: a second request must also be served, which
                 // proves the loop returned to accept() after reaping.
                 let mut s = tokio::net::TcpStream::connect(addr).await?;
-                s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
-                    .await?;
+                s.write_all(
+                    b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n",
+                )
+                .await?;
                 let mut buf = Vec::new();
                 s.read_to_end(&mut buf).await?;
                 if buf.starts_with(b"HTTP/1.1 200") {

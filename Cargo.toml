@@ -8,7 +8,7 @@ repository = "https://github.com/wusende/keysink"
 homepage = "https://github.com/wusende/keysink#readme"
 keywords = ["api-keys", "secrets", "llm", "proxy", "claude-code"]
 categories = ["authentication", "command-line-utilities", "development-tools", "network-programming"]
-exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts"]
+exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts", "docs", "perf", "examples"]
 
 [dependencies]
 age = "0.12"

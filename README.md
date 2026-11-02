@@ -108,7 +108,7 @@ talk to two different providers, or to the same provider with different keys.
 ```
 keysink init                     # first entry point in scripts / headless environments (interactive serve auto-initializes)
 keysink route add|ls|show|rotate|update|rm|enable|disable
-keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N]
+keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N] [--accept-degraded]
 keysink status | doctor
 keysink export --output FILE      # needs master password; strips all key values
 keysink rekey [--yes]             # rotate the vault master key
@@ -172,13 +172,17 @@ that can read both `vault.key` and `vault.age` can still decrypt offline —
 machine-level isolation stays your job (tight sudo, separate UID).
 
 `--audit-log` records route, vkey fingerprint, status and latency — never
-headers, body or query. Off by default.
+headers, body or query. Off by default. Five rotated generations (10 MB each)
+are kept, and rejected requests are admitted at 1/s per fingerprint — a flood
+of unauthenticated requests cannot rotate the forensic trail away.
 
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.
 Everything a request touches is bounded by default — body size, in-flight
 requests, connections, time — so a hung upstream or a misbehaving agent can't
-take the gateway down.
+take the gateway down. Idle connections are bounded too: http1 heads must
+finish within 30s, and h2 connections that stop answering keep-alive PINGs
+are closed.
 
 ## What this is not
 

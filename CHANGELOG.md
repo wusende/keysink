@@ -32,6 +32,33 @@
 - The audit writer's reopen path no longer asserts an internal invariant
   with `unwrap`
 
+**Security**
+
+- Inbound h2c connections are now keep-alive-probed: the server PINGs after
+  30s of silence and closes the connection when the PING is not ACKed within
+  15s. The http1 slowloris bound (header_read_timeout) never reached h2
+  connections, so an established-but-silent h2 connection held its connection
+  slot forever — silently parking max_connections of them was a one-shot
+  remote denial of service on an `--allow-remote` deployment. A peer that
+  answers the PINGs is actively maintaining the connection and is unaffected
+- Starting `serve` on the `.bak` backup (primary store undecryptable) now
+  prints a prominent stderr banner with the recovery commands and, on a TTY,
+  asks for confirmation — the backup lags one write behind, so vkeys rotated
+  or removed since that write would silently work again. Non-interactive
+  runs (systemd) keep starting for availability, banner and all;
+  `--accept-degraded` skips the prompt
+- The audit log now keeps 5 rotated generations (`.1` … `.5`, previously
+  just `.1`), and rejected requests (401/403/408/413/…) pass an admission
+  gate: one row per second per vkey fingerprint, 100 rows per second
+  overall, suppressions counted in the log. Rejection rows are the one audit
+  input an unauthenticated peer controls, and at loopback speeds a flood
+  used to rotate a whole generation away in about a minute
+- `export` output now states that the backup carries the working vkeys of
+  every route (it always did; the reminder makes the storage requirement
+  explicit), and `init --force` lists the leftover `vault.key.old.*` /
+  `vault.age.old.*` pairs — each old key still decrypts its old store, so a
+  rebuild done to flush a compromise is not complete until they are deleted
+
 **Performance**
 
 - SSE terminator scanning no longer allocates per chunk: the scan state moved

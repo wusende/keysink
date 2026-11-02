@@ -398,7 +398,22 @@ async fn proxy_end_to_end_fuzz() {
         if let Some(b) = &body {
             req = req.body(b.clone());
         }
-        let resp = req.send().await.expect("gateway must answer");
+        // Early rejects (401/403) answer before the request body is drained,
+        // so the gateway closes that connection while body bytes may still be
+        // in flight → the OS turns the close into an RST, and under load the
+        // very next request can be handed the just-died pooled connection and
+        // fail with a SendRequest error even though nothing was delivered.
+        // No response was received, so one retry on a fresh connection is
+        // faithful to the invariant under test (this used to flake ~50% under
+        // parallel test load).
+        let retry = req.try_clone().expect("request must be cloneable");
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) if e.status().is_none() && !e.is_timeout() => {
+                retry.send().await.expect("gateway must answer")
+            }
+            Err(e) => panic!("gateway must answer: {e}"),
+        };
         let rid = resp
             .headers()
             .get("x-keysink-request-id")
@@ -1424,11 +1439,21 @@ async fn head_screening_rejects_before_permit() {
     let mut store = Store::new();
     store.routes.insert(
         "main".into(),
-        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, true),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
     );
     store.routes.insert(
         "off".into(),
-        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, false),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            false,
+        ),
     );
     let (state, vks) = build_state(
         store,
@@ -1442,9 +1467,21 @@ async fn head_screening_rejects_before_permit() {
     let vk_off = vks["off"].clone();
 
     let cases: Vec<(&'static str, String, StatusCode)> = vec![
-        ("authorization", "Bearer ks_fffffffffffffffffffffffffffffffffffffffffff0".into(), StatusCode::UNAUTHORIZED),
-        ("authorization", "Bearer no ks prefix at all".into(), StatusCode::UNAUTHORIZED),
-        ("authorization", format!("Bearer {vk_off}"), StatusCode::FORBIDDEN),
+        (
+            "authorization",
+            "Bearer ks_fffffffffffffffffffffffffffffffffffffffffff0".into(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "authorization",
+            "Bearer no ks prefix at all".into(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "authorization",
+            format!("Bearer {vk_off}"),
+            StatusCode::FORBIDDEN,
+        ),
     ];
     for (header, value, want) in cases {
         let req = Request::builder()
@@ -1488,7 +1525,12 @@ async fn queue_bound_sheds_valid_request_with_503() {
     let mut store = Store::new();
     store.routes.insert(
         "main".into(),
-        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, true),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
     );
     let (state, vks) = build_state(
         store,
@@ -1510,7 +1552,9 @@ async fn queue_bound_sheds_valid_request_with_503() {
     let resp = keysink::proxy::handler(State(state), req).await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
         Some("1"),
         "shed responses must carry Retry-After"
     );

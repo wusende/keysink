@@ -9,7 +9,7 @@ use crate::vkey;
 use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -186,6 +186,33 @@ fn cmd_init(paths: &Paths, force: bool, password_stdin: bool) -> Result<()> {
     println!("vault initialized: {}", paths.home.display());
     println!("  {}  0600", paths.master_key().display());
     println!("  {}  0600", paths.store().display());
+    if force {
+        // --force renames the old key/store pairs to .old.<millis> instead of
+        // deleting them; each pair still decrypts each other, so a rebuild
+        // done to flush a compromise is not complete until they are removed.
+        let leftovers: Vec<String> = std::fs::read_dir(&paths.home)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| {
+                        name.starts_with("vault.key.old.") || name.starts_with("vault.age.old.")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !leftovers.is_empty() {
+            println!();
+            println!(
+                "Note: {} pre-rebuild vault file(s) remain; each old key still decrypts its old \
+                 store, so if the rebuild was to flush a compromise, delete them:",
+                leftovers.len()
+            );
+            for name in leftovers {
+                println!("  {}/{}", paths.home.display(), name);
+            }
+        }
+    }
     println!();
     println!(
         "master password is only used to encrypt and restore `export` backups; writes/rotation/serve never need it."
@@ -349,6 +376,10 @@ pub struct ServeArgs {
     pub max_concurrent: usize,
     #[arg(long, default_value_t = crate::retry::DEFAULT_MAX_RETRIES)]
     pub max_retries: u8,
+    /// Start even when the primary store is undecryptable and the vault data
+    /// comes from the older .bak backup (revoked/removed vkeys may work again)
+    #[arg(long)]
+    pub accept_degraded: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1028,10 +1059,8 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     }
 
     let unlocked = store::unlock(&paths)?;
-    if unlocked.from_backup {
-        tracing::error!(
-            "primary store failed to decrypt; starting from the .bak backup this time; the backup may be stale (revoked/deleted vkeys may work again) — fix this as soon as possible"
-        );
+    if unlocked.from_backup && !confirm_degraded_start(&paths, args.accept_degraded)? {
+        return Err(Error::msg("aborted: not serving the stale backup"));
     }
     let table = vkey::RouteTable::build(&unlocked.store)?;
     let routes = table.len();
@@ -1119,6 +1148,49 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     result
 }
 
+/// Degraded-start gate: the primary store failed to decrypt, so `serve` would
+/// run on the .bak backup, which lags one write behind — vkeys rotated or
+/// removed since that write become valid again. Availability-first still
+/// holds for non-interactive runs (systemd restarts must not wedge), but a
+/// human at a terminal gets the decision; either way the banner goes to
+/// stderr so it lands in the journal too. Returns true = proceed.
+fn confirm_degraded_start(paths: &Paths, accepted: bool) -> Result<bool> {
+    eprintln!();
+    eprintln!("=================================================================");
+    eprintln!(" DEGRADED VAULT: the primary store failed to decrypt.");
+    eprintln!(" The gateway would serve the .bak backup, which is one write");
+    eprintln!(" behind: vkeys rotated or removed since then WORK AGAIN.");
+    eprintln!("=================================================================");
+    eprintln!(" store:    {}", paths.store().display());
+    eprintln!(" backup:   {}", paths.store_bak().display());
+    eprintln!(" inspect:  keysink doctor");
+    eprintln!(
+        " recover:  cp {} {}",
+        paths.store_bak().display(),
+        paths.store().display()
+    );
+    if accepted {
+        eprintln!(" (--accept-degraded given; starting)");
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(" (non-interactive: starting anyway — fix the store as soon as possible)");
+        return Ok(true);
+    }
+    eprint!("Start on the stale backup anyway? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+        Ok(true)
+    } else {
+        eprintln!(
+            "rerun with --accept-degraded to force, or restore the backup over the store first"
+        );
+        Ok(false)
+    }
+}
+
 async fn shutdown_signal() {
     wait_for_shutdown_signal().await;
     // tokio's libc signal handler stays registered for the process lifetime
@@ -1131,9 +1203,7 @@ async fn shutdown_signal() {
     // finish cleanly; tail audit lines (≤50ms of buffer) may be lost.
     tokio::spawn(async {
         wait_for_shutdown_signal().await;
-        tracing::warn!(
-            "second shutdown signal; exiting now (in-flight connections dropped)"
-        );
+        tracing::warn!("second shutdown signal; exiting now (in-flight connections dropped)");
         std::process::exit(130);
     });
 }
@@ -1648,6 +1718,10 @@ pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
     }
     let stripped = store::export(paths, &args.output, &passphrase)?;
     println!("exported: {}", args.output.display());
+    println!(
+        "Note: the export contains the working vkeys of every route — anyone who can decrypt it \
+         can use your gateway while it runs. Store it as carefully as the keys themselves."
+    );
     if stripped > 0 {
         println!(
             "Note: the export contains no key values (route-only keys of {stripped} routes were stripped); \

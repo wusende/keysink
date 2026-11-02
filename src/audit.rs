@@ -1,5 +1,6 @@
 use crate::util;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -7,9 +8,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_AUDIT_BYTES: u64 = 10 * 1024 * 1024;
+/// Rotated generations kept on disk: `.1` (newest) through `.{N}` (oldest).
+/// Rotation is the log's only retention mechanism, and rejected requests are
+/// audited too — without generations, a flood of unauthenticated requests
+/// evicts the forensic trail of real traffic (60MB of history at N=5, plus
+/// the live file) in a few minutes at loopback speeds.
+const AUDIT_GENERATIONS: usize = 5;
 /// Bounded queue depth: under disk-write jitter, prefer dropping audit lines (with a counted warning) over blocking the request path.
 const QUEUE_DEPTH: usize = 1024;
 /// How long the writer idles before flushing buffered lines: under load,
@@ -17,12 +24,47 @@ const QUEUE_DEPTH: usize = 1024;
 /// syscall carries many lines; when the queue goes quiet, this bounds how
 /// long a `tail -f` style consumer waits for the tail.
 const FLUSH_IDLE: Duration = Duration::from_millis(50);
+/// Per-fingerprint admission interval for rejection rows: a single probing
+/// key leaves a steady, complete trail (one row per second) without being
+/// able to rotate the log on its own.
+const REJECT_FP_INTERVAL: Duration = Duration::from_secs(1);
+/// Global rejection admission per window: bounds floods that randomize the
+/// fingerprint (each fake token is a fresh bucket, so the per-fingerprint
+/// gate alone cannot cap them).
+const REJECT_GLOBAL_WINDOW: Duration = Duration::from_secs(1);
+const REJECT_GLOBAL_MAX: usize = 100;
+/// Per-fingerprint table bound: randomized-token floods would otherwise grow
+/// it without limit; when full it resets (buckets re-arm, the global cap
+/// still holds).
+const REJECT_FP_TABLE_MAX: usize = 4096;
 
 /// Audit disk writes run on a dedicated thread + bounded channel:
 /// - the request path only does try_send, never a synchronous open/write/chmod on a tokio worker;
 /// - a single writer naturally eliminates the race where two concurrent requests trigger the rotation rename at the same time.
 pub struct Audit {
     writer: Mutex<Option<Writer>>,
+    /// Rejection-side admission state (see record_reject): bounded, checked
+    /// on the calling thread before the queue.
+    rejects: Mutex<RejectGate>,
+}
+
+/// Admission state for rejection rows; see the REJECT_* constants.
+struct RejectGate {
+    per_fp: HashMap<String, Instant>,
+    window_start: Instant,
+    window_count: usize,
+    suppressed: u64,
+}
+
+impl Default for RejectGate {
+    fn default() -> Self {
+        Self {
+            per_fp: HashMap::new(),
+            window_start: Instant::now(),
+            window_count: 0,
+            suppressed: 0,
+        }
+    }
 }
 
 struct Writer {
@@ -49,6 +91,7 @@ impl Audit {
     pub fn disabled() -> Self {
         Self {
             writer: Mutex::new(None),
+            rejects: Mutex::new(RejectGate::default()),
         }
     }
 
@@ -66,6 +109,7 @@ impl Audit {
         {
             Ok(handle) => Self {
                 writer: Mutex::new(Some(Writer { tx, handle })),
+                rejects: Mutex::new(RejectGate::default()),
             },
             Err(e) => {
                 tracing::warn!(error = %e, "failed to start audit writer thread; audit disabled for this run");
@@ -91,6 +135,60 @@ impl Audit {
             }
         }
         // Disconnected (after close) is silent: audit is no longer needed during shutdown.
+    }
+
+    /// Audits a rejected request (auth failure, disabled route, body limits,
+    /// route configuration errors). Rejection rows are the one audit input an
+    /// unauthenticated peer controls, so they pass an admission gate before
+    /// the queue: per-fingerprint (one row per `REJECT_FP_INTERVAL`) plus a
+    /// global cap per window. Suppressed rows are counted, never silent.
+    pub fn record_reject(&self, entry: AuditEntry) {
+        let admit = {
+            let mut gate = self.rejects.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if now.duration_since(gate.window_start) >= REJECT_GLOBAL_WINDOW {
+                gate.window_start = now;
+                gate.window_count = 0;
+            }
+            let admitted = if gate.window_count >= REJECT_GLOBAL_MAX {
+                false
+            } else {
+                match gate.per_fp.get_mut(&entry.key_fp) {
+                    Some(last) => {
+                        if now.duration_since(*last) >= REJECT_FP_INTERVAL {
+                            *last = now;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => {
+                        if gate.per_fp.len() >= REJECT_FP_TABLE_MAX {
+                            gate.per_fp.clear();
+                        }
+                        gate.per_fp.insert(entry.key_fp.clone(), now);
+                        true
+                    }
+                }
+            };
+            if admitted {
+                gate.window_count += 1;
+            } else {
+                gate.suppressed += 1;
+                let n = gate.suppressed;
+                if n % 100 == 1 {
+                    tracing::warn!(
+                        suppressed = n,
+                        global_per_sec = REJECT_GLOBAL_MAX,
+                        "rejection audit rows throttled (1/s per fingerprint); a flood can no longer rotate the log away"
+                    );
+                }
+            }
+            admitted
+        };
+        if admit {
+            self.record(entry);
+        }
     }
 
     /// On shutdown, drain the queue and wait for the writer thread to exit so tail audit lines are not lost.
@@ -183,8 +281,19 @@ fn rotate_if_needed(path: &Path, log: &mut OpenLog) -> std::io::Result<()> {
     if log.written < MAX_AUDIT_BYTES {
         return Ok(());
     }
+    // Shift the chain one generation older (.N-1 → .N … current → .1),
+    // dropping the previous .N. remove-before-rename keeps Windows happy
+    // (rename refuses to replace an existing file there); the live file's
+    // replacement target (.1) was just vacated by the shift.
+    for generation in (2..=AUDIT_GENERATIONS).rev() {
+        let from = PathBuf::from(format!("{}.{}", path.display(), generation - 1));
+        let to = PathBuf::from(format!("{}.{}", path.display(), generation));
+        if from.exists() {
+            let _ = std::fs::remove_file(&to);
+            std::fs::rename(&from, &to)?;
+        }
+    }
     let rotated = PathBuf::from(format!("{}.1", path.display()));
-    let _ = std::fs::remove_file(&rotated);
     std::fs::rename(path, rotated)?;
     log.written = 0;
     Ok(())
@@ -269,5 +378,110 @@ mod tests {
         audit.close();
         audit.record(AuditEntry::new("R2", "r", "fp", "GET", "/x", 0, false));
         assert!(!dir.path().join("audit.jsonl").exists());
+    }
+
+    #[test]
+    fn rotation_shifts_generations_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "current").unwrap();
+        std::fs::write(dir.path().join("audit.jsonl.1"), "gen1").unwrap();
+        std::fs::write(dir.path().join("audit.jsonl.2"), "gen2").unwrap();
+        let mut log = OpenLog {
+            file: None,
+            written: u64::MAX, // force rotation
+        };
+        rotate_if_needed(&path, &mut log).unwrap();
+        assert_eq!(log.written, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("audit.jsonl.1")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("audit.jsonl.2")).unwrap(),
+            "gen1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("audit.jsonl.3")).unwrap(),
+            "gen2"
+        );
+        assert!(!dir.path().join("audit.jsonl.4").exists());
+        assert!(!path.exists(), "the live file moves into .1 on rotation");
+    }
+
+    #[test]
+    fn rotation_drops_the_oldest_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "current").unwrap();
+        for generation in 1..=AUDIT_GENERATIONS {
+            std::fs::write(
+                dir.path().join(format!("audit.jsonl.{generation}")),
+                format!("gen{generation}"),
+            )
+            .unwrap();
+        }
+        let mut log = OpenLog {
+            file: None,
+            written: u64::MAX,
+        };
+        rotate_if_needed(&path, &mut log).unwrap();
+        // The chain shifted: .5 now holds old .4, old .5 is gone, nothing beyond.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("audit.jsonl.5")).unwrap(),
+            format!("gen{}", AUDIT_GENERATIONS - 1)
+        );
+        assert!(
+            !dir.path()
+                .join(format!("audit.jsonl.{}", AUDIT_GENERATIONS + 1))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn rejection_rows_throttle_per_fingerprint_and_globally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Audit::new(path.clone());
+        // Same fingerprint: the first row lands, the immediate second is suppressed.
+        audit.record_reject(AuditEntry::new("A1", "-", "fpX", "GET", "/x", 0, false));
+        audit.record_reject(AuditEntry::new("A2", "-", "fpX", "GET", "/x", 0, false));
+        // Unique fingerprints (randomized-token flood): admitted only up to
+        // the global window cap, which fpX's first row already counted against.
+        for i in 0..150 {
+            audit.record_reject(AuditEntry::new(
+                format!("U{i}"),
+                "-",
+                format!("fp{i}"),
+                "GET",
+                "/x",
+                0,
+                false,
+            ));
+        }
+        // Forwarded rows bypass the rejection gate entirely.
+        audit.record(AuditEntry::new(
+            "F1",
+            "claude",
+            "fpOK",
+            "POST",
+            "/v1/messages",
+            12,
+            true,
+        ));
+        audit.close();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let count = text.lines().count();
+        assert!(text.contains("\"A1\""));
+        assert!(
+            !text.contains("\"A2\""),
+            "same-fingerprint repeat within the interval must be suppressed"
+        );
+        assert_eq!(
+            count,
+            1 + REJECT_GLOBAL_MAX,
+            "gate admits the window cap plus the forward"
+        );
     }
 }
