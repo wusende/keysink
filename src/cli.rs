@@ -1732,7 +1732,13 @@ mod tests {
             resolve_required(Some("  x  ".into()), "label", "--flag").unwrap(),
             "x"
         );
-        // The test process's stdin is not a TTY: a missing argument must fail immediately, never hang waiting for input
+        // The non-TTY error branch is only observable when the test process's
+        // stdin is not a terminal; from a real terminal resolve_required(None)
+        // would block in prompt_line waiting for a line and the suite appears
+        // to hang. CI and non-interactive runs (no TTY) still cover the branch.
+        if std::io::stdin().is_terminal() {
+            return;
+        }
         let err = resolve_required(None, "label", "--flag")
             .unwrap_err()
             .to_string();
