@@ -302,9 +302,12 @@ pub async fn serve_inbound(
             // sized to hold hyper's connection future) until join_next
             // consumes it, so without this branch memory would grow with
             // the cumulative number of accepted connections over the
-            // process lifetime. join_next pends on an empty set, so this
-            // never busy-loops.
-            res = conns.join_next() => {
+            // process lifetime. The arm must be disabled while the set is
+            // empty: join_next returns Ready(None) immediately for an empty
+            // set (it only pends while tasks are still running), and an
+            // always-ready arm would spin the loop and starve
+            // listener.accept() — the gateway would stop serving entirely.
+            res = conns.join_next(), if !conns.is_empty() => {
                 let _ = res;
                 continue;
             }
@@ -2224,5 +2227,97 @@ mod tests {
             assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from(vec![i]));
         }
         assert!(s.next().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod serve_inbound_tests {
+    use super::*;
+    use crate::model::Store;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            snapshot: ArcSwap::from_pointee(Snapshot {
+                store: Arc::new(Store::new()),
+                table: RouteTable::build(&Store::new()).unwrap(),
+                from_backup: false,
+            }),
+            clients: ProxyClients::new().unwrap(),
+            retry: RetryPolicy::default(),
+            body_limit: 1 << 20,
+            body_read_idle: BODY_READ_IDLE,
+            inbound_body_timeout: CLIENT_BODY_TIMEOUT,
+            permit_queue_timeout: PERMIT_QUEUE_TIMEOUT,
+            inbound_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            audit: Audit::disabled(),
+            started: Instant::now(),
+        })
+    }
+
+    /// Regression: the reaping arm of the accept select must be disabled while
+    /// the JoinSet is empty. `join_next` returns Ready(None) immediately for an
+    /// empty set, so an unguarded arm is always ready — the loop spins on it
+    /// and `listener.accept()` is never polled: the gateway accepts nothing
+    /// (connections pile up in the kernel backlog) while burning CPU. A real
+    /// round trip through serve_inbound is the only way to see it; handler-level
+    /// tests bypass the accept loop entirely. The timeout guard turns the
+    /// regression into a fast failure instead of a hang.
+    #[tokio::test]
+    async fn serve_inbound_accepts_and_answers_while_reaping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: CLIENT_HEADER_TIMEOUT,
+                max_connections: 64,
+            },
+            std::future::pending(),
+        ));
+
+        // First connection is served (the empty-set spin never gets here).
+        let buf = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut s = tokio::net::TcpStream::connect(addr).await?;
+            s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+                .await?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        })
+        .await
+        .expect("serve_inbound must accept and answer connections")
+        .unwrap();
+        assert!(
+            buf.starts_with(b"HTTP/1.1 200"),
+            "health must answer 200, got: {}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // A finished connection task must be reaped: after the connection
+        // closes, the JoinSet drains back to empty and the loop returns to
+        // accept() — proven indirectly by a second full round trip.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                // The server task is polled concurrently; sleep a tick per probe.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Indirect probe: a second request must also be served, which
+                // proves the loop returned to accept() after reaping.
+                let mut s = tokio::net::TcpStream::connect(addr).await?;
+                s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+                    .await?;
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).await?;
+                if buf.starts_with(b"HTTP/1.1 200") {
+                    return Ok::<(), std::io::Error>(());
+                }
+            }
+        })
+        .await
+        .expect("second connection must also be served after the first was reaped")
+        .unwrap();
+
+        server.abort();
     }
 }
