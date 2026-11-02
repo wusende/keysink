@@ -23,7 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # 22.04, not ubuntu-latest: the glibc version of the runner becomes the
+          # floor for every downstream user. 24.04 links against GLIBC_2.39,
+          # which excludes Debian 12, Ubuntu 22.04 and node:20-slim images.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: keysink-x86_64-unknown-linux-gnu
             # Only one matrix leg generates release notes: every leg calls the
@@ -32,6 +35,8 @@ jobs:
             notes: true
           # Native arm64 runner: cross-compiling ring (rustls) from x86_64 needs
           # a full cross toolchain and is fragile; public repos get arm64 runners for free.
+          # Consequence: the arm64 binary inherits Ubuntu 24.04's glibc 2.39 floor
+          # (no 22.04 arm64 runner exists yet). Documented in npm/README.md.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: keysink-aarch64-unknown-linux-gnu
@@ -102,3 +107,36 @@ jobs:
           files: |
             ${{ matrix.artifact }}.*
           body: ${{ steps.changelog.outputs.body }}
+
+  # Publishes the same binaries to npm as one self-contained package: every
+  # platform lives in vendor/<platform>-<arch>/ inside `keysink`, so installing
+  # needs only the npm registry (mirror-friendly) and runs no install scripts.
+  # Version numbers come from Cargo.toml, so tagging is the only release action.
+  #
+  # Gated on the NPM_PUBLISH repository variable: npm requires a trusted
+  # publisher to be configured per package on npmjs.com, which can only happen
+  # after the first manual publish. Until NPM_PUBLISH=true is set, tag releases
+  # skip this job instead of failing red. Setup steps: npm/README.md.
+  npm:
+    name: publish npm
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && vars.NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: keysink-*
+          path: npm-artifacts
+          merge-multiple: true
+      - name: stage packages
+        run: bash scripts/npm-pack.sh --from-artifacts npm-artifacts
+      - name: publish
+        run: bash scripts/npm-publish.sh

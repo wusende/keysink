@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.3
+
+*Released 2026-11-02.*
+
+Maintenance release plus a new install channel. No behavior changes.
+
+**Install**
+
+- `npm install -g keysink` — one self-contained package carrying the binaries
+  for Linux (amd64/arm64), macOS (Intel/Apple Silicon) and Windows (amd64). No
+  postinstall download, no Rust toolchain, and it works through registry mirrors
+
+**Dependencies**
+
+- `h2` 0.4.19 → 0.4.20 and `log` 0.4.34 → 0.4.35 (transitive patch updates)
+
+**Metadata**
+
+- crates.io description and keywords now name Claude Code / OpenAI / MCP and
+  use `claude-code` instead of the generic `credential`; `development-tools`
+  joins the categories. Helps in-site search only
+
 ## v0.1.2
 
 *Released 2026-11-02.*

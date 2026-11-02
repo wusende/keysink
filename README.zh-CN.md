@@ -27,13 +27,14 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
 ## 快速开始
 
-1. 安装,二选一:
+1. 安装,任选一种:
 
    ```bash
+   npm install -g keysink     # 预编译二进制,不需要工具链
    cargo install keysink      # 从 crates.io 编译,需要 Rust 工具链
    ```
 
-   或者从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。
+   也可以从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。npm 包只是同一个二进制的启动壳;Linux x64 需要 glibc 2.35+,没覆盖到的平台(musl/Alpine、Windows arm64)请回退到 `cargo install`。
 
 2. 启动网关(standalone 模式,无需 root、无需装服务):
 
@@ -157,4 +158,4 @@ cargo build --release
 bash scripts/smoke.sh    # 端到端:假上游、转发 / SSE / 重试 / 热重载 / 导出剥离
 ```
 
-`cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加带预算的性能场景。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物。
+`cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加带预算的性能场景。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物,开了 `NPM_PUBLISH` 后同时发布 npm 包——见 `npm/README.md`。

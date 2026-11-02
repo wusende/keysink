@@ -1,0 +1,39 @@
+{
+  "name": "keysink",
+  "version": "0.1.3",
+  "description": "Local gateway that keeps real AI API keys out of agents (Claude Code, OpenAI, MCP): agents hold revocable virtual keys, real keys stay in an encrypted vault.",
+  "license": "MIT",
+  "author": "wusende",
+  "homepage": "https://github.com/wusende/keysink#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wusende/keysink.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wusende/keysink/issues"
+  },
+  "keywords": [
+    "api-keys",
+    "secrets",
+    "llm",
+    "proxy",
+    "cli",
+    "claude-code",
+    "openai",
+    "mcp",
+    "ai-agents"
+  ],
+  "bin": {
+    "keysink": "bin/keysink.js"
+  },
+  "files": [
+    "bin/keysink.js",
+    "vendor/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

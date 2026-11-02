@@ -1,13 +1,13 @@
 [package]
 name = "keysink"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-description = "Local credential gateway: virtual key → upstream endpoint + real-credential byte-level passthrough, with an age-encrypted centralized vault"
+description = "Local gateway that keeps real AI API keys out of agents (Claude Code, OpenAI, MCP): agents hold revocable virtual keys, real keys stay in an encrypted vault."
 license = "MIT"
 repository = "https://github.com/wusende/keysink"
 homepage = "https://github.com/wusende/keysink#readme"
-keywords = ["api-keys", "secrets", "credential", "proxy", "llm"]
-categories = ["authentication", "command-line-utilities", "network-programming"]
+keywords = ["api-keys", "secrets", "llm", "proxy", "claude-code"]
+categories = ["authentication", "command-line-utilities", "development-tools", "network-programming"]
 exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts"]
 
 [dependencies]

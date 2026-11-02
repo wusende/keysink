@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Fuzz hit artifacts (crashing inputs land here for triage)
 fuzz/artifacts/
+
+# Staged npm packages (scripts/npm-pack.sh); regenerated, never committed
+npm/dist/

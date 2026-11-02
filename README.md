@@ -40,15 +40,18 @@ everything in its environment — but the real key was never in there.
 
 ## Quick start
 
-1. Install — either way:
+1. Install — any of these:
 
    ```bash
+   npm install -g keysink     # prebuilt binary, no toolchain
    cargo install keysink      # from crates.io, needs a Rust toolchain
    ```
 
-   or grab the binary for your platform from
+   Prebuilt binaries are also on
    [Releases](https://github.com/wusende/keysink/releases) — Linux / macOS /
-   Windows, amd64 / arm64 — and put it on your `PATH`.
+   Windows, amd64 / arm64 — put one on your `PATH`. The npm package is a thin
+   launcher around that same binary; Linux x64 needs glibc 2.35+, and anything
+   uncovered (musl/Alpine, Windows arm64) falls back to `cargo install`.
 
 2. Start the gateway (standalone mode — no root, no service):
 
@@ -220,4 +223,5 @@ bash scripts/smoke.sh    # end-to-end: fake upstream, forwarding / SSE / retry /
 `cargo test` includes a seeded fuzz suite (22 targets over the pure helpers, a
 vault corruption matrix, and end-to-end fuzz against a mock upstream) plus
 budgeted performance scenarios. Pushing a `v*` tag makes GitHub Actions build and
-publish release artifacts for all platforms.
+publish release artifacts for all platforms, plus the npm packages once
+`NPM_PUBLISH` is enabled — see `npm/README.md`.
