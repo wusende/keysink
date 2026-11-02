@@ -1173,7 +1173,6 @@ fn top_level_stream_true(body: &[u8]) -> bool {
             Some(b'"') => {}
             _ => return false,
         }
-        // Member name: the raw interior between the quotes.
         let name_start = i + 1;
         let Some(name_end) = skip_string(body, i) else {
             return false;
@@ -1534,7 +1533,6 @@ impl SseScan {
                 return;
             }
         }
-        // Keep the tail for the next boundary pass.
         if chunk.len() >= overlap {
             self.carry.clear();
             self.carry

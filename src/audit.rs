@@ -48,7 +48,6 @@ pub struct Audit {
     rejects: Mutex<RejectGate>,
 }
 
-/// Admission state for rejection rows; see the REJECT_* constants.
 struct RejectGate {
     per_fp: HashMap<String, Instant>,
     window_start: Instant,
@@ -426,7 +425,6 @@ mod tests {
             written: u64::MAX,
         };
         rotate_if_needed(&path, &mut log).unwrap();
-        // The chain shifted: .5 now holds old .4, old .5 is gone, nothing beyond.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("audit.jsonl.5")).unwrap(),
             format!("gen{}", AUDIT_GENERATIONS - 1)
@@ -443,7 +441,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let audit = Audit::new(path.clone());
-        // Same fingerprint: the first row lands, the immediate second is suppressed.
         audit.record_reject(AuditEntry::new("A1", "-", "fpX", "GET", "/x", 0, false));
         audit.record_reject(AuditEntry::new("A2", "-", "fpX", "GET", "/x", 0, false));
         // Unique fingerprints (randomized-token flood): admitted only up to
@@ -459,7 +456,6 @@ mod tests {
                 false,
             ));
         }
-        // Forwarded rows bypass the rejection gate entirely.
         audit.record(AuditEntry::new(
             "F1",
             "claude",

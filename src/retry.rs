@@ -80,7 +80,6 @@ fn jitter_seed(attempt: u32) -> u64 {
         .wrapping_add(nanos)
 }
 
-/// Parse Retry-After: integer seconds or an HTTP-date.
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
     if let Ok(secs) = trimmed.parse::<u64>() {

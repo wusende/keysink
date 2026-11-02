@@ -27,7 +27,6 @@ pub fn hash_password(password: &str) -> Result<String> {
     ))
 }
 
-/// Verify a password; `encoded` is the output of `hash_password`.
 pub fn verify_password(password: &str, encoded: &str) -> Result<bool> {
     let mut parts = encoded.split('$');
     if parts.next() != Some("scrypt") {
@@ -95,7 +94,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Set the password during init: hidden input entered twice on a TTY; with `--password-stdin` read one line.
 pub fn read_new_password(from_stdin: bool) -> Result<String> {
     let password = if from_stdin {
         read_line()?
@@ -117,7 +115,6 @@ pub fn read_new_password(from_stdin: bool) -> Result<String> {
     Ok(password)
 }
 
-/// Verify the password before export: hidden input on a TTY; with `--password-stdin` read one line.
 pub fn read_existing_password(from_stdin: bool) -> Result<String> {
     if from_stdin {
         read_line()

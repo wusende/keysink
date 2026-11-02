@@ -1801,7 +1801,6 @@ mod tests {
 
     #[test]
     fn resolve_required_prefers_given_and_errors_without_tty() {
-        // The argument wins: use it when given (including the trim)
         assert_eq!(
             resolve_required(Some("  x  ".into()), "label", "--flag").unwrap(),
             "x"

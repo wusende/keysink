@@ -34,7 +34,6 @@ fn local_offset(at: OffsetDateTime) -> UtcOffset {
     UtcOffset::local_offset_at(at).unwrap_or(UtcOffset::UTC)
 }
 
-/// Renders an instant as RFC 3339 in `offset`.
 fn ts_at(at: OffsetDateTime, offset: UtcOffset) -> String {
     at.to_offset(offset)
         .format(&Rfc3339)
@@ -50,7 +49,7 @@ pub fn ts(secs: u64) -> String {
     ts_at(at, local_offset(at))
 }
 
-/// Current time as RFC 3339 in the system's local time zone (UTC fallback).
+/// UTC fallback when the system zone cannot be resolved (see [`local_offset`]).
 pub fn now_ts() -> String {
     let now = OffsetDateTime::now_utc();
     now.to_offset(local_offset(now))
@@ -234,7 +233,6 @@ pub fn owner_matches_dir(_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Atomic write: temp file in the same directory + fsync + rename + fsync(dir).
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let dir = path
         .parent()
