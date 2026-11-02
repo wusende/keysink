@@ -57,6 +57,21 @@ pub const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// reads from the client only.
 pub const CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Bound on how long a request may queue for an inbound permit. A wedged
+/// upstream (accepts TCP, never sends response headers) holds every permit
+/// for up to attempts × header_timeout + backoff, so an open-ended queue
+/// would hang agents with no server-side error at all; past this bound the
+/// request is shed with an explicit 503 + Retry-After instead of waiting
+/// for the client's own timeout.
+pub const PERMIT_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// TCP keepalive on inbound connections: dead-peer insurance for sockets
+/// that never deliver a full request head — an HTTP/2 client stalling
+/// after the connection preface is invisible to header_read_timeout
+/// (http1-only), and without keepalive it would hold its connection slot
+/// until process exit.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
 const RID_DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 fn next_rid() -> String {
@@ -99,6 +114,8 @@ pub struct AppState {
     pub body_read_idle: Duration,
     /// Whole-body bound on reading the inbound request body (CLIENT_BODY_TIMEOUT in production; tests inject a small value).
     pub inbound_body_timeout: Duration,
+    /// Bound on queueing for an inbound permit (PERMIT_QUEUE_TIMEOUT in production; tests inject a small value).
+    pub permit_queue_timeout: Duration,
     /// Bounds concurrent handler executions — the memory-heavy phase (whole
     /// inbound body buffered + waiting for upstream response headers). The
     /// permit is held until the handler returns; the response body, including
@@ -280,6 +297,17 @@ pub async fn serve_inbound(
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => None,
+            // Reap connection tasks as they finish: JoinSet retains each
+            // entry (the JoinHandle plus the task's harness allocation,
+            // sized to hold hyper's connection future) until join_next
+            // consumes it, so without this branch memory would grow with
+            // the cumulative number of accepted connections over the
+            // process lifetime. join_next pends on an empty set, so this
+            // never busy-loops.
+            res = conns.join_next() => {
+                let _ = res;
+                continue;
+            }
             accepted = listener.accept() => Some(accepted),
         };
         let Some(accepted) = accepted else {
@@ -291,10 +319,14 @@ pub async fn serve_inbound(
                 // Descriptor pressure is transient (a burst above the OS fd
                 // limit); back off and keep serving instead of turning it
                 // into a full outage. Everything else stays fatal, as before.
-                #[cfg(unix)]
-                if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
-                    tracing::warn!(error = %e, "out of file descriptors while accepting; backing off 1s");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                if is_transient_accept_error(&e) {
+                    tracing::warn!(error = %e, "transient accept error (descriptor pressure); backing off 1s");
+                    // Shutdown stays live during the backoff: an uninterruptible
+                    // sleep would delay a stop by up to 1s per burst.
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
                     continue;
                 }
                 return Err(e);
@@ -317,6 +349,11 @@ pub async fn serve_inbound(
             continue;
         };
         let _ = stream.set_nodelay(true);
+        // Best-effort like nodelay: keepalive is dead-peer hardening, not a
+        // prerequisite for serving. SockRef borrows the stream, so the socket
+        // config lands before the stream moves into the connection task.
+        let socket = socket2::SockRef::from(&stream);
+        let _ = socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE));
         // The connection future owns its builder (cheap config clone) so it
         // stays 'static and can outlive this loop while draining.
         let app = app.clone();
@@ -346,9 +383,31 @@ pub async fn serve_inbound(
     // Graceful: stop accepting, then let in-flight requests (including long
     // SSE streams) run to completion on their own — same semantics as
     // axum::serve's graceful shutdown; the service manager's stop timeout is
-    // the hard cap.
+    // the hard cap. The count tells the operator what is still holding the
+    // drain; a second signal exits immediately (see shutdown_signal — tokio
+    // swallows further signals once the shutdown future resolved).
+    tracing::info!(
+        connections = conns.len(),
+        "shutdown: draining in-flight connections (a second signal exits immediately)"
+    );
     while conns.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Whether an accept error is transient resource pressure to back off from,
+/// rather than a fatal condition for the serve loop. Unix: EMFILE/ENFILE (a
+/// burst above the fd limit). Windows: the winsock equivalents WSAEMFILE
+/// (10024) / WSAENOBUFS (10055) as raw codes, because libc there carries
+/// neither the errno nor the winsock constants portably.
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(e.raw_os_error(), Some(10024) | Some(10055))
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -372,17 +431,6 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
 
 async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> Response {
     let started = Instant::now();
-    // Queue until a permit frees up: saturating the gateway makes extra
-    // requests wait rather than pile up unbounded memory. Never closed, so
-    // acquisition only fails in a shutdown race.
-    let Ok(_permit) = state.inbound_permits.clone().acquire_owned().await else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
-            "gateway is not accepting requests",
-            &rid,
-        );
-    };
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();
@@ -409,6 +457,12 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         error_response(status, kind, msg, &rid)
     };
 
+    // Cheap head screening comes BEFORE the request permit: everything
+    // rejected below needs no body read and no upstream work, so a
+    // credential-less flood (or a peer dribbling an oversized body) must
+    // not occupy permits — with the permit first, such a flood could pin
+    // every permit for CLIENT_BODY_TIMEOUT each and starve legitimate
+    // traffic while it queues.
     if in_headers.contains_key(header::UPGRADE) {
         return deny(
             "-",
@@ -482,6 +536,53 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             &format!("request body exceeds limit of {} bytes", state.body_limit),
         );
     }
+
+    // Queue until a permit frees up: saturating the gateway makes extra
+    // requests wait rather than pile up unbounded memory. The wait is
+    // bounded (permit_queue_timeout): a wedged upstream (accepts TCP, never
+    // sends response headers) holds every permit for up to attempts ×
+    // header_timeout + backoff, so an open-ended queue would hang agents
+    // with no server-side error at all — past the bound the request is shed
+    // with 503 + Retry-After.
+    let permit = tokio::time::timeout(
+        state.permit_queue_timeout,
+        state.inbound_permits.clone().acquire_owned(),
+    )
+    .await;
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Err(_elapsed) => {
+            record_reject(
+                state.as_ref(),
+                &rid,
+                route_name,
+                Some(&hash),
+                &method,
+                &path,
+                StatusCode::SERVICE_UNAVAILABLE,
+                started,
+            );
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "gateway is at capacity; retry shortly",
+                &rid,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+        // The semaphore is never closed; this arm only fires in a shutdown race.
+        Ok(Err(_closed)) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "gateway is not accepting requests",
+                &rid,
+            );
+        }
+    };
 
     let read = tokio::time::timeout(
         state.inbound_body_timeout,
@@ -2068,6 +2169,22 @@ mod tests {
             d,
             "once capped, backoff stays capped"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_accept_errors_are_the_descriptor_pressure_kinds() {
+        assert!(is_transient_accept_error(&std::io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(is_transient_accept_error(&std::io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        // A peer resetting mid-accept is none of our pressure; it stays fatal.
+        assert!(!is_transient_accept_error(&std::io::Error::from_raw_os_error(
+            libc::ECONNABORTED
+        )));
+        assert!(!is_transient_accept_error(&std::io::Error::other("boom")));
     }
 
     #[tokio::test(start_paused = true)]

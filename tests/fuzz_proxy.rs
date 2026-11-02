@@ -255,6 +255,7 @@ fn build_state(
     body_read_idle: Duration,
     inbound_body_timeout: Duration,
     max_inbound: usize,
+    permit_queue_timeout: Duration,
 ) -> (Arc<keysink::proxy::AppState>, HashMap<String, String>) {
     let mut vkeys = HashMap::new();
     for (name, r) in &store.routes {
@@ -273,6 +274,7 @@ fn build_state(
         body_limit,
         body_read_idle,
         inbound_body_timeout,
+        permit_queue_timeout,
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(max_inbound)),
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
@@ -293,6 +295,7 @@ async fn spawn_gateway_with_idle(
         body_read_idle,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
         64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -803,6 +806,7 @@ async fn serve_inbound_reaps_stalled_request_head() {
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
         64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -876,6 +880,7 @@ async fn serve_inbound_sheds_connections_beyond_the_cap() {
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
         64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -948,6 +953,7 @@ async fn inbound_body_trickle_times_out() {
         keysink::proxy::BODY_READ_IDLE,
         Duration::from_millis(300),
         64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1010,6 +1016,7 @@ async fn serve_inbound_passes_sse_streams() {
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
         64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1088,6 +1095,7 @@ async fn concurrent_requests_bounded_by_inbound_permits() {
         keysink::proxy::BODY_READ_IDLE,
         keysink::proxy::CLIENT_BODY_TIMEOUT,
         1,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1399,5 +1407,116 @@ async fn perf_concurrent_e2e_throughput() {
         "concurrent_100_requests",
         Duration::from_secs(30),
         t0.elapsed(),
+    );
+}
+
+// ---------- admission control ----------
+
+/// Head screening (missing/unknown vkey, disabled route, oversized declared
+/// body) must reject BEFORE queueing for a permit: with the permit first, a
+/// credential-less flood could pin every permit and turn its cheap 401/403
+/// rejects into queue hangs. Zero permits + a short queue bound makes any
+/// permit-dependent path answer 503, so fast non-503 answers prove the
+/// screening happens pre-permit.
+#[tokio::test]
+async fn head_screening_rejects_before_permit() {
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, true),
+    );
+    store.routes.insert(
+        "off".into(),
+        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, false),
+    );
+    let (state, vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        0,
+        Duration::from_millis(200),
+    );
+    let vk_off = vks["off"].clone();
+
+    let cases: Vec<(&'static str, String, StatusCode)> = vec![
+        ("authorization", "Bearer ks_fffffffffffffffffffffffffffffffffffffffffff0".into(), StatusCode::UNAUTHORIZED),
+        ("authorization", "Bearer no ks prefix at all".into(), StatusCode::UNAUTHORIZED),
+        ("authorization", format!("Bearer {vk_off}"), StatusCode::FORBIDDEN),
+    ];
+    for (header, value, want) in cases {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header, value)
+            .body(Body::empty())
+            .unwrap();
+        let started = Instant::now();
+        let resp = keysink::proxy::handler(State(state.clone()), req).await;
+        assert_eq!(resp.status(), want);
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "{want} must reject before the permit queue, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // Oversized declared Content-Length is also screenable from the head
+    // alone: 2 MiB against a 1 MiB limit.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", format!("Bearer {}", vks["main"]))
+        .header("content-length", (2 << 20).to_string())
+        .body(Body::empty())
+        .unwrap();
+    let started = Instant::now();
+    let resp = keysink::proxy::handler(State(state.clone()), req).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(started.elapsed() < Duration::from_millis(150));
+}
+
+/// A valid request past an exhausted permit pool must be shed at the queue
+/// bound (503 + Retry-After), not hang until the client's own timeout —
+/// the scenario of a wedged upstream pinning every permit for
+/// attempts × header_timeout + backoff.
+#[tokio::test]
+async fn queue_bound_sheds_valid_request_with_503() {
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(&format!("http://{mock}"), Terminator::Auto, Auth::Bearer, true),
+    );
+    let (state, vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        0,
+        Duration::from_millis(200),
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", format!("Bearer {}", vks["main"]))
+        .body(Body::empty())
+        .unwrap();
+    let started = Instant::now();
+    let resp = keysink::proxy::handler(State(state), req).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "shed responses must carry Retry-After"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(195),
+        "shed must happen at the queue bound, not before: {:?}",
+        started.elapsed()
     );
 }

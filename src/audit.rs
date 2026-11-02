@@ -161,14 +161,19 @@ fn append(path: &Path, log: &mut OpenLog, entry: &AuditEntry) -> std::io::Result
         log.written = file.metadata()?.len();
         log.file = Some(BufWriter::new(file));
     }
-    log.file.as_mut().unwrap().write_all(&line)?;
+    // Unreachable in practice (the block above just opened it), but the
+    // invariant is enforced here instead of asserted with an unwrap.
+    let Some(writer) = log.file.as_mut() else {
+        return Ok(());
+    };
+    writer.write_all(&line)?;
     log.written += line.len() as u64;
     if log.written >= MAX_AUDIT_BYTES {
         // Flush before the handle is dropped: the rotation rename happens on
         // the next reopen, and buffered-but-unwritten tail lines must not be
         // left behind in a file that is about to be renamed. (Windows also
         // refuses to rename an open file.)
-        log.file.as_mut().unwrap().flush()?;
+        writer.flush()?;
         log.file = None;
     }
     Ok(())

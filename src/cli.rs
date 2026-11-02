@@ -1056,6 +1056,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         body_limit: args.body_limit_mb * 1024 * 1024,
         body_read_idle: proxy::BODY_READ_IDLE,
         inbound_body_timeout: proxy::CLIENT_BODY_TIMEOUT,
+        permit_queue_timeout: proxy::PERMIT_QUEUE_TIMEOUT,
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent)),
         audit,
         started: Instant::now(),
@@ -1119,6 +1120,25 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
 }
 
 async fn shutdown_signal() {
+    wait_for_shutdown_signal().await;
+    // tokio's libc signal handler stays registered for the process lifetime
+    // (its docs: once registered, never unregistered), so after this future
+    // resolves and the Signal streams drop, further SIGINT/SIGTERM are
+    // swallowed by a broadcast with no receivers. The graceful drain could
+    // then wait on a long-lived SSE stream forever with no way out short of
+    // SIGKILL — so re-arm and treat a second signal as an immediate exit.
+    // Exit code 130 (128 + SIGINT): the process was ordered to die, not to
+    // finish cleanly; tail audit lines (≤50ms of buffer) may be lost.
+    tokio::spawn(async {
+        wait_for_shutdown_signal().await;
+        tracing::warn!(
+            "second shutdown signal; exiting now (in-flight connections dropped)"
+        );
+        std::process::exit(130);
+    });
+}
+
+async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };

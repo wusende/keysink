@@ -319,6 +319,7 @@ async fn watcher_hot_reload_scenarios() {
         body_limit: 32 * 1024 * 1024,
         body_read_idle: keysink::proxy::BODY_READ_IDLE,
         inbound_body_timeout: keysink::proxy::CLIENT_BODY_TIMEOUT,
+        permit_queue_timeout: keysink::proxy::PERMIT_QUEUE_TIMEOUT,
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(64)),
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),

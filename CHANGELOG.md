@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+**Stability**
+
+- The serve loop now reaps finished connection tasks as they finish (a join
+  branch in the accept select). tokio's JoinSet retains every finished task's
+  entry until `join_next` consumes it, and it was only joined after the
+  accept loop broke — so memory grew with the cumulative number of accepted
+  connections over the process lifetime, a few KB per reconnect, even though
+  concurrency stayed flat. A long-running gateway slowly ate its own RSS
+- Request-head screening (missing/unknown vkey, disabled route, oversized
+  declared Content-Length) now happens before the inbound permit is acquired.
+  With the permit first, a credential-less flood could pin every permit for
+  the body-read timeout each and starve legitimate traffic while it queued.
+  Queueing for a permit is also bounded (`PERMIT_QUEUE_TIMEOUT`, 30s): a
+  wedged upstream that accepts TCP but never sends response headers holds
+  every permit for up to attempts × header_timeout + backoff, and the
+  open-ended queue hung agents with no server-side error at all — past the
+  bound requests are shed with 503 + `Retry-After: 1`
+- Descriptor-pressure accept errors back off on Windows too
+  (WSAEMFILE/WSAENOBUFS, previously Unix-only EMFILE/ENFILE — any other
+  transient error aborted the whole serve loop there), the 1s backoff sleep
+  is interruptible by shutdown, and accepted sockets get a 60s TCP keepalive
+  as dead-peer insurance
+- Graceful shutdown logs how many connections are still draining, and a
+  second SIGINT/SIGTERM exits immediately with code 130: tokio's libc signal
+  handler stays registered after the shutdown future resolves, so further
+  signals were silently swallowed by a broadcast with no receivers and a
+  long-lived SSE stream could pin the drain until SIGKILL
+- The audit writer's reopen path no longer asserts an internal invariant
+  with `unwrap`
+
 **Performance**
 
 - SSE terminator scanning no longer allocates per chunk: the scan state moved
