@@ -9,20 +9,25 @@
 #   scripts/npm-pack.sh                        # fetch assets from GitHub Releases
 #   scripts/npm-pack.sh --from-target          # use target/<triple>/release (native only)
 #   scripts/npm-pack.sh --from-artifacts DIR   # use the archives uploaded by CI
+#   scripts/npm-pack.sh --check-version        # only assert the manifests agree (CI)
 #
-# Cargo.toml is the only place the version is written.
+# Cargo.toml is the only place the version is written: staging stamps it into the
+# built manifest and writes it back into the tracked one, and --check-version
+# keeps that committed copy honest (CI's write-back never reaches the repo).
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 usage() {
-  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 mode=release
 artifacts_dir=
+check_version=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --check-version) check_version=true ;;
     --from-target) mode=target ;;
     --from-release) mode=release ;;
     --from-artifacts)
@@ -39,6 +44,20 @@ done
 
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
 [ -n "$version" ] || { echo "cannot read the package version from Cargo.toml" >&2; exit 1; }
+
+if [ "$check_version" = true ]; then
+  NPM_MANIFEST=npm/keysink/package.json NPM_VERSION=$version node -e '
+    const fs = require("node:fs");
+    const file = process.env.NPM_MANIFEST;
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (pkg.version !== process.env.NPM_VERSION) {
+      console.error(`${file}: version ${pkg.version} != Cargo.toml ${process.env.NPM_VERSION}`);
+      process.exit(1);
+    }
+  '
+  echo "ok: npm/keysink/package.json is $version, matching Cargo.toml"
+  exit 0
+fi
 
 # Local mode stages only what this machine has built, for testing the launcher;
 # release and artifacts mode must cover every platform.

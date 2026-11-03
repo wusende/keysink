@@ -45,3 +45,8 @@ jobs:
           bash -n scripts/npm-publish.sh
           node --check npm/keysink/bin/keysink.js
           node -e "JSON.parse(require('node:fs').readFileSync('npm/keysink/package.json', 'utf8'))"
+      # The tracked launcher manifest is committed, so a release commit that bumps
+      # Cargo.toml but not it would publish a correct version while leaving the
+      # repo lying about it. npm-pack.sh writes the file back only in the runner.
+      - name: npm manifest matches Cargo.toml
+        run: bash scripts/npm-pack.sh --check-version

@@ -73,12 +73,15 @@ npm registry 有 npmmirror 等完整镜像，GitHub Releases 没有，国内用�
 
 ## 每次发版
 
-版本号只写在 `Cargo.toml`，`npm-pack.sh` 会同步进 `npm/keysink/package.json`：
+版本号只写在 `Cargo.toml`，`npm-pack.sh` 会同步进 `npm/keysink/package.json`；
+`npm/keysink/package.json` 是入库文件，所以**发版提交必须把它一起改掉**——CI 的
+`npm manifest matches Cargo.toml` 步骤会拦截漂移（本地可先跑
+`bash scripts/npm-pack.sh --check-version`）。
 
 ```bash
-# 1. 改 Cargo.toml 版本 + CHANGELOG，提交
+# 1. 改 Cargo.toml 版本 + CHANGELOG + npm/keysink/package.json 的 version，提交
 # 2. 打 tag → CI 构建五平台，再打包成单包发布 npm（NPM_PUBLISH=true 时）
-git tag v0.1.3 && git push origin v0.1.3
+git tag v0.1.4 && git push origin v0.1.4
 ```
 
 CI 里的 npm job 用构建产物（`--from-artifacts`）而不是从 GitHub 下载，避免依赖 Release
