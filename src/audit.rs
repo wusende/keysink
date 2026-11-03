@@ -94,6 +94,20 @@ impl Audit {
         }
     }
 
+    /// Whether rows are being written. The writer is chosen once at startup
+    /// (--audit-log or not), so the answer cannot change mid-request; callers
+    /// skip `AuditEntry` construction entirely when this is false — its
+    /// RFC3339 local-time format plus several String allocations are pure
+    /// waste on the default audit-off path. Same lock (and same early-out)
+    /// that `record` would take anyway.
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub fn new(path: PathBuf) -> Self {
         // mode(0o600) only takes effect at creation; if an existing file has overly broad permissions, warn once at startup.
         if path.exists()
@@ -328,6 +342,16 @@ impl AuditEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_enabled_reflects_the_writer() {
+        assert!(!Audit::disabled().is_enabled());
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::new(dir.path().join("audit.jsonl"));
+        assert!(audit.is_enabled());
+        audit.close();
+        assert!(!audit.is_enabled(), "close() takes the writer out");
+    }
 
     #[test]
     fn writes_one_json_line() {

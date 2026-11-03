@@ -813,7 +813,11 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         }
     };
 
-    tracing::info!(
+    // debug, not info: at ~60k RPS the per-request info line wrote ~12MB/s
+    // (6.4GB over a 10-minute soak) and its formatting + stdout-lock cost
+    // showed up as a measurable throughput hit. The audit log (--audit-log)
+    // is the per-request record; RUST_LOG=keysink=debug restores this line.
+    tracing::debug!(
         route = route_name,
         %method,
         %path,
@@ -856,19 +860,25 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         HeaderValue::from_str(&rid).unwrap_or(HeaderValue::from_static("0000")),
     );
 
-    let mut entry = AuditEntry::new(
-        rid.clone(),
-        route_name,
-        vkey::fingerprint(&hash),
-        method.to_string(),
-        path,
-        body.len(),
-        is_stream,
-    );
-    entry.status = response.status().as_u16();
-    entry.ms = started.elapsed().as_millis() as u64;
-    entry.attempts = forward.attempts;
-    state.audit.record(entry);
+    // AuditEntry::new formats an RFC3339 local timestamp and allocates a
+    // handful of Strings per request — pure waste on the default audit-off
+    // path, so check first. The writer is fixed at startup (--audit-log or
+    // not), so the answer cannot flip between here and record().
+    if state.audit.is_enabled() {
+        let mut entry = AuditEntry::new(
+            rid.clone(),
+            route_name,
+            vkey::fingerprint(&hash),
+            method.to_string(),
+            path,
+            body.len(),
+            is_stream,
+        );
+        entry.status = response.status().as_u16();
+        entry.ms = started.elapsed().as_millis() as u64;
+        entry.attempts = forward.attempts;
+        state.audit.record(entry);
+    }
 
     response
 }

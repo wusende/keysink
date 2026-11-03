@@ -61,6 +61,17 @@
 
 **Performance**
 
+- The per-request "forwarding request" log line is now `debug` instead of
+  `info`: at ~60k RPS the info line wrote ~12MB/s of log (6.4GB over a
+  10-minute soak) and its formatting plus stdout-lock cost measurably capped
+  throughput. The audit log (`--audit-log`) remains the per-request record;
+  `RUST_LOG=keysink=debug` restores the line for troubleshooting — update any
+  monitoring that counted these lines
+- With audit off (the default), successful requests no longer construct an
+  audit entry at all: the entry's RFC3339 local-time format and its handful
+  of String allocations were pure waste on that path; an `is_enabled()`
+  check (the writer is fixed at startup, so it cannot flip mid-request)
+  skips them
 - SSE terminator scanning no longer allocates per chunk: the scan state moved
   into the response stream itself, each upstream chunk is now searched in
   place, and a fixed 40-byte stack window catches markers split across chunk
