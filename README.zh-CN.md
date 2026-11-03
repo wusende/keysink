@@ -106,10 +106,17 @@ sudo keysink deploy
 
 一条命令:创建 `keysink` 系统用户和 0700 保险库目录,把二进制装到 `/usr/local/bin/keysink`,写好 systemd unit 和 sudoers 规则(给执行 sudo 的管理员),交互式初始化保险库(隐藏输入、输两遍),然后启用服务。幂等——重复执行就是原地升级并重启。卸载对称:`sudo keysink uninstall`。
 
-unit 在保险库不存在时拒绝启动(`ConditionPathExists`)。没有终端时手动初始化:
+unit 在保险库不存在时拒绝启动(`ConditionPathExists`)。部署主机上没有终端时,手动初始化——有 tty 的交互式:
 
 ```bash
-runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
+sudo -u keysink /usr/local/bin/keysink --home /var/lib/keysink init
+```
+
+完全没有 tty 时(`init` 不会在无终端时提示输入,必须走 stdin):
+
+```bash
+printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
+  --home /var/lib/keysink init --password-stdin
 ```
 
 之后管理命令走 `sudo -u keysink /usr/local/bin/keysink …`,每次调用都重新鉴权(`timestamp_timeout=0`),agent 没法静默执行。

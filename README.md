@@ -148,11 +148,18 @@ binary to `/usr/local/bin/keysink`, writes the systemd unit and the sudoers rule
 password, entered twice), then enables the service. Idempotent — re-running
 upgrades in place and restarts. Removal is symmetric: `sudo keysink uninstall`.
 
-The unit refuses to start until the vault exists (`ConditionPathExists`). Without
-a terminal, init manually:
+The unit refuses to start until the vault exists (`ConditionPathExists`). With no
+terminal on the deploy host, init manually — interactively:
 
 ```bash
-runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
+sudo -u keysink /usr/local/bin/keysink --home /var/lib/keysink init
+```
+
+or fully headless (`init` refuses to prompt without a TTY, so pipe the password):
+
+```bash
+printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
+  --home /var/lib/keysink init --password-stdin
 ```
 
 Admin commands then go through `sudo -u keysink /usr/local/bin/keysink …`; each
