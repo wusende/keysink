@@ -47,6 +47,9 @@ everything in its environment — but the real key was never in there.
    cargo install keysink      # from crates.io, needs a Rust toolchain
    ```
 
+   `cargo install` lands in `~/.cargo/bin`, which sudo can't see. So if you later
+   run `sudo keysink deploy`, use `sudo ~/.cargo/bin/keysink deploy`.
+
    Prebuilt binaries are also on
    [Releases](https://github.com/wusende/keysink/releases) — Linux / macOS /
    Windows, amd64 / arm64 — put one on your `PATH`. The npm package is a thin
@@ -152,8 +155,9 @@ a terminal, init manually:
 runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
 ```
 
-Admin commands then go through `sudo -u keysink keysink …`; each invocation
-re-authenticates (`timestamp_timeout=0`), so an agent cannot silently run them.
+Admin commands then go through `sudo -u keysink /usr/local/bin/keysink …`; each
+invocation re-authenticates (`timestamp_timeout=0`), so an agent cannot silently
+run them.
 
 ## Security model
 

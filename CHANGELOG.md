@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.1.5
+
+*Released 2026-11-03.*
+
+Docs only — no code changes.
+
+- Quick start now notes that `cargo install` puts the binary in `~/.cargo/bin`,
+  which sudo can't see, so `sudo keysink deploy` has to be spelled
+  `sudo ~/.cargo/bin/keysink deploy`.
+- The Linux service section spells out `sudo -u keysink /usr/local/bin/keysink …`.
+  The previous `sudo -u keysink keysink …` failed for the same reason: sudo's
+  `PATH` doesn't include `/usr/local/bin`.
+
 ## v0.1.4
 
 *Released 2026-11-03.*

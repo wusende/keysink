@@ -34,6 +34,8 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
    cargo install keysink      # 从 crates.io 编译,需要 Rust 工具链
    ```
 
+   `cargo install` 装到 `~/.cargo/bin`,sudo 看不到这个目录。所以后面要跑 `sudo keysink deploy` 时,写成 `sudo ~/.cargo/bin/keysink deploy`。
+
    也可以从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。npm 包只是同一个二进制的启动壳;Linux x64 需要 glibc 2.35+,没覆盖到的平台(musl/Alpine、Windows arm64)请回退到 `cargo install`。
 
 2. 启动网关(standalone 模式,无需 root、无需装服务):
@@ -110,7 +112,7 @@ unit 在保险库不存在时拒绝启动(`ConditionPathExists`)。没有终端�
 runuser -u keysink -- /usr/local/bin/keysink --home /var/lib/keysink init
 ```
 
-之后管理命令走 `sudo -u keysink keysink …`,每次调用都重新鉴权(`timestamp_timeout=0`),agent 没法静默执行。
+之后管理命令走 `sudo -u keysink /usr/local/bin/keysink …`,每次调用都重新鉴权(`timestamp_timeout=0`),agent 没法静默执行。
 
 ## 安全模型
 
