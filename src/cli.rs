@@ -1246,10 +1246,17 @@ async fn shutdown_signal() {
     // may be lost.
     tokio::spawn(async {
         let signum = wait_for_shutdown_signal().await;
-        // stderr, not the log: this fires right before process::exit, which
-        // does not wait for the non-blocking log thread to flush — a tracing
-        // line here would (usually) never be seen.
-        eprintln!("keysink: second shutdown signal; exiting now (in-flight connections dropped)");
+        // Bounded drain of the log queue first: process::exit does not wait
+        // for the non-blocking log thread, so without this whatever is still
+        // queued is lost. Short — the user asked to leave now. The notice
+        // itself goes to stderr via writeln! (not the log, which may be the
+        // thing that is backed up, and not eprintln!, which panics if the
+        // stderr write fails).
+        util::flush_logs(Duration::from_millis(500));
+        let _ = writeln!(
+            std::io::stderr(),
+            "keysink: second shutdown signal; exiting now (in-flight connections dropped)"
+        );
         std::process::exit(128 + signum as i32);
     });
 }

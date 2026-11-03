@@ -56,7 +56,10 @@ or storage changes.
   writer is synchronous on the emitting thread, so a slow consumer (journald, a
   full pipe, a paused terminal) could block a tokio worker inside a `write`
   syscall on the per-request warn paths; the request path is now a `try_send`, and
-  a full queue drops lines (counted) instead of stalling the gateway
+  a full queue drops lines (counted) instead of stalling the gateway. The queue is
+  drained at exit (a bounded flush marker, also before a second-signal `exit`),
+  a dead writer counts as drops, and the drop report can no longer panic when
+  stderr is gone too
 - Upstream connection pool idle timeout 90s → 30s: a pooled connection the peer
   already closed fails the next request that picks it, and a POST is not replayed,
   so the agent saw a 502 for a request that never reached the upstream

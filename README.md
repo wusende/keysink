@@ -158,11 +158,14 @@ decrypts — and is what to run when something looks wrong.
 To check the gateway itself, `GET /__keysink/health` returns
 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`,
 plus the state that used to be invisible: `snapshot_age_secs` (how long the
-served snapshot has been in place — it keeps growing while the hot reload is
-failing, e.g. a broken vault), `reload_failures` / `reload_attempts`,
-`shed_connections` / `accept_errors` (connection-cap and per-connection
-accept-error counts), and `audit` / `audit_ok` / `audit_dropped` (a dead audit
-writer reports `audit_ok:false` instead of silently dropping every line).
+served snapshot has been in place — the watcher only reloads on vault changes,
+so on a stable vault this grows with uptime; it reports data freshness, not
+watcher health, so don't alert on it), `reload_failures` / `reload_attempts`
+(the actual reload signals: failures climbs while the vault stays broken, e.g.
+undecryptable), `shed_connections` / `accept_errors` (connection-cap and
+per-connection accept-error counts), and `audit` / `audit_ok` /
+`audit_dropped` (a dead audit writer reports `audit_ok:false` instead of
+silently dropping every line).
 
 `--accept-degraded` covers a broken vault: when the primary store fails to
 decrypt, the gateway can start from `vault.age.bak` instead. That backup is one

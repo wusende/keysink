@@ -53,7 +53,13 @@ fn install_panic_hook() {
 pub fn entry() {
     bootstrap();
     let cli = cli::Cli::parse();
-    if let Err(e) = cli::run(cli) {
+    let result = cli::run(cli);
+    // Drain what the non-blocking log writer still has queued: the subscriber
+    // leaks its sender for the process lifetime, so the writer thread never
+    // runs to completion on its own, and the tail lines — shutdown, cleanup,
+    // the error printed below — would otherwise race process teardown.
+    util::flush_logs(std::time::Duration::from_secs(2));
+    if let Err(e) = result {
         eprintln!("keysink: {e}");
         std::process::exit(1);
     }

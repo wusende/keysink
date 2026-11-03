@@ -4,8 +4,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::UtcOffset;
 use time::format_description::well_known::Rfc3339;
@@ -289,6 +291,21 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 /// process by more than a few MB.
 const LOG_QUEUE_DEPTH: usize = 4096;
 
+/// What the log queue carries: a formatted line, or a flush marker. The
+/// channel is FIFO, so everything enqueued before a marker is written before
+/// the marker is acked — `flush_logs` relies on exactly that ordering.
+enum LogMsg {
+    Line(Vec<u8>),
+    /// Written-back acknowledgement channel for `flush_logs`.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// The writer thread's handle on the queue, for `flush_logs` at exit: the
+/// subscriber installed by `.init()` leaks its sender for the process
+/// lifetime, so the writer never sees the channel close and would otherwise
+/// race process teardown with whatever lines are still queued.
+static LOG_FLUSH: OnceLock<SyncSender<LogMsg>> = OnceLock::new();
+
 /// Non-blocking writer for the log output.
 ///
 /// `tracing_subscriber::fmt()` writes to stdout synchronously, on whichever
@@ -300,37 +317,97 @@ const LOG_QUEUE_DEPTH: usize = 4096;
 /// the queue is full, lines are dropped (and counted) instead of blocking the
 /// gateway.
 pub fn non_blocking_stdout() -> NonBlockingMakeWriter {
-    let (tx, rx) = sync_channel::<Vec<u8>>(LOG_QUEUE_DEPTH);
+    let (tx, rx) = sync_channel::<LogMsg>(LOG_QUEUE_DEPTH);
     let dropped = Arc::new(AtomicU64::new(0));
     let spawned = std::thread::Builder::new()
         .name("keysink-log".into())
-        .spawn(move || {
+        .spawn({
             // Deliberately not `stdout().lock()`: holding the global stdout
             // lock across the blocking recv would deadlock any other writer
             // (the CLI's println! output) for the process lifetime.
             let mut out = std::io::stdout();
-            while let Ok(line) = rx.recv() {
-                if out.write_all(&line).and_then(|()| out.flush()).is_err() {
-                    // stdout is gone (closed pipe, detached terminal): keep
-                    // draining so producers never block, and stop reporting.
-                    for _ in rx.iter() {}
-                    break;
-                }
-            }
-            let _ = out.flush();
+            move || log_writer_loop(rx, &mut out)
         });
     if let Err(e) = spawned {
         // Cannot fall back to a synchronous writer from here; say so once on
         // stderr and let the channel drop lines rather than wedge the process.
-        eprintln!(
+        // (writeln!, never eprintln!: this must not be able to panic — see
+        // the drop report in QueuedWriter::flush.)
+        let _ = writeln!(
+            std::io::stderr(),
             "keysink: failed to start the log writer thread ({e}); log output will be dropped"
         );
     }
+    let _ = LOG_FLUSH.set(tx.clone());
     NonBlockingMakeWriter { tx, dropped }
 }
 
+/// The log writer thread body, separate so the queue protocol has tests.
+///
+/// On a write error (stdout gone: a closed fd, a full disk) the loop stops
+/// writing but keeps draining so producers never block, and keeps acking
+/// flush markers so an exit-time flush does not wait out its whole timeout.
+fn log_writer_loop(rx: Receiver<LogMsg>, out: &mut impl Write) {
+    while let Ok(msg) = rx.recv() {
+        let line = match msg {
+            LogMsg::Flush(ack) => {
+                // Everything enqueued before the marker is already written
+                // (FIFO); release the waiter and keep serving.
+                let _ = out.flush();
+                let _ = ack.send(());
+                continue;
+            }
+            LogMsg::Line(line) => line,
+        };
+        if out.write_all(&line).and_then(|()| out.flush()).is_err() {
+            for msg in rx.iter() {
+                if let LogMsg::Flush(ack) = msg {
+                    let _ = ack.send(());
+                }
+            }
+            break;
+        }
+    }
+    let _ = out.flush();
+}
+
+/// Best-effort drain of the log queue before the process exits: enqueue a
+/// flush marker behind everything still queued and wait for the writer to
+/// ack it. Bounded by `timeout` — a wedged consumer (the situation the
+/// non-blocking writer exists for) must not be able to delay the exit too.
+/// No-op when the non-blocking writer was never installed.
+pub fn flush_logs(timeout: Duration) {
+    let Some(tx) = LOG_FLUSH.get() else {
+        return;
+    };
+    send_flush_marker(tx, timeout);
+}
+
+/// Enqueues a `Flush` marker behind the queued lines and waits for its ack.
+/// A full queue is retried until the deadline (the writer is consuming it);
+/// a disconnected one means the writer is gone and there is nothing to wait
+/// for.
+fn send_flush_marker(tx: &SyncSender<LogMsg>, timeout: Duration) {
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match tx.try_send(LogMsg::Flush(ack_tx.clone())) {
+            Ok(()) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let _ = ack_rx.recv_timeout(left);
+                return;
+            }
+            Err(TrySendError::Full(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Deadline passed with a full queue, or the writer is gone.
+            Err(_) => return,
+        }
+    }
+}
+
 pub struct NonBlockingMakeWriter {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<LogMsg>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -349,7 +426,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingMakeWriter {
 /// Collects one formatted event and hands it to the log thread on flush/drop.
 /// Never blocks: a full queue drops the line.
 pub struct QueuedWriter {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<LogMsg>,
     buf: Vec<u8>,
     dropped: Arc<AtomicU64>,
 }
@@ -365,13 +442,22 @@ impl Write for QueuedWriter {
             return Ok(());
         }
         let line = std::mem::take(&mut self.buf);
-        if let Err(TrySendError::Full(line)) = self.tx.try_send(line) {
+        let len = line.len();
+        // Both failure kinds mean the line is gone: a full queue (slow
+        // consumer) or a dead writer (thread failed to start, or it stopped
+        // draining). Counted either way — the count is the only trace a
+        // dropped line leaves.
+        if self.tx.try_send(LogMsg::Line(line)).is_err() {
             let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 1000 == 1 {
-                // stderr, not the log: the log is what is backed up.
-                eprintln!(
-                    "keysink: log queue full; dropping log lines ({n} dropped so far, {line_len} bytes)",
-                    line_len = line.len()
+                // stderr, not the log: the log is what is backed up. writeln!,
+                // never eprintln!: eprintln! panics when the stderr write
+                // fails, this code runs on a tokio worker inside the tracing
+                // write path, and "both outputs unwritable" (daemonized with
+                // the fds closed) is exactly when lines drop.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "keysink: log queue full or writer gone; dropping log lines ({n} dropped so far, {len} bytes)"
                 );
             }
         }
@@ -413,6 +499,7 @@ pub fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn percent_encode_basic() {
@@ -495,7 +582,7 @@ mod tests {
         // A full queue must drop the line and return immediately: this runs on
         // the request path, where blocking on a slow log consumer stalls a
         // tokio worker (and with it unrelated requests).
-        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+        let (tx, rx) = sync_channel::<LogMsg>(1);
         let dropped = Arc::new(AtomicU64::new(0));
         let mut w = QueuedWriter {
             tx,
@@ -507,10 +594,83 @@ mod tests {
         w.write_all(b"second\n").unwrap();
         w.flush().unwrap();
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(rx.try_recv().unwrap(), b"first\n".to_vec());
+        assert!(
+            matches!(rx.try_recv(), Ok(LogMsg::Line(line)) if line == b"first\n"),
+            "the first line must be queued"
+        );
         assert!(
             rx.try_recv().is_err(),
             "the second line must have been dropped, not queued"
         );
+    }
+
+    /// Vec sink shareable with the writer thread without holding a lock
+    /// across recv() (which would deadlock the assertions).
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_marker_drains_queued_lines_before_acking() {
+        // The exit-time flush (flush_logs) is the marker protocol: everything
+        // enqueued before the marker must be written before the ack — FIFO
+        // ordering is what the ack certifies.
+        let (tx, rx) = sync_channel::<LogMsg>(4);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let writer_sink = sink.clone();
+        let handle = std::thread::spawn(move || {
+            let mut writer_sink = SharedSink(writer_sink);
+            log_writer_loop(rx, &mut writer_sink)
+        });
+        tx.try_send(LogMsg::Line(b"a\n".to_vec())).unwrap();
+        tx.try_send(LogMsg::Line(b"b\n".to_vec())).unwrap();
+        send_flush_marker(&tx, Duration::from_secs(2));
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            b"a\nb\n".as_slice(),
+            "the ack must certify the queued lines are written"
+        );
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    struct BrokenSink;
+
+    impl Write for BrokenSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdout gone"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("stdout gone"))
+        }
+    }
+
+    #[test]
+    fn broken_log_sink_still_acks_flush_markers() {
+        // stdout gone: the loop stops writing but keeps draining. Flush
+        // markers must still be acked in drain mode, or the exit-time flush
+        // would wait out its whole timeout on every shutdown of such a
+        // process. Both arms ack, so no timing is needed: whichever path the
+        // marker lands in, this asserts it is released.
+        let (tx, rx) = sync_channel::<LogMsg>(4);
+        let handle = std::thread::spawn(move || log_writer_loop(rx, &mut BrokenSink));
+        tx.try_send(LogMsg::Line(b"a\n".to_vec())).unwrap();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        tx.try_send(LogMsg::Flush(ack_tx)).unwrap();
+        ack_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drain mode must ack flush markers");
+        drop(tx);
+        handle.join().unwrap();
     }
 }

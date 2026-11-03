@@ -117,7 +117,7 @@ keysink route rotate claude                                       # 换 vkey,旧
 
 `status` 打印保险库摘要(位置、schema、路由数)。`doctor` 跑完整性检查——属主、权限、key 能否解析、store 能否解密、备份能否解密——出问题先跑它。
 
-要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`;另外还有以前看不见的状态:`snapshot_age_secs`(当前快照已经服务了多久——热加载一直失败,比如保险库坏了时它只会越长越大)、`reload_failures` / `reload_attempts`、`shed_connections` / `accept_errors`(连接上限丢弃数、每连接 accept 错误数),以及 `audit` / `audit_ok` / `audit_dropped`(审计写线程死掉时 `audit_ok:false`,而不是默默丢每一行)。
+要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`;另外还有以前看不见的状态:`snapshot_age_secs`(当前快照已服务多久——监听器只在保险库变更时才重载,保险库稳定不变时它会随 uptime 正常增长,反映的是数据新旧而不是监听器健康,别拿它做告警)、`reload_failures` / `reload_attempts`(真正的重载信号:保险库一直坏着时 failures 会持续上涨)、`shed_connections` / `accept_errors`(连接上限丢弃数、每连接 accept 错误数),以及 `audit` / `audit_ok` / `audit_dropped`(审计写线程死掉时 `audit_ok:false`,而不是默默丢每一行)。
 
 `--accept-degraded` 是保险库坏了时的逃生口:主 store 解密失败时,允许网关改用 `vault.age.bak` 启动。那份备份落后一次写入,所以这段时间里被轮换或删除的 vkey 会重新生效——它只是让 agent 继续跑,不是可以长待的状态。`doctor` 会告诉你哪个文件坏了、怎么恢复。
 
