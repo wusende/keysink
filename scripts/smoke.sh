@@ -192,9 +192,18 @@ curl -sS -o /dev/null -X POST "http://127.0.0.1:$GW_PORT/echo" -H "Authorization
   -H 'Content-Type: application/json' -d '{}'
 curl -sS -o /dev/null "http://127.0.0.1:$GW_PORT/echo" \
   -H 'Authorization: Bearer ks_rejected000000000000000000000000000000000000000'
-grep -q '"route":"echo"' "$TMP/audit.jsonl"
-grep -q '"route":"-"' "$TMP/audit.jsonl"
-grep -q '"status":401' "$TMP/audit.jsonl"
+# The audit writer batches lines in a BufWriter that flushes after FLUSH_IDLE
+# (50ms); the greps race that flush on a fast machine, so poll for the content.
+wait_audit() {
+  for _ in $(seq 1 50); do
+    grep -q "$1" "$TMP/audit.jsonl" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+wait_audit '"route":"echo"'
+wait_audit '"route":"-"'
+wait_audit '"status":401'
 if grep -q 'real-key-123\|ks_' "$TMP/audit.jsonl"; then
   echo "audit log leaked a secret or vkey" >&2
   exit 1
