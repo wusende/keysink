@@ -280,7 +280,9 @@ fn stats_json(values: &mut [u64]) -> serde_json::Value {
         "p90": percentile(values, 90.0),
         "p99": percentile(values, 99.0),
         "max": values.last().copied().unwrap_or(0),
-        "mean": if n > 0 { sum / n } else { 0 },
+        // checked_div, not `if n > 0 { sum / n }`: clippy's manual_checked_ops
+        // rejects the guard form.
+        "mean": sum.checked_div(n).unwrap_or(0),
     })
 }
 
