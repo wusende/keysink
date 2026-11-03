@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.1.4
+
+*Released 2026-11-03.*
+
+A stability, security and throughput pass: a long-running gateway no longer
+creeps up in memory, every request phase is bounded, and the hot path allocates
+less per request, per streamed chunk and per forwarded header. Drop-in upgrade —
+no config or storage changes.
+
 **Stability**
 
 - The serve loop now reaps finished connection tasks as they finish (a join
@@ -95,6 +104,10 @@
   entries written across a DST change keep the right offset. Storage is
   unchanged (epoch seconds); `TZ=UTC` restores the old output, and an
   unresolvable zone falls back to UTC rather than dropping the line
+
+**Dependencies**
+
+- `cc` 1.10.0 → 1.11.0 and `ctutils` 0.4.7 → 0.4.8 (transitive patch updates)
 
 ## v0.1.3
 
