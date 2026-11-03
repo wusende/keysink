@@ -187,17 +187,18 @@ fn cmd_init(paths: &Paths, force: bool, password_stdin: bool) -> Result<()> {
     println!("  {}  0600", paths.master_key().display());
     println!("  {}  0600", paths.store().display());
     if force {
-        // --force renames the old key/store pairs to .old.<millis> instead of
-        // deleting them; each pair still decrypts each other, so a rebuild
-        // done to flush a compromise is not complete until they are removed.
+        // --force renames the old key/store pairs (both the live and the .bak
+        // pair) to .old.<millis> instead of deleting them; each pair still
+        // decrypts each other, so a rebuild done to flush a compromise is not
+        // complete until they are removed. The prefix list comes from Paths so
+        // it can never drift from the renames in store::init.
+        let prefixes = paths.old_backup_prefixes();
         let leftovers: Vec<String> = std::fs::read_dir(&paths.home)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|name| {
-                        name.starts_with("vault.key.old.") || name.starts_with("vault.age.old.")
-                    })
+                    .filter(|name| prefixes.iter().any(|p| name.starts_with(p)))
                     .collect()
             })
             .unwrap_or_default();
@@ -1134,6 +1135,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
                 // idle keep-alive and long-lived SSE hold a connection but
                 // no request permit.
                 max_connections: (args.max_concurrent * 8).clamp(256, 16_384),
+                loop_iterations: None,
             },
             shutdown_signal(),
         )
@@ -1199,18 +1201,23 @@ async fn shutdown_signal() {
     // swallowed by a broadcast with no receivers. The graceful drain could
     // then wait on a long-lived SSE stream forever with no way out short of
     // SIGKILL — so re-arm and treat a second signal as an immediate exit.
-    // Exit code 130 (128 + SIGINT): the process was ordered to die, not to
-    // finish cleanly; tail audit lines (≤50ms of buffer) may be lost.
+    // Exit code 128 + signum (130 = SIGINT, 143 = SIGTERM): the process was
+    // ordered to die, not to finish cleanly, and the shell sees the same $?
+    // it would for a kill by that signal; tail audit lines (≤50ms of buffer)
+    // may be lost.
     tokio::spawn(async {
-        wait_for_shutdown_signal().await;
+        let signum = wait_for_shutdown_signal().await;
         tracing::warn!("second shutdown signal; exiting now (in-flight connections dropped)");
-        std::process::exit(130);
+        std::process::exit(128 + signum as i32);
     });
 }
 
-async fn wait_for_shutdown_signal() {
+/// Resolves with the caught signal's number (2 = SIGINT, 15 = SIGTERM), so
+/// the second-signal exit can report the code matching what actually fired.
+async fn wait_for_shutdown_signal() -> u8 {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
+        2
     };
     #[cfg(unix)]
     let terminate = async {
@@ -1219,12 +1226,13 @@ async fn wait_for_shutdown_signal() {
         {
             sig.recv().await;
         }
+        15
     };
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<u8>();
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        signum = ctrl_c => signum,
+        signum = terminate => signum,
     }
 }
 

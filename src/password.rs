@@ -27,6 +27,8 @@ pub fn hash_password(password: &str) -> Result<String> {
     ))
 }
 
+/// `encoded` is a hash_password() output ("scrypt$log_n$r$p$salt$hash");
+/// anything else is rejected as malformed rather than failing to match.
 pub fn verify_password(password: &str, encoded: &str) -> Result<bool> {
     let mut parts = encoded.split('$');
     if parts.next() != Some("scrypt") {

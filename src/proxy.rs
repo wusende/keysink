@@ -16,9 +16,12 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, ReadBuf};
 use tracing::Instrument;
 use zeroize::Zeroizing;
 
@@ -272,7 +275,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 }
 
 /// Inbound read bounds applied by serve_inbound.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct InboundLimits {
     /// Whole-head bound: a client that does not finish sending its request
     /// head within this time is disconnected (slowloris defense).
@@ -283,6 +286,106 @@ pub struct InboundLimits {
     /// than the request bound on purpose: idle keep-alive and long-lived SSE
     /// connections hold a connection slot but no request permit.
     pub max_connections: usize,
+    /// Test instrumentation: counts accept-loop iterations. An idle loop must
+    /// pend on accept (single digits over seconds); an always-ready select
+    /// arm spins it into the millions. Production passes None.
+    pub loop_iterations: Option<Arc<AtomicU64>>,
+}
+
+/// The h2 prior-knowledge preface. hyper-util's auto builder reads it — or a
+/// first diverging byte — to pick http1 vs h2, and that sniff phase obeys
+/// neither inbound bound: http1's header_read_timeout only arms once http1 is
+/// selected, and the h2 keep-alive PING only starts after the h2 handshake
+/// completes. A peer that connects and then sends nothing (or stalls
+/// mid-preface) therefore holds its connection slot until process exit, and
+/// silently parking max_connections of them is the same one-shot remote DoS
+/// the h2 keep-alive closed — at lower cost, since not a single byte needs
+/// to be sent. So the first bytes are read here, under the same whole-head
+/// deadline as http1, and replayed into hyper.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Reads from `io` until the protocol is decidable — `H2_PREFACE` complete
+/// (h2), a divergence from it (http1), or EOF — under one whole-phase
+/// deadline (a slowloris trickling one byte per window gets nowhere, same
+/// semantics as CLIENT_HEADER_TIMEOUT). TimedOut on deadline; read errors
+/// propagate.
+async fn sniff_protocol(
+    io: &mut (impl tokio::io::AsyncRead + Unpin),
+    head_timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + head_timeout;
+    let mut seen = Vec::with_capacity(H2_PREFACE.len());
+    let mut chunk = [0u8; H2_PREFACE.len() + 8];
+    while seen.len() < H2_PREFACE.len() {
+        let read = tokio::time::timeout_at(deadline, io.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "protocol sniff timed out")
+            })??;
+        if read == 0 {
+            // EOF: replay what arrived so hyper reports the closed peer itself.
+            break;
+        }
+        seen.extend_from_slice(&chunk[..read]);
+        // Compare only the prefix-length part: a burst can carry the preface
+        // plus the first h2 frames in one read, and that overshoot is legal.
+        let decided = &seen[..seen.len().min(H2_PREFACE.len())];
+        if !H2_PREFACE.starts_with(decided) {
+            break; // cannot be h2 → http1; header_read_timeout takes over
+        }
+    }
+    Ok(seen)
+}
+
+/// Replays the sniffed bytes ahead of the live socket so hyper sees the exact
+/// byte stream it would have read itself. Writes pass straight through
+/// (WebSocket upgrades included).
+struct PrefaceIo<T> {
+    io: T,
+    preface: Vec<u8>,
+    pos: usize,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefaceIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.pos < self.preface.len() {
+            let n = (self.preface.len() - self.pos).min(buf.remaining());
+            buf.put_slice(&self.preface[self.pos..self.pos + n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefaceIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
 }
 
 /// Serves the gateway on `listener` until `shutdown` resolves — the same
@@ -304,6 +407,9 @@ pub async fn serve_inbound(
     let conn_slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     let mut shed = 0u64;
     loop {
+        if let Some(counter) = &limits.loop_iterations {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         let accepted = tokio::select! {
             _ = &mut shutdown => None,
             // Reap connection tasks as they finish: JoinSet retains each
@@ -364,8 +470,16 @@ pub async fn serve_inbound(
         // Best-effort like nodelay: keepalive is dead-peer hardening, not a
         // prerequisite for serving. SockRef borrows the stream, so the socket
         // config lands before the stream moves into the connection task.
+        // Interval must be explicit: Windows maps it straight onto
+        // SIO_KEEPALIVE_VALS, and socket2 turns an unset interval into a 0ms
+        // probe gap — undefined winsock input, where one dropped packet on a
+        // busy link could reap a healthy connection.
         let socket = socket2::SockRef::from(&stream);
-        let _ = socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE));
+        let _ = socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(TCP_KEEPALIVE)
+                .with_interval(Duration::from_secs(15)),
+        );
         // The connection future owns its builder (cheap config clone) so it
         // stays 'static and can outlive this loop while draining.
         let app = app.clone();
@@ -373,6 +487,16 @@ pub async fn serve_inbound(
             // Hold the connection slot for the task's whole life: dropped
             // when the connection ends, freeing the slot for the next accept.
             let _conn_slot = _conn_slot;
+            let mut stream = stream;
+            let preface = match sniff_protocol(&mut stream, limits.header_timeout).await {
+                Ok(preface) => preface,
+                Err(e) => {
+                    // Silent peers are the DoS shape this bounds; aborts and
+                    // resets are routine client noise in both cases.
+                    tracing::debug!(error = %e, "inbound connection dropped before speaking");
+                    return;
+                }
+            };
             let mut builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             builder.http1().timer(hyper_util::rt::TokioTimer::new());
@@ -394,7 +518,11 @@ pub async fn serve_inbound(
             builder.http2().keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
             if let Err(e) = builder
                 .serve_connection_with_upgrades(
-                    hyper_util::rt::TokioIo::new(stream),
+                    hyper_util::rt::TokioIo::new(PrefaceIo {
+                        io: stream,
+                        preface,
+                        pos: 0,
+                    }),
                     hyper_util::service::TowerToHyperService::new(app.clone()),
                 )
                 .await
@@ -484,10 +612,14 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
 
     // Cheap head screening comes BEFORE the request permit: everything
     // rejected below needs no body read and no upstream work, so a
-    // credential-less flood (or a peer dribbling an oversized body) must
-    // not occupy permits — with the permit first, such a flood could pin
-    // every permit for CLIENT_BODY_TIMEOUT each and starve legitimate
-    // traffic while it queues.
+    // credential-less flood (or a peer dribbling an oversized declared
+    // body) must not occupy permits — with the permit first, such a flood
+    // could pin every permit for CLIENT_BODY_TIMEOUT each and starve
+    // legitimate traffic while it queues. Declared is the operative word:
+    // the screen reads Content-Length, so a chunked request still takes a
+    // permit before its size is knowable — bounded then by body_limit +
+    // CLIENT_BODY_TIMEOUT once the read starts, which is the pre-existing
+    // exposure, strictly narrowed by this screen.
     if in_headers.contains_key(header::UPGRADE) {
         return deny(
             "-",
@@ -1561,20 +1693,28 @@ fn sse_error_event(message: &str, terminator: Terminator) -> Bytes {
     }
 }
 
+/// Every terminator marker the scanner searches for, in one place: the
+/// boundary window only covers straddling markers up to
+/// TERMINATOR_MAX_NEEDLE, and the fit assertion reads this same array — a
+/// needle added here without raising the const fails that test instead of
+/// silently blinding the chunk-boundary check. [0] is the OpenAI marker,
+/// [1..] the Anthropic ones.
+const TERMINATOR_NEEDLES: [&[u8]; 3] = [
+    b"data: [DONE]",
+    b"event: message_stop",
+    b"\"type\":\"message_stop\"",
+];
+
 pub(crate) fn contains_terminator(chunk: &[u8], terminator: Terminator) -> bool {
-    let openai = || find_memmem(chunk, b"data: [DONE]") || find_memmem_ci(chunk, b"data: [DONE]");
-    let anthropic = || {
-        find_memmem(chunk, b"event: message_stop")
-            || find_memmem(chunk, b"\"type\":\"message_stop\"")
-            || find_memmem_ci(chunk, b"event: message_stop")
-            || find_memmem_ci(chunk, b"\"type\":\"message_stop\"")
+    let needles = match terminator {
+        Terminator::Openai => &TERMINATOR_NEEDLES[..1],
+        Terminator::Anthropic => &TERMINATOR_NEEDLES[1..],
+        Terminator::Auto => &TERMINATOR_NEEDLES[..],
+        Terminator::None => return false,
     };
-    match terminator {
-        Terminator::Openai => openai(),
-        Terminator::Anthropic => anthropic(),
-        Terminator::Auto => openai() || anthropic(),
-        Terminator::None => false,
-    }
+    needles
+        .iter()
+        .any(|needle| find_memmem(chunk, needle) || find_memmem_ci(chunk, needle))
 }
 
 fn find_memmem(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1840,11 +1980,7 @@ mod tests {
 
     #[test]
     fn terminator_needles_fit_the_carry_window() {
-        for needle in [
-            &b"data: [DONE]"[..],
-            b"event: message_stop",
-            b"\"type\":\"message_stop\"",
-        ] {
+        for needle in TERMINATOR_NEEDLES {
             assert!(
                 needle.len() <= TERMINATOR_MAX_NEEDLE,
                 "needle {needle:?} is longer than TERMINATOR_MAX_NEEDLE; raise the const so the boundary window still covers straddling markers"
@@ -1854,11 +1990,7 @@ mod tests {
 
     #[test]
     fn scan_finds_markers_split_at_every_point() {
-        for marker in [
-            &b"data: [DONE]"[..],
-            b"event: message_stop",
-            b"\"type\":\"message_stop\"",
-        ] {
+        for marker in TERMINATOR_NEEDLES {
             // two-chunk split at every interior point
             for split in 1..marker.len() {
                 let mut scan = SseScan::new(Terminator::Auto, "R".into());
@@ -2296,6 +2428,7 @@ mod serve_inbound_tests {
             InboundLimits {
                 header_timeout: CLIENT_HEADER_TIMEOUT,
                 max_connections: 64,
+                loop_iterations: None,
             },
             std::future::pending(),
         ));
@@ -2344,5 +2477,170 @@ mod serve_inbound_tests {
         .unwrap();
 
         server.abort();
+    }
+
+    /// Regression (idle spin): the same unguarded reaping arm spins the loop
+    /// even with NO connections — join_next is always ready on an empty set,
+    /// so the loop burns a core while idle and the round-trip test above
+    /// cannot see it (its connections arrive fast enough that accept wins
+    /// the select races anyway). The loop counter makes the spin directly
+    /// assertable: an idle loop must pend on accept, not iterate.
+    #[tokio::test]
+    async fn serve_inbound_idle_loop_pends_instead_of_spinning() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let iterations = Arc::new(AtomicU64::new(0));
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: CLIENT_HEADER_TIMEOUT,
+                max_connections: 8,
+                loop_iterations: Some(iterations.clone()),
+            },
+            std::future::pending(),
+        ));
+
+        // Idle for 300ms: with the guard the loop sits in accept (1-2
+        // iterations); the spin bug produces ~1e6 iterations per second.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let count = iterations.load(Ordering::Relaxed);
+        assert!(
+            count < 1_000,
+            "idle accept loop must pend on accept, not spin; iterations in 300ms: {count}"
+        );
+
+        // Still healthy afterwards: one round trip through the same loop.
+        let buf = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut s = tokio::net::TcpStream::connect(addr).await?;
+            s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+                .await?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        })
+        .await
+        .expect("idle loop must still accept and answer")
+        .unwrap();
+        assert!(buf.starts_with(b"HTTP/1.1 200"));
+
+        server.abort();
+    }
+
+    /// Regression (sniff DoS): a connection that never sends a byte must be
+    /// dropped within the head timeout. Before the sniff read, such a
+    /// connection parked a connection slot forever — hyper-util's auto
+    /// builder polls for the 24-byte h2 preface with no bound, and neither
+    /// header_read_timeout (http1-only) nor the h2 keep-alive PING
+    /// (post-handshake only) reaches that phase.
+    #[tokio::test]
+    async fn serve_inbound_drops_silent_connection_within_head_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head_timeout = Duration::from_millis(300);
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: head_timeout,
+                max_connections: 8,
+                loop_iterations: None,
+            },
+            std::future::pending(),
+        ));
+
+        // Connect and say nothing: the server must close the socket.
+        // Without the sniff bound this read hangs until the test timeout —
+        // exactly the parked-slot DoS. (The trickle variant is covered
+        // deterministically, with paused time, in sniff_protocol_decides_or_times_out.)
+        let closed = tokio::time::timeout(head_timeout * 10, async {
+            let mut s = tokio::net::TcpStream::connect(addr).await?;
+            let mut buf = [0u8; 16];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) => return Ok::<(), std::io::Error>(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("silent connection must be dropped within the head timeout");
+        assert!(closed.is_ok(), "expected clean EOF, got {:?}", closed.unwrap_err());
+
+        server.abort();
+    }
+
+    /// sniff_protocol hands h2 bursts through whole (preface + first frames
+    /// in one read is legal client behavior), stops at the first divergence
+    /// (http1 needs no further sniffing), EOFs cleanly, and — the whole
+    /// point — drops a silent or trickling peer at the whole-phase deadline
+    /// instead of parking the connection slot forever.
+    #[tokio::test(start_paused = true)]
+    async fn sniff_protocol_decides_or_times_out() {
+        // h2 burst: preface + a settings frame payload in one write; the
+        // overshoot must come back intact for hyper to parse.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut burst = H2_PREFACE.to_vec();
+        burst.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]);
+        client.write_all(&burst).await.unwrap();
+        let seen = sniff_protocol(&mut server, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(seen, burst, "preface burst must pass through unmodified");
+
+        // http1 divergence: first byte already decides, one read is enough.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(b"GET /x HTTP/1.1\r\n").await.unwrap();
+        let seen = sniff_protocol(&mut server, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(seen, b"GET /x HTTP/1.1\r\n".to_vec());
+
+        // Silent peer: the deadline must fire, not hang.
+        let (_client, mut server) = tokio::io::duplex(64);
+        let err = sniff_protocol(&mut server, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // Trickle: preface bytes one at a time keeps the prefix forever
+        // undecided, so only the whole-phase deadline (not a per-read one)
+        // can end the sniff.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let dribble = tokio::spawn(async move {
+            loop {
+                for byte in H2_PREFACE {
+                    if client.write_all(&[*byte]).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        });
+        let err = sniff_protocol(&mut server, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        dribble.abort();
+    }
+
+    /// PrefaceIo must replay the sniffed bytes before the live stream, then
+    /// disappear — hyper sees exactly the byte stream it would have read
+    /// itself, across replay-buffer boundaries.
+    #[tokio::test]
+    async fn preface_io_replays_then_passes_through() {
+        let (mut client, server) = tokio::io::duplex(8);
+        let mut io = PrefaceIo {
+            io: server,
+            preface: b"PRI * HTTP/2.0".to_vec(),
+            pos: 0,
+        };
+        client.write_all(b"|live|").await.unwrap();
+        drop(client); // read_to_end needs the peer's EOF
+
+        let mut seen = Vec::new();
+        io.read_to_end(&mut seen).await.unwrap();
+        assert_eq!(
+            seen,
+            b"PRI * HTTP/2.0|live|".to_vec(),
+            "replayed preface must precede live bytes"
+        );
     }
 }

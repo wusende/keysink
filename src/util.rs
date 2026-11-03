@@ -233,6 +233,10 @@ pub fn owner_matches_dir(_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Crash-safe write: the temp file lands in the same directory so the final
+/// rename cannot straddle filesystems (rename across devices is not atomic),
+/// and both the data and the directory entry are fsynced — a rename alone
+/// survives a crash with the new name pointing at empty blocks.
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let dir = path
         .parent()

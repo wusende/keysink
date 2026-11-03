@@ -855,6 +855,8 @@ async fn serve_inbound_reaps_stalled_request_head() {
         keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(keysink::proxy::serve_inbound(
@@ -863,6 +865,7 @@ async fn serve_inbound_reaps_stalled_request_head() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_millis(300),
             max_connections: 16,
+            loop_iterations: None,
         },
         std::future::pending(),
     ));
@@ -929,6 +932,8 @@ async fn serve_inbound_sheds_connections_beyond_the_cap() {
         keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(keysink::proxy::serve_inbound(
@@ -937,6 +942,7 @@ async fn serve_inbound_sheds_connections_beyond_the_cap() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_secs(30),
             max_connections: 1,
+            loop_iterations: None,
         },
         std::future::pending(),
     ));
@@ -1002,6 +1008,8 @@ async fn inbound_body_trickle_times_out() {
         keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1065,6 +1073,8 @@ async fn serve_inbound_passes_sse_streams() {
         keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(keysink::proxy::serve_inbound(
@@ -1073,6 +1083,7 @@ async fn serve_inbound_passes_sse_streams() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_secs(30),
             max_connections: 64,
+            loop_iterations: None,
         },
         std::future::pending(),
     ));
@@ -1106,6 +1117,8 @@ async fn concurrent_requests_bounded_by_inbound_permits() {
     // happens after the handler returns, so streams never hold a permit.)
     let gate = Arc::new(tokio::sync::Notify::new());
     let gate_for_mock = gate.clone();
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1144,6 +1157,8 @@ async fn concurrent_requests_bounded_by_inbound_permits() {
         keysink::proxy::PERMIT_QUEUE_TIMEOUT,
     );
     let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw = listener.local_addr().unwrap();
     tokio::spawn(async move {

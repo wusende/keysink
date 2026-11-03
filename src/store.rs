@@ -60,6 +60,20 @@ impl Paths {
         self.home.join("gateway.addr")
     }
 
+    /// Filename prefixes of the `.old.<millis>` leftovers a `--force` rebuild
+    /// leaves behind, in the same order as the renames in [`init`]. Each
+    /// prefix names a key/store pair that still decrypts each other — the
+    /// `vault.key.bak.old.*` pair included, which is why it must never be
+    /// dropped from a "delete these to complete the rebuild" listing.
+    pub fn old_backup_prefixes(&self) -> [String; 4] {
+        [
+            format!("{}.old.", self.key_name),
+            format!("{}.old.", self.store_name),
+            format!("{}.bak.old.", self.key_name),
+            format!("{}.bak.old.", self.store_name),
+        ]
+    }
+
     fn ensure_home(&self) -> Result<()> {
         util::create_private_dir_all(&self.home)?;
         util::ensure_private_dir(&self.home)
@@ -594,6 +608,13 @@ mod tests {
         let paths = Paths::vault(dir.path().join("v"));
         init(&paths, false, "test-password").unwrap();
         assert!(init(&paths, false, "test-password").is_err());
+        // A vault that has served (written) carries the .bak pair; --force
+        // must preserve those under .bak.old.<millis> exactly like the live
+        // pair, and the leftover listing must match — a .bak.old key still
+        // decrypts its .bak.old store, so dropping it from the listing would
+        // leave an unnoticed live credential after a flush-compromise rebuild.
+        std::fs::write(paths.master_key_bak(), b"bak-key").unwrap();
+        std::fs::write(paths.store_bak(), b"bak-store").unwrap();
         init(&paths, true, "test-password").unwrap();
         assert!(paths.master_key().exists());
         assert!(paths.store().exists());
@@ -602,14 +623,12 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(
-            names.iter().any(|n| n.starts_with("vault.key.old.")),
-            "old vault.key should be renamed keeping the original name: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n.starts_with("vault.age.old.")),
-            "old vault.age should be renamed keeping the original name: {names:?}"
-        );
+        for prefix in paths.old_backup_prefixes() {
+            assert!(
+                names.iter().any(|n| n.starts_with(&prefix)),
+                "old {prefix}* should be renamed keeping the original name: {names:?}"
+            );
+        }
         assert!(
             !names
                 .iter()
