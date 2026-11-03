@@ -30,8 +30,29 @@ GW_PORT=18787
 
 UP_PID=""
 GW_PID=""
+# 失败标记:run_bench 轮失败 / 聚合失败 / 微基准失败都置 1,脚本最终以
+# 非零退出,CI 与调用方才能感知;否则缺轮只能靠人眼翻 summary。
+FAILED=0
+# 后台 bench(S7 reload / S8 soak)进程:set -e 中途退出时 cleanup 必须
+# 一并杀掉,否则它们对着已死的网关空转发最长 SOAK 秒。
+RELOAD_BENCH=""
+SOAK_SMALL=""
+SOAK_SSE=""
+
+# 端口被占时基线会打到别人身上而静默产出错误数据(健康检查探的是端口
+# 上的任何进程),开工前先确认两个端口都没人。fd 开在子 shell 里,连接
+# 成功即说明端口有人,子 shell 退出连接随之关闭。
+for _port in "$UP_PORT" "$GW_PORT"; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$_port") 2>/dev/null; then
+    echo "FATAL: port $_port already in use (先释放端口再跑)" >&2
+    exit 1
+  fi
+done
 
 cleanup() {
+  [ -n "$RELOAD_BENCH" ] && kill "$RELOAD_BENCH" 2>/dev/null || true
+  [ -n "$SOAK_SMALL" ] && kill "$SOAK_SMALL" 2>/dev/null || true
+  [ -n "$SOAK_SSE" ] && kill "$SOAK_SSE" 2>/dev/null || true
   [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
   [ -n "$UP_PID" ] && kill "$UP_PID" 2>/dev/null || true
 }
@@ -61,7 +82,17 @@ cargo build --release --locked --example ksbench
 log "start upstream"
 "$KSBENCH" upstream --port "$UP_PORT" >"$RESULTS/upstream.log" 2>&1 &
 UP_PID=$!
-sleep 0.5
+# 与 start_gw 同款存活探测:bind 失败(端口被占)时进程会死,没有这个
+# 检查的话 d/* 直连基线全部打到端口占用者身上。
+for _ in $(seq 50); do
+  kill -0 "$UP_PID" 2>/dev/null || {
+    echo "FATAL: upstream died during startup" >&2
+    tail -5 "$RESULTS/upstream.log" >&2
+    exit 1
+  }
+  (exec 3<>"/dev/tcp/127.0.0.1/$UP_PORT") 2>/dev/null && break
+  sleep 0.1
+done
 
 VAULT="$(mktemp -d)"
 ks() { "$BIN" --home "$VAULT" "$@"; }
@@ -75,11 +106,22 @@ VKEY="$(printf 'real-perf-key\n' | ks route add bench \
 if [ -z "$VKEY" ]; then echo "FATAL: no vkey captured" >&2; exit 1; fi
 
 GW_LOG="$RESULTS/gateway.log"
+GW_PID_FILE="$RESULTS/gw.pid"
+# 默认 warn:每请求 info 行在 60k RPS 下 15s 就写 ~180MB(曾经撑爆磁盘),
+# 日志本身的开销单独在 S10 里做受控对比。GW_RUST_LOG=info 可覆盖。
 start_gw() { # $@ = extra serve flags
-  "$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" "$@" \
+  RUST_LOG="${GW_RUST_LOG:-warn}" "$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" "$@" \
     >"$GW_LOG" 2>&1 &
   GW_PID=$!
+  echo "$GW_PID" >"$GW_PID_FILE"
   for _ in $(seq 100); do
+    # 健康检查探到的是端口上的任何进程:若本进程已死(bind 失败,比如上一
+    # 场景的网关没停),curl 会探到旧网关并误报成功,被测对象被静默换掉。
+    kill -0 "$GW_PID" 2>/dev/null || {
+      echo "FATAL: gateway process died during startup" >&2
+      tail -5 "$GW_LOG" >&2
+      exit 1
+    }
     curl -sf "http://127.0.0.1:$GW_PORT/__keysink/health" >/dev/null && return 0
     sleep 0.1
   done
@@ -90,17 +132,22 @@ start_gw() { # $@ = extra serve flags
 stop_gw() {
   [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
   wait "$GW_PID" 2>/dev/null || true
+  rm -f "$GW_PID_FILE"
   GW_PID=""
 }
 
-# 网关 RSS 采样(每秒一行,与 markers.log 时间戳对齐)
+# 网关 RSS 采样(每秒一行,与 markers.log 时间戳对齐)。PID 从文件读:
+# 采样器先于 start_gw fork,环境变量捕获不到后来的值。
 RSS_FILE="$RESULTS/rss.csv"
 MARKERS="$RESULTS/markers.log"
 touch "$RSS_FILE" "$MARKERS"
 rss_sampler() {
   while :; do
-    if [ -n "$GW_PID" ] && kill -0 "$GW_PID" 2>/dev/null; then
-      echo "$(date +%s),$(ps -o rss= -p "$GW_PID" | tr -d ' ')" >>"$RSS_FILE"
+    if [ -f "$GW_PID_FILE" ]; then
+      pid="$(cat "$GW_PID_FILE")"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "$(date +%s),$(ps -o rss= -p "$pid" | tr -d ' ')" >>"$RSS_FILE"
+      fi
     fi
     sleep 1
   done
@@ -108,6 +155,9 @@ rss_sampler() {
 rss_sampler & RSS_SAMPLER=$!
 cleanup() {
   kill "$RSS_SAMPLER" 2>/dev/null || true
+  [ -n "$RELOAD_BENCH" ] && kill "$RELOAD_BENCH" 2>/dev/null || true
+  [ -n "$SOAK_SMALL" ] && kill "$SOAK_SMALL" 2>/dev/null || true
+  [ -n "$SOAK_SSE" ] && kill "$SOAK_SSE" 2>/dev/null || true
   [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
   [ -n "$UP_PID" ] && kill "$UP_PID" 2>/dev/null || true
 }
@@ -126,7 +176,10 @@ run_bench() {
   for r in $(seq "$rounds"); do
     "$KSBENCH" bench "$@" --label "$label" \
       >>"$RESULTS/rounds.jsonl" 2>>"$RESULTS/ksbench.err" \
-      || echo "$(date +%s) FAIL $label round $r" >>"$MARKERS"
+      || {
+        echo "$(date +%s) FAIL $label round $r" >>"$MARKERS"
+        FAILED=1
+      }
   done
   echo "$(date +%s) END $label" >>"$MARKERS"
 }
@@ -188,6 +241,9 @@ run_bench "g/json32mb" "$ROUNDS" --target "$(gw /json?size=33554432)" \
 
 # ---------------------------------------------------------------------------
 log "S4 large request bodies"
+# 33554432 恰好等于网关默认 --max-body-mb 32(上限含端点,压线通过):
+# 场景本意就是"最大默认 body",但任何一侧改动一字节就会 413——动这个
+# 数字前先对齐两侧。
 for size in 1048576 8388608 33554432; do
   for kind in plain stream_true marker_in_string; do
     run_bench "g/body_${size}_${kind}" "$ROUNDS" --target "$(gw /echo?size=1024)" \
@@ -217,6 +273,27 @@ start_gw --audit-log "$RESULTS/audit.jsonl"
 run_bench "g/audit_on_c32" "$ROUNDS" --target "$(gw /echo?size=1024)" \
   "${AUTH[@]}" --concurrency 32 --duration "$DURATION"
 stop_gw
+
+# ---------------------------------------------------------------------------
+log "S10 per-request log cost (info vs warn)"
+# 每个配置一个独立的网关进程:start_gw 前必须没有存活网关,否则新进程 bind
+# 失败退出、健康检查却探到旧网关误报成功,三个场景会测成同一个配置。
+# warn→/dev/null:无每请求日志的基线;info→/dev/null:格式化+写系统调用的
+# CPU 成本;info→文件:再加落盘成本(1 轮即删,防止日志膨胀)。
+GW_LOG=/dev/null start_gw
+run_bench "g/logwarn_devnull_c32" "$ROUNDS" --target "$(gw /echo?size=1024)" \
+  "${AUTH[@]}" --concurrency 32 --duration "$DURATION"
+stop_gw
+GW_LOG=/dev/null GW_RUST_LOG=info start_gw
+run_bench "g/loginfo_devnull_c32" "$ROUNDS" --target "$(gw /echo?size=1024)" \
+  "${AUTH[@]}" --concurrency 32 --duration "$DURATION"
+stop_gw
+GW_LOG="$RESULTS/gateway_info.log" GW_RUST_LOG=info start_gw
+run_bench "g/loginfo_file_c32" 1 --target "$(gw /echo?size=1024)" \
+  "${AUTH[@]}" --concurrency 32 --duration "$DURATION"
+stop_gw
+rm -f "$RESULTS/gateway_info.log"
+
 start_gw
 
 # ---------------------------------------------------------------------------
@@ -234,8 +311,9 @@ for i in 1 2 3; do
 done
 # mtime 扰动:watcher 应重解锁但快照内容等价
 for i in 1 2; do touch "$VAULT/store.age"; sleep 4; done
-wait "$RELOAD_BENCH"
+wait "$RELOAD_BENCH" || FAILED=1
 echo "$(date +%s) END reloads" >>"$MARKERS"
+RELOAD_BENCH=""
 
 # ---------------------------------------------------------------------------
 log "S8 soak (mixed: small + paced SSE)"
@@ -249,8 +327,10 @@ if [ "${PERF_SKIP_SOAK:-0}" != "1" ]; then
     --concurrency 8 --duration "$SOAK" --label "g/soak_sse" \
     >"$RESULTS/soak_sse.json" 2>>"$RESULTS/ksbench.err" &
   SOAK_SSE=$!
-  wait "$SOAK_SMALL"
-  wait "$SOAK_SSE"
+  wait "$SOAK_SMALL" || FAILED=1
+  wait "$SOAK_SSE" || FAILED=1
+  SOAK_SMALL=""
+  SOAK_SSE=""
   cat "$RESULTS/soak_small.json" >>"$RESULTS/rounds.jsonl"
   cat "$RESULTS/soak_sse.json" >>"$RESULTS/rounds.jsonl"
   echo "$(date +%s) END soak" >>"$MARKERS"
@@ -263,7 +343,10 @@ stop_gw
 # ---------------------------------------------------------------------------
 log "S9 micro-benchmarks (cargo perf_ tests, release)"
 cargo test --release --locked perf_ -- --nocapture \
-  >"$RESULTS/micro.txt" 2>&1 || echo "micro tests FAILED" >>"$RESULTS/micro.txt"
+  >"$RESULTS/micro.txt" 2>&1 || {
+  echo "micro tests FAILED" >>"$RESULTS/micro.txt"
+  FAILED=1
+}
 grep -E "perf/" "$RESULTS/micro.txt" || true
 
 # ---------------------------------------------------------------------------
@@ -272,6 +355,7 @@ python3 scripts/perf_aggregate.py \
   --results "$RESULTS" >"$RESULTS/aggregate.log" 2>&1 || {
   echo "aggregate FAILED"
   cat "$RESULTS/aggregate.log"
+  FAILED=1
 }
 kill "$RSS_SAMPLER" 2>/dev/null || true
 kill "$UP_PID" 2>/dev/null || true
@@ -279,3 +363,7 @@ kill "$UP_PID" 2>/dev/null || true
 echo
 echo "results in: $RESULTS"
 echo "summary:    $RESULTS/summary.md"
+if [ "$FAILED" -ne 0 ]; then
+  echo "STATUS: FAILED(轮失败/聚合失败,详见 markers.log、ksbench.err、aggregate.log)"
+fi
+exit "$FAILED"

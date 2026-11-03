@@ -73,8 +73,11 @@ async fn run_upstream(args: UpstreamArgs) {
 
     let app = axum::Router::new()
         .route("/echo", axum::routing::get(echo).post(echo))
-        .route("/json", axum::routing::get(json_fixed))
-        .route("/sse", axum::routing::get(sse));
+        .route("/json", axum::routing::get(json_fixed).post(json_fixed))
+        .route("/sse", axum::routing::get(sse))
+        // Accept the large request bodies the bench sends; axum's default
+        // extractor limit is 2MB and would 413 everything bigger.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
     axum::serve(listener, app).await.expect("upstream serve");
 }
 
@@ -205,7 +208,9 @@ struct BenchArgs {
     #[arg(long)]
     sse: bool,
 
-    /// Per-request timeout in seconds.
+    /// Per-request timeout in seconds: bounds send() plus the body read as a
+    /// whole for non-streaming requests, and as a per-chunk idle bound for
+    /// SSE streams (long streams are expected to outlive it).
     #[arg(long, default_value_t = 120)]
     timeout: u64,
 
@@ -265,7 +270,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
-fn stats_json(values: &mut Vec<u64>) -> serde_json::Value {
+fn stats_json(values: &mut [u64]) -> serde_json::Value {
     values.sort_unstable();
     let n = values.len() as u64;
     let sum: u64 = values.iter().sum();
@@ -319,8 +324,6 @@ async fn run_bench(args: BenchArgs) {
             let body = body.clone();
             let headers = req_headers.clone();
             let sent = sent.clone();
-            let is_sse = is_sse;
-            let has_body_cap = has_body_cap;
             let method = method.clone();
             tokio::spawn(async move {
                 let mut s = Samples::default();
@@ -366,8 +369,10 @@ async fn run_bench(args: BenchArgs) {
                             s.error_samples
                                 .push(format!("http {} via {}", resp.status(), target));
                         }
-                        // Drain so the connection can be reused.
-                        let _ = resp.bytes().await;
+                        // Drain so the connection can be reused — bounded: an
+                        // error response is small, so a hang here is a wedged
+                        // peer, not a payload worth waiting for.
+                        let _ = tokio::time::timeout(timeout, resp.bytes()).await;
                         continue;
                     }
 
@@ -375,7 +380,26 @@ async fn run_bench(args: BenchArgs) {
                         let mut stream = resp.bytes_stream();
                         let mut ttfb: Option<u64> = None;
                         let mut last: Option<Instant> = None;
-                        while let Some(item) = stream.next().await {
+                        let mut stream_ok = true;
+                        // Each read is idle-bounded, not the whole stream: a
+                        // healthy long stream may legitimately outlive the
+                        // per-request timeout, but a gap of one timeout
+                        // without a chunk means someone hung — without this
+                        // bound a wedged upstream parks the worker forever
+                        // and the whole bench never exits.
+                        loop {
+                            let item = match tokio::time::timeout(timeout, stream.next()).await {
+                                Ok(item) => item,
+                                Err(_) => {
+                                    stream_ok = false;
+                                    s.transport_errors += 1;
+                                    if s.error_samples.len() < 5 {
+                                        s.error_samples.push("transport: stream idle timeout".into());
+                                    }
+                                    break;
+                                }
+                            };
+                            let Some(item) = item else { break };
                             match item {
                                 Ok(chunk) => {
                                     if ttfb.is_none() {
@@ -388,6 +412,7 @@ async fn run_bench(args: BenchArgs) {
                                     s.chunks += 1;
                                 }
                                 Err(e) => {
+                                    stream_ok = false;
                                     s.transport_errors += 1;
                                     if s.error_samples.len() < 5 {
                                         s.error_samples.push(format!("stream: {e}"));
@@ -396,25 +421,39 @@ async fn run_bench(args: BenchArgs) {
                                 }
                             }
                         }
-                        let total = started.elapsed().as_micros() as u64;
-                        s.latencies.push((ttfb.unwrap_or(total), total));
+                        // A stream that died mid-flight counts only as a
+                        // transport error: no latency sample, no ok.
+                        if stream_ok {
+                            let total = started.elapsed().as_micros() as u64;
+                            s.latencies.push((ttfb.unwrap_or(total), total));
+                            s.ok += 1;
+                        }
                     } else {
                         let ttfb = started.elapsed().as_micros() as u64;
-                        match resp.bytes().await {
-                            Ok(b) => {
+                        // Whole-body bound: send() returning only means the
+                        // headers arrived; the body itself needs the same
+                        // timeout or a hung response parks the worker.
+                        match tokio::time::timeout(timeout, resp.bytes()).await {
+                            Ok(Ok(b)) => {
                                 s.bytes += b.len() as u64;
                                 s.latencies
                                     .push((ttfb, started.elapsed().as_micros() as u64));
+                                s.ok += 1;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 s.transport_errors += 1;
                                 if s.error_samples.len() < 5 {
                                     s.error_samples.push(format!("body: {e}"));
                                 }
                             }
+                            Err(_) => {
+                                s.transport_errors += 1;
+                                if s.error_samples.len() < 5 {
+                                    s.error_samples.push("transport: body timeout".into());
+                                }
+                            }
                         }
                     }
-                    s.ok += 1;
                 }
                 s
             })
