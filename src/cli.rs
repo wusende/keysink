@@ -381,6 +381,11 @@ pub struct ServeArgs {
     /// comes from the older .bak backup (revoked/removed vkeys may work again)
     #[arg(long)]
     pub accept_degraded: bool,
+    /// Seconds to wait for in-flight requests while shutting down before
+    /// dropping them (0 = wait forever). Keep the service manager's stop
+    /// timeout above this, or it will SIGKILL the drain.
+    #[arg(long, default_value_t = proxy::DRAIN_TIMEOUT.as_secs())]
+    pub drain_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -1024,6 +1029,22 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
     if args.max_concurrent == 0 || args.max_concurrent > 4096 {
         return Err(Error::msg("max-concurrent must be within 1..=4096"));
     }
+    if args.drain_timeout_secs > 600 {
+        return Err(Error::msg("drain-timeout-secs must be within 0..=600"));
+    }
+    // Every in-flight request may buffer its whole body in memory, so the two
+    // knobs multiply: warn when the worst case is large enough to invite the
+    // OOM killer on a small host, rather than discovering it under load.
+    // (u64: the product exceeds a 32-bit usize at the largest allowed values.)
+    let worst_case_bytes = (args.body_limit_mb as u64) * 1024 * 1024 * (args.max_concurrent as u64);
+    if worst_case_bytes > 2 * 1024 * 1024 * 1024 {
+        tracing::warn!(
+            body_limit_mb = args.body_limit_mb,
+            max_concurrent = args.max_concurrent,
+            worst_case_gib = worst_case_bytes / (1024 * 1024 * 1024),
+            "worst-case buffered request bodies is large; lower --body-limit-mb or --max-concurrent if this host is small"
+        );
+    }
     let audit = match &args.audit_log {
         Some(path) => {
             let parent = path
@@ -1075,6 +1096,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         ..RetryPolicy::default()
     };
 
+    let counters = Arc::new(proxy::ServeCounters::default());
     let state = Arc::new(AppState {
         snapshot: ArcSwap::from_pointee(Snapshot {
             store: Arc::new(unlocked.store),
@@ -1087,10 +1109,16 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         body_read_idle: proxy::BODY_READ_IDLE,
         inbound_body_timeout: proxy::CLIENT_BODY_TIMEOUT,
         permit_queue_timeout: proxy::PERMIT_QUEUE_TIMEOUT,
+        body_total_budget: proxy::BODY_TOTAL_BUDGET,
+        reload: Arc::new(proxy::ReloadStatus::default()),
+        counters: counters.clone(),
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent)),
         audit,
         started: Instant::now(),
     });
+
+    let drain_timeout =
+        (args.drain_timeout_secs > 0).then(|| Duration::from_secs(args.drain_timeout_secs));
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| Error::msg(format!("failed to create tokio runtime: {e}")))?;
@@ -1118,9 +1146,17 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
                 };
                 Error::msg(format!("failed to listen on {addr}: {e}{hint}"))
             })?;
-        // Record the actual listen address as soon as the bind succeeds: route add relies on it to report where it is listening.
-        util::atomic_write(&paths.gateway_addr(), format!("{addr}\n").as_bytes(), 0o600)?;
-        tracing::info!(%addr, routes, from_backup, store = %store_path.display(), "keysink started");
+        // Record the actual bound address as soon as the bind succeeds: route
+        // add relies on it to report where the gateway is listening. This must
+        // be the listener's address, not the requested one — `--listen
+        // 127.0.0.1:0` (any free port) would otherwise be recorded as `:0`.
+        let bound = listener.local_addr().unwrap_or(addr);
+        util::atomic_write(
+            &paths.gateway_addr(),
+            format!("{bound}\n").as_bytes(),
+            0o600,
+        )?;
+        tracing::info!(addr = %bound, routes, from_backup, store = %store_path.display(), "keysink started");
         if let Some(path) = args.audit_log {
             tracing::info!(audit = %path.display(), "audit enabled");
         } else {
@@ -1135,7 +1171,10 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
                 // idle keep-alive and long-lived SSE hold a connection but
                 // no request permit.
                 max_connections: (args.max_concurrent * 8).clamp(256, 16_384),
+                drain_timeout,
                 loop_iterations: None,
+                live_connections: None,
+                counters: Some(counters.clone()),
             },
             shutdown_signal(),
         )
@@ -1207,7 +1246,10 @@ async fn shutdown_signal() {
     // may be lost.
     tokio::spawn(async {
         let signum = wait_for_shutdown_signal().await;
-        tracing::warn!("second shutdown signal; exiting now (in-flight connections dropped)");
+        // stderr, not the log: this fires right before process::exit, which
+        // does not wait for the non-blocking log thread to flush — a tracing
+        // line here would (usually) never be seen.
+        eprintln!("keysink: second shutdown signal; exiting now (in-flight connections dropped)");
         std::process::exit(128 + signum as i32);
     });
 }
@@ -1385,9 +1427,12 @@ StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure
 RestartSec=2
-# Graceful shutdown waits at most 10s: long SSE streams can't stall a stop
-# forever; SIGKILL is the backstop
-TimeoutStopSec=10
+# Graceful shutdown: `serve` stops accepting, tells every live connection to
+# finish and close, and drains for at most --drain-timeout-secs (default 10s)
+# before dropping what is left. This is the backstop above that: long enough
+# for the drain to finish on its own, short enough that a wedged process still
+# goes away. Keep it above the drain timeout.
+TimeoutStopSec=30
 
 # Hardening: no core dumps, no privilege regain, read-only home
 LimitCORE=0

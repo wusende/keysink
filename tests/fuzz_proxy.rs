@@ -120,12 +120,52 @@ async fn mock_handler(State(hits): State<Arc<AtomicUsize>>, req: Request<Body>) 
         )
             .into_response();
     }
+    if path == "/stall-body-429" {
+        // Headers arrive (429 = retryable), one chunk follows, then the
+        // upstream goes silent: the retry path's discard must be bounded,
+        // or the handler (and its inbound permit) parks forever.
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"partial-"))
+        })
+        .chain(futures_util::stream::pending());
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
     if let Some(code) = path.strip_prefix("/status/") {
         let status = StatusCode::from_u16(code.parse().unwrap_or(500)).unwrap_or(StatusCode::OK);
         return status.into_response();
     }
     if path == "/sse" {
         return sse_response(&query).await;
+    }
+    if path == "/trickle-sse" {
+        // n chunks, one every pace_ms, then a clean end: long enough to
+        // outlive a tiny whole-body budget while staying well inside the
+        // per-chunk idle bound. Deterministic proxy for a long agent stream.
+        let mut n = 10usize;
+        let mut pace_ms = 100u64;
+        for pair in query.split('&') {
+            let mut kv = pair.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some("n"), Some(v)) => n = v.parse().unwrap_or(10),
+                (Some("pace_ms"), Some(v)) => pace_ms = v.parse().unwrap_or(100),
+                _ => {}
+            }
+        }
+        let stream = futures_util::stream::iter(0..n).then(move |i| async move {
+            tokio::time::sleep(Duration::from_millis(pace_ms)).await;
+            Ok::<_, std::io::Error>(Bytes::from(format!("data: {{\"i\":{i}}}\n\n")))
+        });
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
     }
 
     let headers: BTreeMap<String, String> = parts
@@ -304,6 +344,9 @@ fn build_state(
         body_read_idle,
         inbound_body_timeout,
         permit_queue_timeout,
+        body_total_budget: keysink::proxy::BODY_TOTAL_BUDGET,
+        reload: Arc::new(keysink::proxy::ReloadStatus::default()),
+        counters: Arc::new(keysink::proxy::ServeCounters::default()),
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(max_inbound)),
         audit: keysink::audit::Audit::disabled(),
         started: Instant::now(),
@@ -693,6 +736,138 @@ async fn stalled_non_streaming_body_aborts_instead_of_hanging() {
 }
 
 #[tokio::test]
+async fn retryable_status_with_stalled_body_does_not_wedge_the_handler() {
+    // Regression: the retry path discards a retryable response's body to give
+    // the connection back, and that drain had no bound. The non-streaming
+    // client carries no client-level read timeout, so an upstream that
+    // answered 429 and then stalled the body parked the handler forever —
+    // with its inbound permit. `max_concurrent` such responses turned the
+    // whole gateway into 503s for everyone else.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let policy = RetryPolicy {
+        max_retries: 2,
+        statuses: vec![429].into(),
+        initial_backoff: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(30),
+        header_timeout: Duration::from_secs(5),
+    };
+    let (gw, vks) =
+        spawn_gateway_with_idle(store, policy, 1 << 20, Duration::from_millis(300)).await;
+    let client = reqwest::Client::new();
+
+    let started = Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("http://{gw}/stall-body-429"))
+            .header("authorization", format!("Bearer {}", vks["main"]))
+            .body(b"{}".to_vec())
+            .send(),
+    )
+    .await
+    .expect("the retry-discard path must be bounded, not hang the handler")
+    .unwrap();
+    assert_eq!(resp.status(), 429, "the last attempt's status is returned");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "discard must give up at the read idle, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn sse_stream_without_terminator_scan_has_no_total_budget() {
+    // Regression: `Terminator::None` routes pass SSE through raw (no scan),
+    // and that passthrough used to inherit the whole-body budget — a stream
+    // that legitimately outlives it (a long agent session) was cut off
+    // mid-stream. Content-type says SSE ⇒ only the per-chunk read idle
+    // applies. The production budget is 10 minutes, so the test injects a
+    // tiny one via a hand-built state and races the stream against the
+    // budget: the stream (paced well inside the idle bound, but far longer
+    // than the injected budget) must complete instead of ending in a
+    // TimedOut abort.
+    let (mock, _hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::None,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let tiny_budget = Duration::from_millis(500);
+    let (mut state, vks) = build_state(
+        store,
+        RetryPolicy::default(),
+        1 << 20,
+        // idle bound far above the chunk pacing; the budget is what would
+        // trip first if SSE inherited it
+        Duration::from_secs(30),
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
+    );
+    // The SSE passthrough must ignore the budget entirely: hand the state a
+    // budget far shorter than the stream and expect the stream to win.
+    Arc::get_mut(&mut state)
+        .expect("the test holds the only Arc to the state")
+        .body_total_budget = tiny_budget;
+    let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(keysink::proxy::serve_inbound(
+        listener,
+        app,
+        keysink::proxy::InboundLimits {
+            header_timeout: Duration::from_secs(30),
+            max_connections: 64,
+            drain_timeout: Some(Duration::from_secs(5)),
+            loop_iterations: None,
+            live_connections: None,
+            counters: None,
+        },
+        std::future::pending(),
+    ));
+
+    let client = reqwest::Client::new();
+    // 30 chunks × 100ms = a 3s stream: 6× past the injected 500ms budget,
+    // every chunk inside the 30s idle bound. If SSE inherited the budget,
+    // the body would abort with TimedOut ~0.5s in.
+    let resp = client
+        .post(format!("http://{addr}/trickle-sse?n=30&pace_ms=100"))
+        .header("authorization", format!("Bearer {}", vks["main"]))
+        .body(br#"{"stream":true,"model":"m"}"#.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp
+        .bytes()
+        .await
+        .expect("an SSE stream must not be aborted by the whole-body budget");
+    let mut expected = String::new();
+    for i in 0..30 {
+        expected.push_str(&format!("data: {{\"i\":{i}}}\n\n"));
+    }
+    assert_eq!(body, expected.as_bytes());
+    server.abort();
+}
+
+#[tokio::test]
 async fn retry_policy_replays_and_returns_final_status() {
     let (mock, hits) = spawn_mock().await;
     let mut store = Store::new();
@@ -865,7 +1040,10 @@ async fn serve_inbound_reaps_stalled_request_head() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_millis(300),
             max_connections: 16,
+            drain_timeout: Some(Duration::from_secs(5)),
             loop_iterations: None,
+            live_connections: None,
+            counters: None,
         },
         std::future::pending(),
     ));
@@ -942,7 +1120,10 @@ async fn serve_inbound_sheds_connections_beyond_the_cap() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_secs(30),
             max_connections: 1,
+            drain_timeout: Some(Duration::from_secs(5)),
             loop_iterations: None,
+            live_connections: None,
+            counters: None,
         },
         std::future::pending(),
     ));
@@ -1083,7 +1264,10 @@ async fn serve_inbound_passes_sse_streams() {
         keysink::proxy::InboundLimits {
             header_timeout: Duration::from_secs(30),
             max_connections: 64,
+            drain_timeout: Some(Duration::from_secs(5)),
             loop_iterations: None,
+            live_connections: None,
+            counters: None,
         },
         std::future::pending(),
     ));

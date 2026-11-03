@@ -156,7 +156,13 @@ integrity checks — owner, permissions, key parses, store decrypts, backup
 decrypts — and is what to run when something looks wrong.
 
 To check the gateway itself, `GET /__keysink/health` returns
-`{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`.
+`{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`,
+plus the state that used to be invisible: `snapshot_age_secs` (how long the
+served snapshot has been in place — it keeps growing while the hot reload is
+failing, e.g. a broken vault), `reload_failures` / `reload_attempts`,
+`shed_connections` / `accept_errors` (connection-cap and per-connection
+accept-error counts), and `audit` / `audit_ok` / `audit_dropped` (a dead audit
+writer reports `audit_ok:false` instead of silently dropping every line).
 
 `--accept-degraded` covers a broken vault: when the primary store fails to
 decrypt, the gateway can start from `vault.age.bak` instead. That backup is one
@@ -235,9 +241,20 @@ network exposure are yours to solve; the intended deployment is loopback only.
 
 Nothing is unbounded: 32 MB bodies (`--body-limit-mb`), 64 in-flight requests
 (`--max-concurrent`), a capped connection count, per-phase timeouts, and 30s to
-finish reading http1 request heads. An h2 connection that stops answering
+finish reading http1 request heads. A non-streaming response body is bounded
+both per chunk and as a whole, so an upstream that trickles a byte a minute
+cannot hold a connection forever. An h2 connection that stops answering
 keep-alive PINGs is closed. A hung upstream or a misbehaving agent can't take
 the gateway down.
+
+Shutdown is graceful and bounded: `serve` stops accepting, tells every live
+connection to finish and close (`Connection: close`, h2 `GOAWAY`), and drains
+for at most `--drain-timeout-secs` (default 10, `0` = wait forever) before
+dropping what is left with a warning. Idle keep-alive sockets close
+immediately, so a restart no longer waits out a 30s header timeout; the
+systemd unit's `TimeoutStopSec=30` is the backstop above that. The store
+watcher is supervised too: if it dies it is restarted, and if it stops ticking
+the log says so.
 
 ## What this is not
 

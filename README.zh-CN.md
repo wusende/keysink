@@ -117,7 +117,7 @@ keysink route rotate claude                                       # 换 vkey,旧
 
 `status` 打印保险库摘要(位置、schema、路由数)。`doctor` 跑完整性检查——属主、权限、key 能否解析、store 能否解密、备份能否解密——出问题先跑它。
 
-要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`。
+要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`;另外还有以前看不见的状态:`snapshot_age_secs`(当前快照已经服务了多久——热加载一直失败,比如保险库坏了时它只会越长越大)、`reload_failures` / `reload_attempts`、`shed_connections` / `accept_errors`(连接上限丢弃数、每连接 accept 错误数),以及 `audit` / `audit_ok` / `audit_dropped`(审计写线程死掉时 `audit_ok:false`,而不是默默丢每一行)。
 
 `--accept-degraded` 是保险库坏了时的逃生口:主 store 解密失败时,允许网关改用 `vault.age.bak` 启动。那份备份落后一次写入,所以这段时间里被轮换或删除的 vkey 会重新生效——它只是让 agent 继续跑,不是可以长待的状态。`doctor` 会告诉你哪个文件坏了、怎么恢复。
 
@@ -168,7 +168,9 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 `--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。保留 5 份轮转日志(每份 10 MB),被拒的请求按指纹每秒只放 1 个进来——所以未鉴权的请求洪水没法把取证记录冲掉。
 
-`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉。
+`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。非流式响应体既按单块也按整体设上界,所以一分钟吐一个字节的上游也没法永久占住连接。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉。
+
+关闭是优雅且有界的:`serve` 停止接受新连接,通知每条活着的连接处理完当前响应后关闭(`Connection: close`,h2 发 `GOAWAY`),最多 drain `--drain-timeout-secs`(默认 10,`0` 表示一直等),到点还在的连打一行 warning 后丢弃。空闲 keep-alive 连接会立即关闭,重启不用再等 30 秒的 head 超时;systemd unit 里的 `TimeoutStopSec=30` 是更上一层的兜底。store 监听器也加了看门狗:死了会重启,停止 tick 会在日志里报出来。
 
 ## 它不是什么
 

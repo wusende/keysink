@@ -10,7 +10,20 @@
 #   PERF_DURATION 常规场景时长秒(默认 15)
 #   PERF_SOAK    soak 时长秒(默认 600;CI/调试可调小)
 #   PERF_SKIP_SOAK=1 跳过 soak 场景
+#
+# 平台:Linux / macOS / WSL。Windows 原生 bash(Git Bash/MSYS2)不支持,见脚本开头的拦截。
 set -euo pipefail
+
+# Windows 上只有 WSL 能完整跑:原生 bash 环境(Git Bash/MSYS2)既没有
+# /dev/tcp 端口探测,ps 也不支持 -o rss(RSS 采样产出空值,聚合阶段
+# ValueError),perf 数据会半残。趁早拦下,而不是让人跑到一半对着坏数据排障。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "FATAL: perf.sh does not run under Git Bash/MSYS2 (no /dev/tcp, ps lacks -o rss; the RSS aggregate would fail)." >&2
+    echo "Run it under WSL instead: wsl bash scripts/perf.sh" >&2
+    exit 1
+    ;;
+esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -66,9 +79,21 @@ log() { printf '\n===== %s =====\n' "$*"; }
 log "env + build"
 {
   echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sw_vers
-  uname -m
-  sysctl -n hw.model hw.ncpu hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu hw.memsize
+  echo "os: $(uname -s -r -m)"
+  # Model / cores / memory, per platform: macOS reports P/E core split via
+  # sysctl, Linux falls back to /proc. Unknown fields are simply absent —
+  # env.txt feeds the summary header, nothing parses it.
+  case "$(uname -s)" in
+    Darwin)
+      sw_vers
+      sysctl -n hw.model hw.ncpu hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu hw.memsize
+      ;;
+    Linux)
+      grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || true
+      echo "cores: $(nproc)"
+      awk '/MemTotal/ {printf "mem_bytes: %s\n", $2*1024}' /proc/meminfo
+      ;;
+  esac
   "$BIN" --version || true
 } >"$RESULTS/env.txt" 2>&1
 cat "$RESULTS/env.txt"

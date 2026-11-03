@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+A stability and observability pass: the two remaining ways a single misbehaving
+peer could stall the whole gateway are closed, shutdown is bounded instead of
+relying on SIGKILL, and the states that used to fail silently (a stale snapshot,
+a dead audit writer, a panic) now report themselves. Drop-in upgrade — no config
+or storage changes.
+
+**Stability**
+
+- The retry path's response-body discard is bounded. A `429`/`503`/`504` whose
+  body then stalled parked the handler — and its inbound permit — forever: the
+  discard read used the non-streaming client, which deliberately carries no
+  client-level read timeout, and nothing else bounded that drain. `max_concurrent`
+  such responses turned the gateway into 503s for every other request. The drain
+  now gives up at the read idle and drops the connection instead of reusing it
+- A non-streaming response body is bounded as a whole (`BODY_TOTAL_BUDGET`, 10
+  minutes) on top of the per-chunk read idle. An upstream trickling a byte just
+  under the idle bound was "alive" forever and held its connection slot for the
+  process lifetime; streaming (SSE) bodies are still exempt by design —
+  including a content-encoded stream's passthrough fallback, which used to
+  inherit the 10-minute budget by mistake
+- Shutdown is propagated into every live connection. hyper's connection future
+  does not stop on its own, so a draining gateway kept answering *new* requests
+  on existing keep-alive connections, and an idle keep-alive socket held the
+  drain until its 30s header timeout expired — measured at 28s per stop, past the
+  unit's `TimeoutStopSec`, i.e. every restart ended in SIGKILL (losing the audit
+  flush and the runtime-file cleanup). Each connection now gets
+  `graceful_shutdown` (http1 `Connection: close`, h2 `GOAWAY`), and the drain is
+  bounded by `--drain-timeout-secs` (default 10, `0` = wait forever): past it the
+  remaining connections are dropped with a warning. An idle keep-alive connection
+  now closes immediately (measured: 0.05s vs 28s)
+- `TimeoutStopSec` in the deployed unit goes 10 → 30, above the drain timeout, so
+  a normal stop no longer gets SIGKILLed before the drain can finish
+- Accept errors are split three ways instead of "descriptor pressure or fatal".
+  Linux and the BSDs pass per-connection failures from the backlog up through
+  `accept(2)` (an aborted handshake, protocol/route errors) and document that
+  they should be retried like EAGAIN; treating them as fatal turned one dropped
+  handshake into a full gateway restart. Resource-pressure errors (EMFILE,
+  ENFILE, ENOBUFS, ENOMEM — the last two are kernel memory pressure, where an
+  immediate retry would just spin) back off 1s, and only genuinely
+  listener-level errors end the serve loop
+- A panic in a connection task is no longer invisible: the reaping arm logs the
+  `JoinError` (previously discarded with `let _ = res`), and a process-wide panic
+  hook reports panics through tracing before the default handler prints them
+- The store watcher runs under a supervisor: if the watcher task dies it is
+  restarted instead of silently leaving the gateway on a snapshot nothing tracks,
+  and a watcher that stops ticking is reported with its tick age
+- The audit writer backs off on write failures (doubling, capped at 5s) instead of
+  attempting a failed open plus a warn line per record — a full disk used to cost
+  a syscall spin and a log flood. The backoff wait drains the queue (counting the
+  drops) and exits immediately on `close()`
+- Log output goes through a bounded, non-blocking writer thread. `fmt()`'s default
+  writer is synchronous on the emitting thread, so a slow consumer (journald, a
+  full pipe, a paused terminal) could block a tokio worker inside a `write`
+  syscall on the per-request warn paths; the request path is now a `try_send`, and
+  a full queue drops lines (counted) instead of stalling the gateway
+- Upstream connection pool idle timeout 90s → 30s: a pooled connection the peer
+  already closed fails the next request that picks it, and a POST is not replayed,
+  so the agent saw a 502 for a request that never reached the upstream
+- `--listen 127.0.0.1:0` records the bound port in `gateway.addr` instead of `:0`
+  (it wrote the *requested* address, so `route add` reported a bogus gateway)
+- Startup warns when `--body-limit-mb × --max-concurrent` reaches 2 GiB, the
+  worst-case amount of request bodies buffered at once
+
+**Observability**
+
+- `/__keysink/health` now reports `snapshot_age_secs`, `reload_failures`,
+  `reload_attempts`, `audit`, `audit_ok`, `audit_dropped`, `shed_connections`
+  and `accept_errors`. The gateway answers with the last good snapshot even
+  while the hot reload is failing (a broken vault, permissions, a watcher that
+  stopped), so "it answers" used to be the only signal — a rotated key still
+  working was the next one. Per-connection accept errors are retried in place
+  (visible before only when they were wrongly fatal), so the counter is the
+  only trace they leave at info level after the first warn
+- A dead audit writer thread is reported instead of silently dropping every line:
+  `audit_ok:false` on health plus one error line, with `closed` distinguished from
+  `died` so shutdown stays quiet
+
+**Tests**
+
+- New regression tests: the retry-discard path with a stalled body must not wedge
+  the handler; an idle keep-alive connection must not delay shutdown and must be
+  closed by it; finished connection tasks must be reaped (the gauge fails if the
+  reaping arm is disabled, verified by removing it); the total body budget; the
+  accept-error classification; the audit writer's liveness and backoff; the
+  health payload's reload/audit fields
+
 ## v0.1.5
 
 *Released 2026-11-03.*

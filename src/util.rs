@@ -3,6 +3,9 @@ use rand::Rng;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use time::OffsetDateTime;
 use time::UtcOffset;
 use time::format_description::well_known::Rfc3339;
@@ -281,6 +284,107 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     out
 }
 
+/// Depth of the log queue. Generous next to a burst (a rejected flood, an
+/// upstream outage) and small enough that a dead consumer cannot grow the
+/// process by more than a few MB.
+const LOG_QUEUE_DEPTH: usize = 4096;
+
+/// Non-blocking writer for the log output.
+///
+/// `tracing_subscriber::fmt()` writes to stdout synchronously, on whichever
+/// thread emitted the event — for this gateway that is a tokio worker handling
+/// a request. The hot warn paths (upstream timeout, retry, shed) fire per
+/// request, so a slow consumer (journald, a full pipe, a paused terminal) blocks
+/// a worker inside a `write` syscall and stalls unrelated requests. A dedicated
+/// thread with a bounded channel keeps the request path to a `try_send`; when
+/// the queue is full, lines are dropped (and counted) instead of blocking the
+/// gateway.
+pub fn non_blocking_stdout() -> NonBlockingMakeWriter {
+    let (tx, rx) = sync_channel::<Vec<u8>>(LOG_QUEUE_DEPTH);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let spawned = std::thread::Builder::new()
+        .name("keysink-log".into())
+        .spawn(move || {
+            // Deliberately not `stdout().lock()`: holding the global stdout
+            // lock across the blocking recv would deadlock any other writer
+            // (the CLI's println! output) for the process lifetime.
+            let mut out = std::io::stdout();
+            while let Ok(line) = rx.recv() {
+                if out.write_all(&line).and_then(|()| out.flush()).is_err() {
+                    // stdout is gone (closed pipe, detached terminal): keep
+                    // draining so producers never block, and stop reporting.
+                    for _ in rx.iter() {}
+                    break;
+                }
+            }
+            let _ = out.flush();
+        });
+    if let Err(e) = spawned {
+        // Cannot fall back to a synchronous writer from here; say so once on
+        // stderr and let the channel drop lines rather than wedge the process.
+        eprintln!(
+            "keysink: failed to start the log writer thread ({e}); log output will be dropped"
+        );
+    }
+    NonBlockingMakeWriter { tx, dropped }
+}
+
+pub struct NonBlockingMakeWriter {
+    tx: SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingMakeWriter {
+    type Writer = QueuedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        QueuedWriter {
+            tx: self.tx.clone(),
+            buf: Vec::new(),
+            dropped: self.dropped.clone(),
+        }
+    }
+}
+
+/// Collects one formatted event and hands it to the log thread on flush/drop.
+/// Never blocks: a full queue drops the line.
+pub struct QueuedWriter {
+    tx: SyncSender<Vec<u8>>,
+    buf: Vec<u8>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Write for QueuedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.buf);
+        if let Err(TrySendError::Full(line)) = self.tx.try_send(line) {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 1000 == 1 {
+                // stderr, not the log: the log is what is backed up.
+                eprintln!(
+                    "keysink: log queue full; dropping log lines ({n} dropped so far, {line_len} bytes)",
+                    line_len = line.len()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QueuedWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -384,5 +488,29 @@ mod tests {
         let path = dir.path().join("vault.age");
         fs::write(&path, b"x").unwrap();
         assert!(owner_matches_dir(&path).unwrap());
+    }
+
+    #[test]
+    fn queued_log_writer_drops_instead_of_blocking() {
+        // A full queue must drop the line and return immediately: this runs on
+        // the request path, where blocking on a slow log consumer stalls a
+        // tokio worker (and with it unrelated requests).
+        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut w = QueuedWriter {
+            tx,
+            buf: Vec::new(),
+            dropped: dropped.clone(),
+        };
+        w.write_all(b"first\n").unwrap();
+        w.flush().unwrap();
+        w.write_all(b"second\n").unwrap();
+        w.flush().unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap(), b"first\n".to_vec());
+        assert!(
+            rx.try_recv().is_err(),
+            "the second line must have been dropped, not queued"
+        );
     }
 }

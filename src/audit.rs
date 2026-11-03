@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,6 +38,12 @@ const REJECT_GLOBAL_MAX: usize = 100;
 /// it without limit; when full it resets (buckets re-arm, the global cap
 /// still holds).
 const REJECT_FP_TABLE_MAX: usize = 4096;
+/// First wait after a failed audit write, doubling per consecutive failure and
+/// capped: a full disk or a vanished directory would otherwise cost one failed
+/// open + one warn line *per record*, turning an audit-on gateway into a
+/// syscall spin and a log flood.
+const WRITE_BACKOFF_START: Duration = Duration::from_millis(50);
+const WRITE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Audit disk writes run on a dedicated thread + bounded channel:
 /// - the request path only does try_send, never a synchronous open/write/chmod on a tokio worker;
@@ -46,6 +53,24 @@ pub struct Audit {
     /// Rejection-side admission state (see record_reject): bounded, checked
     /// on the calling thread before the queue.
     rejects: Mutex<RejectGate>,
+    /// Liveness/counters shared with the writer thread, the request path and
+    /// the health endpoint.
+    state: Arc<AuditState>,
+}
+
+/// Writer-thread liveness and counters.
+///
+/// A dead writer thread used to be completely silent: every record hit
+/// `Disconnected` and returned, `is_enabled()` still said yes, and nothing
+/// anywhere said audit had stopped recording. `alive`/`closed` make the
+/// difference between "closed during shutdown" (expected) and "the writer
+/// died" (an alert) visible, and `dropped` gives the health endpoint the loss
+/// count that used to live only in a static counter nobody could read.
+struct AuditState {
+    alive: AtomicBool,
+    closed: AtomicBool,
+    dropped: AtomicU64,
+    dead_warned: AtomicBool,
 }
 
 struct RejectGate {
@@ -91,6 +116,12 @@ impl Audit {
         Self {
             writer: Mutex::new(None),
             rejects: Mutex::new(RejectGate::default()),
+            state: Arc::new(AuditState {
+                alive: AtomicBool::new(false),
+                closed: AtomicBool::new(true),
+                dropped: AtomicU64::new(0),
+                dead_warned: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -108,6 +139,19 @@ impl Audit {
             .is_some()
     }
 
+    /// Whether audit is doing what it says: disabled counts as healthy, an
+    /// enabled audit whose writer thread died does not.
+    pub fn healthy(&self) -> bool {
+        !self.is_enabled() || self.state.alive.load(Ordering::Relaxed)
+    }
+
+    /// Lines dropped so far (queue full or a failed write). Surfaced on the
+    /// health endpoint; throttled rejection rows are counted separately in the
+    /// log and never reach the writer at all.
+    pub fn dropped(&self) -> u64 {
+        self.state.dropped.load(Ordering::Relaxed)
+    }
+
     pub fn new(path: PathBuf) -> Self {
         // mode(0o600) only takes effect at creation; if an existing file has overly broad permissions, warn once at startup.
         if path.exists()
@@ -116,13 +160,21 @@ impl Audit {
             tracing::warn!(error = %e, "audit log permissions too wide; consider tightening to 0600");
         }
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
+        let state = Arc::new(AuditState {
+            alive: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+            dead_warned: AtomicBool::new(false),
+        });
+        let thread_state = state.clone();
         match std::thread::Builder::new()
             .name("keysink-audit".into())
-            .spawn(move || writer_loop(path, rx))
+            .spawn(move || writer_loop(path, rx, thread_state))
         {
             Ok(handle) => Self {
                 writer: Mutex::new(Some(Writer { tx, handle })),
                 rejects: Mutex::new(RejectGate::default()),
+                state,
             },
             Err(e) => {
                 tracing::warn!(error = %e, "failed to start audit writer thread; audit disabled for this run");
@@ -140,14 +192,28 @@ impl Audit {
         let Some(tx) = tx else {
             return;
         };
-        if let Err(TrySendError::Full(_)) = tx.try_send(entry) {
-            static DROPPED: AtomicU64 = AtomicU64::new(0);
-            let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 100 == 1 {
-                tracing::warn!(dropped = n, "audit queue full; dropping audit lines");
+        match tx.try_send(entry) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let n = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 100 == 1 {
+                    tracing::warn!(dropped = n, "audit queue full; dropping audit lines");
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // The writer thread is gone. During a clean close that is
+                // expected; otherwise audit silently stopped recording, which
+                // is exactly what used to go unnoticed (health now shows
+                // audit_ok=false, and this line says it once).
+                if !self.state.closed.load(Ordering::Relaxed)
+                    && !self.state.dead_warned.swap(true, Ordering::Relaxed)
+                {
+                    tracing::error!(
+                        "audit writer thread exited; audit is no longer recording (see /__keysink/health audit_ok)"
+                    );
+                }
             }
         }
-        // Disconnected (after close) is silent: audit is no longer needed during shutdown.
     }
 
     /// Audits a rejected request (auth failure, disabled route, body limits,
@@ -206,6 +272,7 @@ impl Audit {
 
     /// On shutdown, drain the queue and wait for the writer thread to exit so tail audit lines are not lost.
     pub fn close(&self) {
+        self.state.closed.store(true, Ordering::Relaxed);
         let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = guard.take() {
             drop(w.tx);
@@ -214,7 +281,17 @@ impl Audit {
     }
 }
 
-fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>) {
+/// Marks the writer thread dead on every exit path, a panic included.
+struct AliveGuard(Arc<AuditState>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::Relaxed);
+    }
+}
+
+fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>, state: Arc<AuditState>) {
+    let _alive = AliveGuard(state.clone());
     // The handle stays open, buffered: lines batch in a BufWriter instead of
     // costing one write syscall each; the buffer flushes at capacity, when
     // the queue goes idle (FLUSH_IDLE), and before rotation or shutdown. On
@@ -224,22 +301,66 @@ fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>) {
         file: None,
         written: 0,
     };
+    let mut failures = 0u32;
     loop {
         match rx.recv_timeout(FLUSH_IDLE) {
-            Ok(entry) => {
-                if let Err(e) = append(&path, &mut log, &entry) {
-                    tracing::warn!(error = %e, "failed to write audit log");
+            Ok(entry) => match append(&path, &mut log, &entry) {
+                Ok(()) => failures = 0,
+                Err(e) => {
                     // Dropping the BufWriter attempts a best-effort flush of
                     // whatever is still buffered; the next record reopens.
                     log.file = None;
+                    failures += 1;
+                    state.dropped.fetch_add(1, Ordering::Relaxed);
+                    if failures == 1 || failures.is_multiple_of(100) {
+                        tracing::warn!(
+                            error = %e,
+                            failures,
+                            "failed to write audit log (backing off; audit lines are dropped until it recovers)"
+                        );
+                    }
+                    // Back off instead of retrying the open/write per line: a
+                    // full disk would otherwise cost a failed syscall and a
+                    // warn line for every record.
+                    if !wait_for_recovery(&rx, write_backoff(failures), &state) {
+                        break;
+                    }
                 }
-            }
+            },
             Err(RecvTimeoutError::Timeout) => flush_dirty(&mut log),
             // Disconnected (after close): drain, flush, exit so tail audit lines are not lost.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     flush_dirty(&mut log);
+}
+
+/// Wait after `failures` consecutive write failures: doubling, capped.
+fn write_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    WRITE_BACKOFF_START
+        .saturating_mul(1u32 << shift)
+        .min(WRITE_BACKOFF_MAX)
+}
+
+/// Sleeps out a write backoff while draining (and counting) the queue, so a
+/// shutdown (`close`) is noticed immediately instead of waiting for the full
+/// backoff. Returns false when the channel closed, i.e. the writer must exit.
+fn wait_for_recovery(rx: &Receiver<AuditEntry>, backoff: Duration, state: &AuditState) -> bool {
+    let until = Instant::now() + backoff;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match rx.recv_timeout(left.min(FLUSH_IDLE)) {
+            Ok(_) => {
+                state.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
 }
 
 fn flush_dirty(log: &mut OpenLog) {
@@ -346,11 +467,67 @@ mod tests {
     #[test]
     fn is_enabled_reflects_the_writer() {
         assert!(!Audit::disabled().is_enabled());
+        assert!(
+            Audit::disabled().healthy(),
+            "audit off is not an unhealthy audit"
+        );
         let dir = tempfile::tempdir().unwrap();
         let audit = Audit::new(dir.path().join("audit.jsonl"));
         assert!(audit.is_enabled());
+        assert!(audit.healthy());
         audit.close();
         assert!(!audit.is_enabled(), "close() takes the writer out");
+    }
+
+    #[test]
+    fn dead_writer_is_reported_unhealthy() {
+        // Simulate the writer thread dying under a still-enabled audit (a
+        // panic in the writer): `is_enabled` keeps saying yes, so health must
+        // be the thing that notices.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::new(dir.path().join("audit.jsonl"));
+        audit.state.alive.store(false, Ordering::Relaxed);
+        assert!(audit.is_enabled());
+        assert!(!audit.healthy(), "a dead writer must not look healthy");
+        audit.close();
+    }
+
+    #[test]
+    fn write_backoff_doubles_and_caps() {
+        assert_eq!(write_backoff(1), WRITE_BACKOFF_START);
+        assert_eq!(write_backoff(2), WRITE_BACKOFF_START * 2);
+        assert_eq!(write_backoff(30), WRITE_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn recovery_wait_stops_on_close() {
+        // close() drops the sender; the writer's backoff wait must notice and
+        // exit instead of sleeping out the whole backoff (a shutdown would
+        // otherwise hang for up to WRITE_BACKOFF_MAX).
+        let (tx, rx) = sync_channel::<AuditEntry>(4);
+        let state = AuditState {
+            alive: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+            dead_warned: AtomicBool::new(false),
+        };
+        drop(tx);
+        assert!(!wait_for_recovery(&rx, Duration::from_secs(30), &state));
+    }
+
+    #[test]
+    fn queued_entries_are_counted_as_dropped_while_backing_off() {
+        let (tx, rx) = sync_channel::<AuditEntry>(4);
+        let state = AuditState {
+            alive: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+            dead_warned: AtomicBool::new(false),
+        };
+        tx.try_send(AuditEntry::new("R9", "r", "fp", "GET", "/x", 0, false))
+            .unwrap();
+        assert!(wait_for_recovery(&rx, Duration::from_millis(1), &state));
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

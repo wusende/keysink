@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, ReadBuf};
@@ -45,6 +45,13 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// the header-phase bound on purpose: one story, "no upstream progress ⇒
 /// give up". SSE bodies are bounded by STREAM_READ_TIMEOUT instead.
 pub const BODY_READ_IDLE: Duration = crate::retry::DEFAULT_HEADER_TIMEOUT;
+
+/// Whole-response budget for a non-streaming body, on top of the per-chunk
+/// read idle. The idle bound alone only catches an upstream that goes silent:
+/// one that trickles a byte every minute is "alive" forever, and each such
+/// connection occupies a connection slot for the process lifetime. SSE bodies
+/// are deliberately exempt (a stream may legitimately last for minutes).
+pub const BODY_TOTAL_BUDGET: Duration = Duration::from_secs(10 * 60);
 
 /// Whole-head bound on the inbound request from an agent client: a
 /// connection that never finishes sending its head (slowloris) is closed
@@ -76,6 +83,16 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// request is shed with an explicit 503 + Retry-After instead of waiting
 /// for the client's own timeout.
 pub const PERMIT_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hard bound on the graceful drain: how long in-flight connections (a long
+/// non-streaming generation, an SSE stream, an idle keep-alive socket) may
+/// hold shutdown before they are dropped. Without it the drain lasts until
+/// every client goes away on its own — an idle keep-alive connection alone
+/// held it for its 30s header timeout, past the service manager's stop
+/// timeout, so every restart ended in SIGKILL (no audit flush, no cleanup).
+/// Single source of truth for the `--drain-timeout-secs` default; keep the
+/// systemd unit's `TimeoutStopSec` above this.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// TCP keepalive on inbound connections: dead-peer insurance for sockets
 /// that never deliver a full request head — an HTTP/2 client stalling
@@ -117,6 +134,27 @@ pub struct Snapshot {
     pub from_backup: bool,
 }
 
+/// Hot-reload health, shared between the watcher, the health endpoint and the
+/// watcher watchdog.
+///
+/// The watcher can fail for as long as the vault stays broken (an
+/// undecryptable or corrupt store, a permission change) while the gateway
+/// happily serves the last good snapshot — "the gateway answers" is not "the
+/// vault is being tracked". These counters make that gap visible instead of
+/// leaving it in a log line.
+#[derive(Default)]
+pub struct ReloadStatus {
+    /// `AppState::started.elapsed()` in seconds at the last successful
+    /// snapshot publish. 0 = the snapshot loaded at startup.
+    pub last_ok_secs: AtomicU64,
+    /// `started.elapsed()` at the last watcher tick (watchdog liveness).
+    pub last_tick_secs: AtomicU64,
+    /// Consecutive failed reloads (reset by a success).
+    pub failures: AtomicU32,
+    /// Reload attempts since startup, successful or not.
+    pub attempts: AtomicU64,
+}
+
 pub struct AppState {
     pub snapshot: ArcSwap<Snapshot>,
     pub clients: ProxyClients,
@@ -128,6 +166,13 @@ pub struct AppState {
     pub inbound_body_timeout: Duration,
     /// Bound on queueing for an inbound permit (PERMIT_QUEUE_TIMEOUT in production; tests inject a small value).
     pub permit_queue_timeout: Duration,
+    /// Whole-body budget for a non-streaming upstream response (BODY_TOTAL_BUDGET in production; tests inject a small value).
+    pub body_total_budget: Duration,
+    /// Hot-reload health, published for the health endpoint and the watcher watchdog.
+    pub reload: Arc<ReloadStatus>,
+    /// Serve-loop counters (shed connections, per-connection accept errors),
+    /// published on the health endpoint.
+    pub counters: Arc<ServeCounters>,
     /// Bounds concurrent handler executions — the memory-heavy phase (whole
     /// inbound body buffered + waiting for upstream response headers). The
     /// permit is held until the handler returns; the response body, including
@@ -160,7 +205,13 @@ pub fn build_upstream_client(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(64)
-        .pool_idle_timeout(Duration::from_secs(90))
+        // Deliberately below the idle timeouts common in front of an LLM API
+        // (60s at most load balancers): a pooled connection the peer has
+        // already closed fails the next request that picks it, and a POST is
+        // not replayed, so the agent sees a 502 for a request that never
+        // reached the upstream. Shorter idle reuse trades a TLS handshake for
+        // not handing out dead sockets.
+        .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(60))
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(10))
@@ -286,10 +337,34 @@ pub struct InboundLimits {
     /// than the request bound on purpose: idle keep-alive and long-lived SSE
     /// connections hold a connection slot but no request permit.
     pub max_connections: usize,
+    /// Bound on the graceful drain (DRAIN_TIMEOUT in production; None waits
+    /// for every connection to finish on its own).
+    pub drain_timeout: Option<Duration>,
     /// Test instrumentation: counts accept-loop iterations. An idle loop must
     /// pend on accept (single digits over seconds); an always-ready select
     /// arm spins it into the millions. Production passes None.
     pub loop_iterations: Option<Arc<AtomicU64>>,
+    /// Test instrumentation: the JoinSet length after each accept/reap step.
+    /// Finished connection tasks must be reaped as they finish — JoinSet
+    /// retains every finished entry until `join_next` consumes it, so a serve
+    /// loop that only drains at shutdown grows with the cumulative connection
+    /// count (the memory creep v0.1.4 fixed). Production passes None.
+    pub live_connections: Option<Arc<AtomicU64>>,
+    /// Counters surfaced on the health endpoint. Production passes `Some`;
+    /// tests that assert on them pass their own.
+    pub counters: Option<Arc<ServeCounters>>,
+}
+
+/// Serve-loop counters the health endpoint publishes: the accept loop is
+/// otherwise invisible to monitoring, and per-connection accept errors used
+/// to be either fatal (visible, wrong) or retried in debug-only log lines
+/// (invisible).
+#[derive(Default)]
+pub struct ServeCounters {
+    /// Connections shed at the connection cap.
+    pub shed: AtomicU64,
+    /// accept(2) failures classified as per-connection (retried in place).
+    pub accept_errors: AtomicU64,
 }
 
 /// The h2 prior-knowledge preface. hyper-util's auto builder reads it — or a
@@ -405,7 +480,15 @@ pub async fn serve_inbound(
     let mut shutdown = std::pin::pin!(shutdown);
     let mut conns = tokio::task::JoinSet::new();
     let conn_slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    // Shutdown is propagated into every live connection, not just into this
+    // accept loop. hyper's connection future does not stop on its own: without
+    // this a draining gateway kept answering NEW requests on existing
+    // keep-alive connections, and an idle keep-alive socket held the drain
+    // until its header_read_timeout (30s) expired — past the service
+    // manager's stop timeout, so every restart ended in SIGKILL.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let mut shed = 0u64;
+    let mut accept_errors = 0u64;
     loop {
         if let Some(counter) = &limits.loop_iterations {
             counter.fetch_add(1, Ordering::Relaxed);
@@ -423,7 +506,16 @@ pub async fn serve_inbound(
             // always-ready arm would spin the loop and starve
             // listener.accept() — the gateway would stop serving entirely.
             res = conns.join_next(), if !conns.is_empty() => {
-                let _ = res;
+                // A panicking connection task would otherwise vanish without
+                // a trace: the JoinSet is the only place its JoinError is seen.
+                if let Some(Err(e)) = res
+                    && e.is_panic()
+                {
+                    tracing::error!("inbound connection task panicked: {e}");
+                }
+                if let Some(gauge) = &limits.live_connections {
+                    gauge.store(conns.len() as u64, Ordering::Relaxed);
+                }
                 continue;
             }
             accepted = listener.accept() => Some(accepted),
@@ -434,16 +526,43 @@ pub async fn serve_inbound(
         let (stream, _peer) = match accepted {
             Ok(ok) => ok,
             Err(e) => {
-                // Descriptor pressure is transient (a burst above the OS fd
-                // limit); back off and keep serving instead of turning it
-                // into a full outage. Everything else stays fatal, as before.
-                if is_transient_accept_error(&e) {
-                    tracing::warn!(error = %e, "transient accept error (descriptor pressure); backing off 1s");
+                // Transient resource pressure (fd or kernel memory): back
+                // off and keep serving instead of turning it into a full
+                // outage.
+                if is_resource_pressure_accept_error(&e) {
+                    tracing::warn!(error = %e, "transient accept error (resource pressure); backing off 1s");
                     // Shutdown stays live during the backoff: an uninterruptible
                     // sleep would delay a stop by up to 1s per burst.
                     tokio::select! {
                         _ = &mut shutdown => break,
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    continue;
+                }
+                // accept(2) reports per-connection failures from the backlog
+                // (a handshake the peer aborted, protocol/route errors) as
+                // errors on the listener. They say nothing about the listener
+                // itself, so retrying is the documented behavior; treating
+                // them as fatal turned one dropped handshake into a full
+                // gateway restart.
+                if is_connection_level_accept_error(&e) {
+                    accept_errors += 1;
+                    if let Some(counters) = &limits.counters {
+                        counters
+                            .accept_errors
+                            .store(accept_errors, Ordering::Relaxed);
+                    }
+                    if accept_errors == 1 {
+                        // First one at warn: the old code treated these as
+                        // fatal, so they were at least visible — this keeps
+                        // the signal an operator can actually notice.
+                        tracing::warn!(error = %e, "per-connection accept error; still accepting");
+                    } else if accept_errors.is_multiple_of(100) {
+                        tracing::debug!(
+                            error = %e,
+                            count = accept_errors,
+                            "per-connection accept error; still accepting"
+                        );
                     }
                     continue;
                 }
@@ -457,6 +576,9 @@ pub async fn serve_inbound(
         // log sane while still leaving evidence a cap was ever hit.
         let Ok(_conn_slot) = conn_slots.clone().try_acquire_owned() else {
             shed += 1;
+            if let Some(counters) = &limits.counters {
+                counters.shed.store(shed, Ordering::Relaxed);
+            }
             if shed % 100 == 1 {
                 tracing::warn!(
                     shed,
@@ -483,6 +605,7 @@ pub async fn serve_inbound(
         // The connection future owns its builder (cheap config clone) so it
         // stays 'static and can outlive this loop while draining.
         let app = app.clone();
+        let mut drain_rx = drain_rx.clone();
         conns.spawn(async move {
             // Hold the connection slot for the task's whole life: dropped
             // when the connection ends, freeing the slot for the next accept.
@@ -516,61 +639,171 @@ pub async fn serve_inbound(
                 .http2()
                 .keep_alive_interval(Some(HTTP2_KEEPALIVE_INTERVAL));
             builder.http2().keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
-            if let Err(e) = builder
-                .serve_connection_with_upgrades(
-                    hyper_util::rt::TokioIo::new(PrefaceIo {
-                        io: stream,
-                        preface,
-                        pos: 0,
-                    }),
-                    hyper_util::service::TowerToHyperService::new(app.clone()),
-                )
-                .await
-            {
+            let conn = builder.serve_connection_with_upgrades(
+                hyper_util::rt::TokioIo::new(PrefaceIo {
+                    io: stream,
+                    preface,
+                    pos: 0,
+                }),
+                hyper_util::service::TowerToHyperService::new(app.clone()),
+            );
+            let mut conn = std::pin::pin!(conn);
+            let served = tokio::select! {
+                res = &mut conn => res,
+                _ = drain_rx.changed() => {
+                    // Shutdown started: stop accepting requests on this
+                    // connection and close it once the in-flight response
+                    // finishes (an idle keep-alive connection closes now).
+                    // h2 peers get a GOAWAY instead.
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = served {
                 // Client aborts mid-stream are routine for a proxy; keep the
                 // noise down but leave a trace for debugging.
                 tracing::debug!(error = %e, "inbound connection ended");
             }
         });
+        if let Some(gauge) = &limits.live_connections {
+            gauge.store(conns.len() as u64, Ordering::Relaxed);
+        }
     }
-    // Graceful: stop accepting, then let in-flight requests (including long
-    // SSE streams) run to completion on their own — same semantics as
-    // axum::serve's graceful shutdown; the service manager's stop timeout is
-    // the hard cap. The count tells the operator what is still holding the
-    // drain; a second signal exits immediately (see shutdown_signal — tokio
-    // swallows further signals once the shutdown future resolved).
+    // Graceful: stop accepting, tell every live connection to finish and
+    // close, then wait for them — bounded by drain_timeout, because a
+    // long-lived SSE stream or a client that simply never goes away would
+    // otherwise hold shutdown until the service manager SIGKILLs the
+    // process (losing the audit flush and the runtime file cleanup). The
+    // count tells the operator what is still holding the drain; a second
+    // signal exits immediately (see shutdown_signal — tokio swallows further
+    // signals once the shutdown future resolved).
+    let _ = drain_tx.send(true);
     tracing::info!(
         connections = conns.len(),
         "shutdown: draining in-flight connections (a second signal exits immediately)"
     );
-    while conns.join_next().await.is_some() {}
+    let deadline = limits
+        .drain_timeout
+        .map(|limit| tokio::time::Instant::now() + limit);
+    loop {
+        let joined = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, conns.join_next()).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    tracing::warn!(
+                        remaining = conns.len(),
+                        "drain timeout reached; dropping the remaining connections"
+                    );
+                    conns.shutdown().await;
+                    break;
+                }
+            },
+            None => conns.join_next().await,
+        };
+        match joined {
+            Some(Err(e)) if e.is_panic() => {
+                tracing::error!("inbound connection task panicked during drain: {e}");
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
     Ok(())
 }
 
-/// Whether an accept error is transient resource pressure to back off from,
-/// rather than a fatal condition for the serve loop. Unix: EMFILE/ENFILE (a
-/// burst above the fd limit). Windows: the winsock equivalents WSAEMFILE
-/// (10024) / WSAENOBUFS (10055) as raw codes, because libc there carries
-/// neither the errno nor the winsock constants portably.
-fn is_transient_accept_error(e: &std::io::Error) -> bool {
+/// Whether an accept error is transient resource pressure to back off from
+/// (1s), rather than a fatal condition or a per-connection retry: the listener
+/// is healthy, but the process or the kernel is out of a resource, so an
+/// immediate re-accept would just fail again and spin a core. Unix:
+/// EMFILE/ENFILE (a burst above the fd limit) plus ENOBUFS/ENOMEM (kernel
+/// memory/buffer pressure). Windows: the winsock equivalents WSAEMFILE (10024)
+/// / WSAENOBUFS (10055) as raw codes, because libc there carries neither the
+/// errno nor the winsock constants portably.
+fn is_resource_pressure_accept_error(e: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
-        matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
     }
     #[cfg(not(unix))]
     {
-        matches!(e.raw_os_error(), Some(10024) | Some(10055))
+        matches!(e.raw_os_error(), Some(10024 | 10055))
+    }
+}
+
+/// Whether an accept error belongs to the *connection* that was being
+/// accepted, not to the listener. Linux and the BSDs pass pending-socket
+/// errors up through accept(2) (a peer that reset between SYN and accept, a
+/// protocol/route failure); accept(2) itself documents that the application
+/// should treat them like EAGAIN and keep accepting. Anything else stays
+/// fatal, because it means the listener is unusable.
+fn is_connection_level_accept_error(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(code) = e.raw_os_error() else {
+            return false;
+        };
+        let known = [
+            libc::ECONNABORTED,
+            libc::EPROTO,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::ENOPROTOOPT,
+            libc::EOPNOTSUPP,
+        ];
+        if known.contains(&code) {
+            return true;
+        }
+        // ENONET is in libc's Linux set only; keep the reference behind the cfg
+        // so the Apple/Windows builds do not look for it.
+        #[cfg(target_os = "linux")]
+        {
+            if code == libc::ENONET {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        // winsock reports per-connection failures as WSAECONNABORTED (10053)
+        // / WSAECONNRESET (10054) / WSAENETDOWN (10050) / WSAENETUNREACH
+        // (10051) / WSAEHOSTUNREACH (10065).
+        matches!(
+            e.raw_os_error(),
+            Some(10053 | 10054 | 10050 | 10051 | 10065)
+        )
     }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snap = state.snapshot.load();
+    let uptime = state.started.elapsed().as_secs();
+    let last_ok = state.reload.last_ok_secs.load(Ordering::Relaxed);
     Json(json!({
         "ok": true,
         "degraded": snap.from_backup,
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_secs": state.started.elapsed().as_secs(),
+        "uptime_secs": uptime,
         "routes": snap.table.len(),
+        // The gateway answers with the last good snapshot even while the
+        // hot reload is failing (undecryptable store, permissions, a watcher
+        // that stopped) — without these the outage was invisible to
+        // monitoring until someone noticed a rotated key still working.
+        "snapshot_age_secs": uptime.saturating_sub(last_ok),
+        "reload_failures": state.reload.failures.load(Ordering::Relaxed),
+        "reload_attempts": state.reload.attempts.load(Ordering::Relaxed),
+        "audit": state.audit.is_enabled(),
+        "audit_ok": state.audit.healthy(),
+        "audit_dropped": state.audit.dropped(),
+        // Accept-loop visibility: the shed count is the only trace a connection
+        // flood leaves, and per-connection accept errors used to be either
+        // fatal (visible, wrong) or retried in debug-only lines (invisible).
+        "shed_connections": state.counters.shed.load(Ordering::Relaxed),
+        "accept_errors": state.counters.accept_errors.load(Ordering::Relaxed),
     }))
 }
 
@@ -947,16 +1180,27 @@ fn is_length_limit_error(e: &axum::Error) -> bool {
 /// Bounded read that discards a retryable response body to give the
 /// connection back: past the limit it simply gives up (drop the connection,
 /// no reuse), preventing a misbehaving upstream from blowing up memory with a
-/// huge body.
+/// huge body. The whole drain is bounded by `budget` because the non-streaming
+/// client carries no client-level read timeout: an upstream that answers
+/// 429/503 and then stalls the body used to park the handler — and with it the
+/// inbound permit — forever, so `max_concurrent` such responses wedged the
+/// whole gateway.
 const DISCARD_BODY_LIMIT: usize = 64 * 1024;
 
-async fn discard_body_limited(mut resp: reqwest::Response) {
-    let mut remaining = DISCARD_BODY_LIMIT;
-    while let Ok(Some(chunk)) = resp.chunk().await {
-        if chunk.len() >= remaining {
-            return;
+async fn discard_body_limited(mut resp: reqwest::Response, budget: Duration) {
+    let drain = async {
+        let mut remaining = DISCARD_BODY_LIMIT;
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if chunk.len() >= remaining {
+                return;
+            }
+            remaining -= chunk.len();
         }
-        remaining -= chunk.len();
+    };
+    if tokio::time::timeout(budget, drain).await.is_err() {
+        tracing::warn!(
+            "retryable upstream response body did not drain within the read idle; dropping the connection"
+        );
     }
 }
 
@@ -1054,7 +1298,7 @@ async fn forward_with_retry(
                 route = route_name,
                 "upstream returned retryable status"
             );
-            discard_body_limited(resp).await;
+            discard_body_limited(resp, state.body_read_idle).await;
             tokio::time::sleep(policy.backoff(attempt as u32, retry_after)).await;
             continue;
         }
@@ -1065,10 +1309,12 @@ async fn forward_with_retry(
                 route.sse_terminator,
                 rid.to_string(),
                 state.body_read_idle,
+                state.body_total_budget,
             )
             .await
         } else {
-            pass_through_response(resp, state.body_read_idle).await
+            // Plain non-streaming response: per-chunk idle + whole-body budget.
+            pass_through_response(resp, state.body_read_idle, Some(state.body_total_budget)).await
         };
         return Forwarded {
             response,
@@ -1466,7 +1712,11 @@ pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
     }
 }
 
-async fn pass_through_response(mut resp: reqwest::Response, body_idle: Duration) -> Response {
+async fn pass_through_response(
+    mut resp: reqwest::Response,
+    body_idle: Duration,
+    total_budget: Option<Duration>,
+) -> Response {
     let status = resp.status();
     // Move the header map out of the upstream response and drop hop-by-hop
     // entries in place; build_response then moves the map straight into the
@@ -1474,68 +1724,92 @@ async fn pass_through_response(mut resp: reqwest::Response, body_idle: Duration)
     // fresh map, again through the response builder).
     let mut headers = std::mem::take(resp.headers_mut());
     drop_hop_by_hop(&mut headers);
-    let stream = idle_bounded(resp.bytes_stream(), body_idle);
+    let stream = idle_bounded(resp.bytes_stream(), body_idle, total_budget);
     build_response(status, headers, Body::from_stream(stream))
 }
 
 /// Per-chunk read-idle bound for a forwarded response body: chunks pass
 /// through unchanged; if the upstream goes silent past `idle`, or errors, the
 /// body ends with an error so hyper aborts the response instead of hanging on
-/// it forever. Ends after the first error rather than looping errors if the
-/// consumer polls again.
+/// it forever. `total` bounds the body as a whole: an upstream trickling one
+/// byte just under the idle bound is "alive" forever and would hold its
+/// connection slot for the process lifetime. `None` skips the whole-body
+/// budget — used for streams that may legitimately run for hours (SSE,
+/// including its content-encoded passthrough fallbacks). Ends after the first
+/// error rather than looping errors if the consumer polls again.
 fn idle_bounded<S>(
     inner: S,
     idle: Duration,
+    total: Option<Duration>,
 ) -> impl futures_util::Stream<Item = std::result::Result<Bytes, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>>,
 {
     let inner = Box::pin(inner);
-    stream::unfold((inner, false), move |(mut inner, done)| async move {
-        if done {
-            return None;
-        }
-        match tokio::time::timeout(idle, inner.next()).await {
-            Ok(Some(Ok(chunk))) => Some((Ok(chunk), (inner, false))),
-            Ok(Some(Err(e))) => {
-                if e.is_timeout() {
-                    tracing::warn!(
-                        "upstream stopped sending the response body (read idle); aborting the response"
-                    );
-                } else {
-                    // Summary fields only, deliberately not the error object:
-                    // reqwest Display appends "for url (<url>)" when one is
-                    // attached, and with Auth::Query that URL carries the
-                    // upstream key. Today body-kind errors carry no URL, but
-                    // logging the full object would turn that reqwest
-                    // invariant into a silent leak the next time it changes.
-                    tracing::warn!(
-                        timeout = e.is_timeout(),
-                        connect = e.is_connect(),
-                        status = e.status().map(|s| s.as_u16()),
-                        "failed to read upstream response body"
-                    );
+    let deadline = total.map(|total| tokio::time::Instant::now() + total);
+    stream::unfold(
+        (inner, false, deadline),
+        move |(mut inner, done, deadline)| {
+            async move {
+                if done {
+                    return None;
                 }
-                Some((
-                    Err(std::io::Error::other("upstream body error")),
-                    (inner, true),
-                ))
+                let until = match deadline {
+                    Some(deadline) => (tokio::time::Instant::now() + idle).min(deadline),
+                    None => tokio::time::Instant::now() + idle,
+                };
+                match tokio::time::timeout_at(until, inner.next()).await {
+                    Ok(Some(Ok(chunk))) => Some((Ok(chunk), (inner, false, deadline))),
+                    Ok(Some(Err(e))) => {
+                        if e.is_timeout() {
+                            tracing::warn!(
+                                "upstream stopped sending the response body (read idle); aborting the response"
+                            );
+                        } else {
+                            // Summary fields only, deliberately not the error object:
+                            // reqwest Display appends "for url (<url>)" when one is
+                            // attached, and with Auth::Query that URL carries the
+                            // upstream key. Today body-kind errors carry no URL, but
+                            // logging the full object would turn that reqwest
+                            // invariant into a silent leak the next time it changes.
+                            tracing::warn!(
+                                timeout = e.is_timeout(),
+                                connect = e.is_connect(),
+                                status = e.status().map(|s| s.as_u16()),
+                                "failed to read upstream response body"
+                            );
+                        }
+                        Some((
+                            Err(std::io::Error::other("upstream body error")),
+                            (inner, true, deadline),
+                        ))
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        // The min() above means firing past `until` can be the
+                        // idle bound or the total budget; a None deadline is
+                        // always the idle bound.
+                        let expired = deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
+                        let message = if expired {
+                            tracing::warn!(
+                                "upstream response body exceeded the total budget; aborting the response"
+                            );
+                            "upstream body total budget exceeded"
+                        } else {
+                            tracing::warn!(
+                                "upstream response body stalled past the read idle; aborting the response"
+                            );
+                            "upstream body read idle timeout"
+                        };
+                        Some((
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message)),
+                            (inner, true, deadline),
+                        ))
+                    }
+                }
             }
-            Ok(None) => None,
-            Err(_) => {
-                tracing::warn!(
-                    "upstream response body stalled past the read idle; aborting the response"
-                );
-                Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "upstream body read idle timeout",
-                    )),
-                    (inner, true),
-                ))
-            }
-        }
-    })
+        },
+    )
 }
 
 async fn stream_response(
@@ -1543,6 +1817,7 @@ async fn stream_response(
     terminator: Terminator,
     rid: String,
     body_idle: Duration,
+    non_stream_budget: Duration,
 ) -> Response {
     // The passthrough fallbacks below consume `resp` whole, so the content
     // checks borrow its headers before the map is moved out for the SSE path.
@@ -1553,8 +1828,16 @@ async fn stream_response(
         .map(|v| v.to_ascii_lowercase().starts_with("text/event-stream"))
         .unwrap_or(false);
 
-    if !is_sse || terminator == Terminator::None {
-        return pass_through_response(resp, body_idle).await;
+    if !is_sse {
+        // Not a stream after all: the whole-body budget applies as usual.
+        return pass_through_response(resp, body_idle, Some(non_stream_budget)).await;
+    }
+
+    // From here on it IS an SSE stream: it may legitimately run for hours, so
+    // the whole-body budget never applies — only the per-chunk read idle does.
+    // Terminator::None routes skip scanning entirely and pass through raw.
+    if terminator == Terminator::None {
+        return pass_through_response(resp, body_idle, None).await;
     }
 
     // A content-encoded response is compressed bytes, so terminator scanning
@@ -1562,9 +1845,12 @@ async fn stream_response(
     // truncation detection than to append plain-text events to a compressed
     // stream (that corrupts the frame tail and makes the client's decoder
     // error out, e.g. Bun's ZstdDecompressionError).
+    //
+    // The trickle test (Terminator::None) covers the budget exemption for the
+    // SSE passthrough family; this branch shares it, so the test guards both.
     if is_encoded(resp.headers()) {
         tracing::debug!(rid = %rid, "response is content-encoded, skipping SSE terminator detection");
-        return pass_through_response(resp, body_idle).await;
+        return pass_through_response(resp, body_idle, None).await;
     }
 
     let status = resp.status();
@@ -1813,92 +2099,160 @@ fn next_reload_backoff(after: Duration) -> Duration {
     after.saturating_mul(2).min(MAX_RELOAD_BACKOFF)
 }
 
-/// Polls the store.age / master.key mtime+size and swaps in a whole new snapshot on change.
+/// How often the supervisor checks that the watcher is still alive.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+/// A watcher that has not ticked for this long is wedged (a blocking disk read
+/// that never returns, for instance). Reported, not killed: the tick is
+/// published before the blocking part of the round, so a stale tick means the
+/// watcher is stuck inside it and respawning would only park another blocking
+/// task behind the same hung read.
+const WATCHDOG_STALE: Duration = Duration::from_secs(120);
+
+/// Runs the store watcher under a supervisor: a watcher task that dies (a
+/// panic in the reload path) is restarted instead of silently leaving the
+/// gateway on a snapshot nothing tracks any more, and a wedged watcher is
+/// reported with its tick age. Both are also visible on the health endpoint
+/// through `ReloadStatus`, so "the gateway answers" no longer hides "the vault
+/// is no longer being watched".
 pub fn spawn_watcher(state: Arc<AppState>, paths: Paths) {
     tokio::spawn(async move {
-        // Zeroed so the first round after startup always reloads once,
-        // covering the race where the CLI modified the store between serve
-        // finishing the initial store load and the watcher starting.
-        let mut last = (0u64, 0u64, 0u64);
-        let mut failures = 0u32;
-        let mut backup_warned = false;
-        let mut delay = RELOAD_POLL;
         loop {
-            tokio::time::sleep(delay).await;
-            let now = stamp(&paths);
-            if now == last {
-                continue;
-            }
-            // File I/O + age decryption + JSON parse + validate are blocking:
-            // run them on the blocking pool so a slow disk or a large vault
-            // never occupies a tokio worker while requests are being forwarded.
-            let unlocked = {
-                let paths = paths.clone();
-                tokio::task::spawn_blocking(move || crate::store::unlock(&paths))
-                    .await
-                    .unwrap_or_else(|e| Err(Error::msg(format!("hot reload worker failed: {e}"))))
-            };
-            match unlocked {
-                Ok(unlocked) => match RouteTable::build(&unlocked.store) {
-                    Ok(table) => {
-                        let from_backup = unlocked.from_backup;
-                        if !adopt_snapshot(from_backup, Some(state.snapshot.load().from_backup)) {
-                            // .bak wants to overwrite a good in-memory snapshot: refuse the
-                            // downgrade. .bak lags one generation and would revive
-                            // revoked/deleted vkeys; memory still holds the latest good data.
-                            last = now;
-                            delay = RELOAD_POLL;
-                            if !backup_warned {
-                                tracing::error!(
-                                    "main store failed to decrypt, refusing to overwrite in-memory snapshot with stale .bak (continuing to serve the latest good data); fix the main store ASAP"
-                                );
-                                backup_warned = true;
-                            }
-                            continue;
-                        }
-                        let routes = table.len();
-                        let live_urls: HashSet<String> = unlocked
-                            .store
-                            .routes
-                            .values()
-                            .filter_map(|r| r.proxy.clone())
-                            .filter(|p| p.as_str() != crate::model::PROXY_DIRECT)
-                            .collect();
-                        state.snapshot.store(Arc::new(Snapshot {
-                            store: Arc::new(unlocked.store),
-                            table,
-                            from_backup,
-                        }));
-                        state.clients.retain_urls(&live_urls);
-                        last = now;
-                        failures = 0;
-                        delay = RELOAD_POLL;
-                        backup_warned = false;
-                        if from_backup {
+            let watcher = tokio::spawn(watcher_loop(state.clone(), paths.clone()));
+            tokio::pin!(watcher);
+            let mut stale_warned = false;
+            let joined = loop {
+                tokio::select! {
+                    res = &mut watcher => break Some(res),
+                    _ = tokio::time::sleep(WATCHDOG_INTERVAL) => {
+                        let age = tick_age(&state);
+                        if age > WATCHDOG_STALE.as_secs() && !stale_warned {
                             tracing::error!(
-                                "hot reload fell back to .bak backup (main store failed to decrypt): revoked/deleted vkeys may become effective again; fix ASAP"
+                                age_secs = age,
+                                "store watcher has not ticked; the vault may no longer be tracked (hung disk read?)"
                             );
+                            stale_warned = true;
                         }
-                        tracing::info!(routes, from_backup, "store hot-reloaded");
                     }
-                    Err(e) => {
+                }
+            };
+            match joined {
+                Some(Ok(())) => tracing::error!("store watcher exited; restarting"),
+                Some(Err(e)) => tracing::error!(error = %e, "store watcher failed; restarting"),
+                None => break,
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn tick_age(state: &AppState) -> u64 {
+    state
+        .started
+        .elapsed()
+        .as_secs()
+        .saturating_sub(state.reload.last_tick_secs.load(Ordering::Relaxed))
+}
+
+/// Polls the store.age / master.key mtime+size and swaps in a whole new snapshot on change.
+async fn watcher_loop(state: Arc<AppState>, paths: Paths) {
+    // Zeroed so the first round after startup always reloads once,
+    // covering the race where the CLI modified the store between serve
+    // finishing the initial store load and the watcher starting.
+    let mut last = (0u64, 0u64, 0u64);
+    let mut failures = 0u32;
+    let mut backup_warned = false;
+    let mut delay = RELOAD_POLL;
+    loop {
+        tokio::time::sleep(delay).await;
+        // Liveness tick, published before the blocking part of the round so
+        // the watchdog can tell "nothing to reload" from "stuck reloading".
+        state
+            .reload
+            .last_tick_secs
+            .store(state.started.elapsed().as_secs(), Ordering::Relaxed);
+        let now = stamp(&paths);
+        if now == last {
+            continue;
+        }
+        state.reload.attempts.fetch_add(1, Ordering::Relaxed);
+        // File I/O + age decryption + JSON parse + validate are blocking:
+        // run them on the blocking pool so a slow disk or a large vault
+        // never occupies a tokio worker while requests are being forwarded.
+        let unlocked = {
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || crate::store::unlock(&paths))
+                .await
+                .unwrap_or_else(|e| Err(Error::msg(format!("hot reload worker failed: {e}"))))
+        };
+        match unlocked {
+            Ok(unlocked) => match RouteTable::build(&unlocked.store) {
+                Ok(table) => {
+                    let from_backup = unlocked.from_backup;
+                    if !adopt_snapshot(from_backup, Some(state.snapshot.load().from_backup)) {
+                        // .bak wants to overwrite a good in-memory snapshot: refuse the
+                        // downgrade. .bak lags one generation and would revive
+                        // revoked/deleted vkeys; memory still holds the latest good data.
+                        last = now;
+                        delay = RELOAD_POLL;
                         failures += 1;
-                        delay = next_reload_backoff(delay);
-                        if failures % 10 == 1 {
-                            tracing::warn!(error = %e, "hot reload validation failed, keeping old snapshot");
+                        state.reload.failures.store(failures, Ordering::Relaxed);
+                        if !backup_warned {
+                            tracing::error!(
+                                "main store failed to decrypt, refusing to overwrite in-memory snapshot with stale .bak (continuing to serve the latest good data); fix the main store ASAP"
+                            );
+                            backup_warned = true;
                         }
+                        continue;
                     }
-                },
+                    let routes = table.len();
+                    let live_urls: HashSet<String> = unlocked
+                        .store
+                        .routes
+                        .values()
+                        .filter_map(|r| r.proxy.clone())
+                        .filter(|p| p.as_str() != crate::model::PROXY_DIRECT)
+                        .collect();
+                    state.snapshot.store(Arc::new(Snapshot {
+                        store: Arc::new(unlocked.store),
+                        table,
+                        from_backup,
+                    }));
+                    state.clients.retain_urls(&live_urls);
+                    last = now;
+                    failures = 0;
+                    delay = RELOAD_POLL;
+                    backup_warned = false;
+                    state.reload.failures.store(0, Ordering::Relaxed);
+                    state
+                        .reload
+                        .last_ok_secs
+                        .store(state.started.elapsed().as_secs(), Ordering::Relaxed);
+                    if from_backup {
+                        tracing::error!(
+                            "hot reload fell back to .bak backup (main store failed to decrypt): revoked/deleted vkeys may become effective again; fix ASAP"
+                        );
+                    }
+                    tracing::info!(routes, from_backup, "store hot-reloaded");
+                }
                 Err(e) => {
                     failures += 1;
+                    state.reload.failures.store(failures, Ordering::Relaxed);
                     delay = next_reload_backoff(delay);
                     if failures % 10 == 1 {
-                        tracing::warn!(error = %e, "hot reload decryption failed, keeping old snapshot");
+                        tracing::warn!(error = %e, "hot reload validation failed, keeping old snapshot");
                     }
+                }
+            },
+            Err(e) => {
+                failures += 1;
+                state.reload.failures.store(failures, Ordering::Relaxed);
+                delay = next_reload_backoff(delay);
+                if failures % 10 == 1 {
+                    tracing::warn!(error = %e, "hot reload decryption failed, keeping old snapshot");
                 }
             }
         }
-    });
+    }
 }
 
 fn stamp(paths: &Paths) -> (u64, u64, u64) {
@@ -2341,18 +2695,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn transient_accept_errors_are_the_descriptor_pressure_kinds() {
-        assert!(is_transient_accept_error(
-            &std::io::Error::from_raw_os_error(libc::EMFILE)
+    fn accept_errors_split_into_pressure_connection_and_fatal() {
+        // Resource pressure (fd or kernel memory): back off, the listener is
+        // fine. ENOBUFS/ENOMEM belong here, not in the retry-now bucket:
+        // under pressure a re-accept usually fails again, and an immediate
+        // retry would hot-spin a core.
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_resource_pressure_accept_error(&e),
+                "errno {code} is resource pressure"
+            );
+            assert!(!is_connection_level_accept_error(&e));
+        }
+
+        // Per-connection errors accept(2) passes up from the backlog: the
+        // aborted connection is gone, the listener still works. Treating
+        // these as fatal (the old behavior) turned one dropped handshake into
+        // a full gateway restart.
+        for code in [
+            libc::ECONNABORTED,
+            libc::EPROTO,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+        ] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_connection_level_accept_error(&e),
+                "errno {code} is per-connection, not fatal"
+            );
+            assert!(!is_resource_pressure_accept_error(&e));
+        }
+
+        // Anything else still means the listener is unusable.
+        assert!(!is_connection_level_accept_error(&std::io::Error::other(
+            "boom"
+        )));
+        assert!(!is_connection_level_accept_error(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
         ));
-        assert!(is_transient_accept_error(
-            &std::io::Error::from_raw_os_error(libc::ENFILE)
-        ));
-        // A peer resetting mid-accept is none of our pressure; it stays fatal.
-        assert!(!is_transient_accept_error(
-            &std::io::Error::from_raw_os_error(libc::ECONNABORTED)
-        ));
-        assert!(!is_transient_accept_error(&std::io::Error::other("boom")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2361,7 +2744,11 @@ mod tests {
             Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"a")),
             Ok(Bytes::from_static(b"b")),
         ]);
-        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(60)));
+        let mut s = Box::pin(idle_bounded(
+            inner,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(600)),
+        ));
         assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"a"));
         assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"b"));
         assert!(s.next().await.is_none());
@@ -2372,7 +2759,11 @@ mod tests {
         // one chunk, then the upstream goes silent forever
         let inner = stream::once(async { Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"x")) })
             .chain(stream::pending::<reqwest::Result<Bytes>>());
-        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(30)));
+        let mut s = Box::pin(idle_bounded(
+            inner,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(600)),
+        ));
         assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"x"));
         let err = s.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
@@ -2387,10 +2778,42 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok::<Bytes, reqwest::Error>(Bytes::from(vec![i]))
         });
-        let mut s = Box::pin(idle_bounded(inner, Duration::from_secs(60)));
+        let mut s = Box::pin(idle_bounded(
+            inner,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(600)),
+        ));
         for i in 0u8..3 {
             assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from(vec![i]));
         }
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_bounded_enforces_the_total_budget() {
+        // A trickle that never trips the per-chunk idle bound (every chunk
+        // arrives well within it) must still end at the total budget: without
+        // it such an upstream held its connection slot forever.
+        let inner = stream::iter(0u8..10).then(|i| async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Ok::<Bytes, reqwest::Error>(Bytes::from(vec![i]))
+        });
+        let mut s = Box::pin(idle_bounded(
+            inner,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(90)),
+        ));
+        // chunks at t=20, 40, 60, 80 — each one inside the 60s idle bound
+        for i in 0u8..4 {
+            assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from(vec![i]));
+        }
+        // the next chunk would land at t=100, past the 90s total budget
+        let err = s.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("total budget"),
+            "the total-budget abort must be distinguishable from the idle one: {err}"
+        );
         assert!(s.next().await.is_none());
     }
 }
@@ -2414,6 +2837,9 @@ mod serve_inbound_tests {
             body_read_idle: BODY_READ_IDLE,
             inbound_body_timeout: CLIENT_BODY_TIMEOUT,
             permit_queue_timeout: PERMIT_QUEUE_TIMEOUT,
+            body_total_budget: BODY_TOTAL_BUDGET,
+            reload: Arc::new(ReloadStatus::default()),
+            counters: Arc::new(ServeCounters::default()),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             audit: Audit::disabled(),
             started: Instant::now(),
@@ -2438,7 +2864,10 @@ mod serve_inbound_tests {
             InboundLimits {
                 header_timeout: CLIENT_HEADER_TIMEOUT,
                 max_connections: 64,
+                drain_timeout: Some(Duration::from_secs(5)),
                 loop_iterations: None,
+                live_connections: None,
+                counters: None,
             },
             std::future::pending(),
         ));
@@ -2506,7 +2935,10 @@ mod serve_inbound_tests {
             InboundLimits {
                 header_timeout: CLIENT_HEADER_TIMEOUT,
                 max_connections: 8,
+                drain_timeout: Some(Duration::from_secs(5)),
                 loop_iterations: Some(iterations.clone()),
+                live_connections: None,
+                counters: None,
             },
             std::future::pending(),
         ));
@@ -2554,7 +2986,10 @@ mod serve_inbound_tests {
             InboundLimits {
                 header_timeout: head_timeout,
                 max_connections: 8,
+                drain_timeout: Some(Duration::from_secs(5)),
                 loop_iterations: None,
+                live_connections: None,
+                counters: None,
             },
             std::future::pending(),
         ));
@@ -2637,6 +3072,146 @@ mod serve_inbound_tests {
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         dribble.abort();
+    }
+
+    /// Regression guard for the memory creep class: finished connection tasks
+    /// must be reaped as they finish. `JoinSet` keeps every finished entry
+    /// (handle plus the task's harness allocation, sized to hold hyper's
+    /// connection future) until `join_next` consumes it, so a loop that only
+    /// drains at shutdown grows with the cumulative connection count even at
+    /// flat concurrency. The gauge is the JoinSet length after each accept and
+    /// each reap: sequential connect/close cycles must return it to zero
+    /// instead of accumulating.
+    #[tokio::test]
+    async fn serve_inbound_reaps_finished_connection_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicU64::new(0));
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: CLIENT_HEADER_TIMEOUT,
+                max_connections: 16,
+                drain_timeout: Some(Duration::from_secs(5)),
+                loop_iterations: None,
+                live_connections: Some(live.clone()),
+                counters: None,
+            },
+            std::future::pending(),
+        ));
+
+        for _ in 0..50 {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            assert!(buf.starts_with(b"HTTP/1.1 200"));
+        }
+
+        // Every closed connection's task must be consumed by the reaping arm.
+        let reaped = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if live.load(Ordering::Relaxed) == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            reaped,
+            "finished connection tasks must be reaped, JoinSet still holds {}",
+            live.load(Ordering::Relaxed)
+        );
+
+        server.abort();
+    }
+
+    /// Regression: shutdown used to wait for every connection to end on its
+    /// own. An idle keep-alive socket only ends when hyper's
+    /// header_read_timeout (30s) expires, so a stop took ~30s — past the
+    /// service manager's stop timeout, which SIGKILLed the process every time
+    /// (losing the audit flush and the runtime-file cleanup). Shutdown is now
+    /// propagated into each connection: an idle one closes immediately.
+    #[tokio::test]
+    async fn serve_inbound_shutdown_reaps_idle_keep_alive_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: CLIENT_HEADER_TIMEOUT,
+                max_connections: 8,
+                drain_timeout: Some(Duration::from_secs(5)),
+                loop_iterations: None,
+                live_connections: None,
+                counters: None,
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        // One request, then stay connected and idle (an agent's pooled socket).
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /__keysink/health HTTP/1.1\r\nhost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = s.read(&mut buf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+            "health must answer before shutdown"
+        );
+
+        let started = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("shutdown must not wait for the 30s idle keep-alive reap")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "drain took {:?}",
+            started.elapsed()
+        );
+
+        // The connection must be closed, not left lingering: the client sees EOF.
+        let closed = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the drained connection must be closed, got {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_reports_reload_and_audit_state() {
+        let state = test_state();
+        state.reload.failures.store(3, Ordering::Relaxed);
+        state.counters.shed.store(7, Ordering::Relaxed);
+        state.counters.accept_errors.store(2, Ordering::Relaxed);
+        let resp = health(State(state)).await.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reload_failures"], 3);
+        assert!(
+            v["snapshot_age_secs"].as_u64().is_some(),
+            "snapshot age must be reported: {v}"
+        );
+        assert_eq!(v["audit"], false);
+        // audit off is not an unhealthy audit; only a dead writer is
+        assert_eq!(v["audit_ok"], true);
+        assert_eq!(v["audit_dropped"], 0);
+        assert_eq!(v["shed_connections"], 7);
+        assert_eq!(v["accept_errors"], 2);
     }
 
     /// PrefaceIo must replay the sniffed bytes before the live stream, then
