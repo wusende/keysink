@@ -2576,7 +2576,11 @@ mod serve_inbound_tests {
         })
         .await
         .expect("silent connection must be dropped within the head timeout");
-        assert!(closed.is_ok(), "expected clean EOF, got {:?}", closed.unwrap_err());
+        assert!(
+            closed.is_ok(),
+            "expected clean EOF, got {:?}",
+            closed.unwrap_err()
+        );
 
         server.abort();
     }
@@ -2594,13 +2598,17 @@ mod serve_inbound_tests {
         let mut burst = H2_PREFACE.to_vec();
         burst.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]);
         client.write_all(&burst).await.unwrap();
-        let seen = sniff_protocol(&mut server, Duration::from_secs(30)).await.unwrap();
+        let seen = sniff_protocol(&mut server, Duration::from_secs(30))
+            .await
+            .unwrap();
         assert_eq!(seen, burst, "preface burst must pass through unmodified");
 
         // http1 divergence: first byte already decides, one read is enough.
         let (mut client, mut server) = tokio::io::duplex(64);
         client.write_all(b"GET /x HTTP/1.1\r\n").await.unwrap();
-        let seen = sniff_protocol(&mut server, Duration::from_secs(30)).await.unwrap();
+        let seen = sniff_protocol(&mut server, Duration::from_secs(30))
+            .await
+            .unwrap();
         assert_eq!(seen, b"GET /x HTTP/1.1\r\n".to_vec());
 
         // Silent peer: the deadline must fire, not hang.

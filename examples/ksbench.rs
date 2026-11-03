@@ -394,7 +394,8 @@ async fn run_bench(args: BenchArgs) {
                                     stream_ok = false;
                                     s.transport_errors += 1;
                                     if s.error_samples.len() < 5 {
-                                        s.error_samples.push("transport: stream idle timeout".into());
+                                        s.error_samples
+                                            .push("transport: stream idle timeout".into());
                                     }
                                     break;
                                 }
