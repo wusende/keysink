@@ -53,8 +53,9 @@ everything in its environment — but the real key was never in there.
    Prebuilt binaries are also on
    [Releases](https://github.com/wusende/keysink/releases) — Linux / macOS /
    Windows, amd64 / arm64 — put one on your `PATH`. The npm package is a thin
-   launcher around that same binary; Linux x64 needs glibc 2.35+, and anything
-   uncovered (musl/Alpine, Windows arm64) falls back to `cargo install`.
+   launcher around that same binary; Linux x86_64 needs glibc 2.35+, arm64 needs
+   2.39+, and anything uncovered (musl/Alpine, Windows arm64) falls back to
+   `cargo install`.
 
 2. Start the gateway (standalone mode — no root, no service):
 
@@ -71,8 +72,21 @@ everything in its environment — but the real key was never in there.
    # non-interactive: printf %s "$KEY" | keysink route add claude --base-url … --auth x-api-key
    ```
 
-   It prints the two lines your agent needs. Routes hot-reload into a running
-   gateway within ~1s, so adding one never requires a restart.
+   It prints the vkey and the two lines your agent needs:
+
+   ```
+   route `claude` created (key goes in, never out: cannot be read/exported)
+   auth: x-api-key    base_url: https://api.anthropic.com
+   vkey: ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
+   (vkey is shown only this once; if lost, only `keysink route rotate claude` can issue a new one)
+   gateway: http://127.0.0.1:8787 (running)
+   agent-side config (OpenAI-compatible clients usually need /v1 in base_url):
+     BASE_URL=http://127.0.0.1:8787
+     TOKEN=ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
+   ```
+
+   Routes hot-reload into a running gateway within ~1s, so adding one never
+   requires a restart.
 
 4. Point your agent at it:
 
@@ -102,6 +116,10 @@ never smuggle its own credentials through. Everything else — method, path, bod
 preserved with the auth parameter managed by the route. SSE chunks are forwarded
 as they arrive instead of being buffered into a whole response.
 
+`--auth` describes keysink → upstream only. Inbound, the vkey is accepted in any
+of `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `api-key`, so the
+client's auth style and the route's never have to match.
+
 Because the vkey picks the route, "which upstream does this agent talk to" is a
 keysink-side decision, not a client-side one. Two agents on the same port can
 talk to two different providers, or to the same provider with different keys.
@@ -127,6 +145,27 @@ Route options worth knowing:
   a per-route upstream proxy, defaulting to `HTTP(S)_PROXY`
 - `--retry-on-status CODE` overrides the retryable set per route (400..=599)
 
+Common moves:
+
+```bash
+keysink route update claude --base-url https://api.openai.com     # switch upstream
+printf %s "$NEW_KEY" | keysink route update claude --route-key -   # swap the real key
+keysink route rotate claude                                       # new vkey, old one stops working
+```
+
+`status` prints the vault summary (home, schema, route count). `doctor` runs the
+integrity checks — owner, permissions, key parses, store decrypts, backup
+decrypts — and is what to run when something looks wrong.
+
+To check the gateway itself, `GET /__keysink/health` returns
+`{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`.
+
+`--accept-degraded` covers a broken vault: when the primary store fails to
+decrypt, the gateway can start from `vault.age.bak` instead. That backup is one
+write behind, so vkeys rotated or deleted since then work again — a stopgap to
+keep agents running, not a state to stay in. `doctor` tells you which file is
+bad and how to restore it.
+
 ## Where the vault lives
 
 `~/.local/share/keysink` (Windows: `%LOCALAPPDATA%\keysink`; system installs:
@@ -135,6 +174,12 @@ Route options worth knowing:
 The master password is only used to encrypt and restore `export` backups —
 serving, adding, rotating and disabling keys never ask for it, so a daemon
 restart can't be blocked by a forgotten password.
+
+`vault.key` is a plain age identity file (`0600`), not something the master
+password protects: the vault's protection is file mode plus a separate UID. For
+services, the identity can live outside the vault directory — `KEYSINK_MASTER_KEY`
+(inline age identity) or `KEYSINK_MASTER_KEY_FILE` (path to one), which is what
+systemd's `LoadCredential` wants.
 
 ## Linux system service
 
@@ -189,6 +234,7 @@ of unauthenticated requests cannot rotate the forensic trail away.
 
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.
+
 Everything a request touches is bounded by default — body size, in-flight
 requests, connections, time — so a hung upstream or a misbehaving agent can't
 take the gateway down. Idle connections are bounded too: http1 heads must
@@ -223,9 +269,18 @@ are closed.
 
 **Is a local proxy a single point of failure?**
 
-It's a local process, so yes — if it's down, requests fail. `keysink status`
-reports the live listen address and probes reachability, and under systemd the
-unit restarts on failure. The vault is plain files, so a crash never loses keys.
+It's a local process, so yes — if it's down, requests fail. `GET
+/__keysink/health` says whether it's up and whether it's serving a stale backup;
+under systemd the unit restarts on failure. The vault is plain files, so a crash
+never loses keys.
+
+**My agent gets 401 — is the vkey wrong or the real key?**
+
+keysink's own 401 has a JSON body from keysink and an `x-keysink-request-id`
+header, e.g. `{"error":{"type":"authentication_error","message":"virtual key is
+invalid or has been rotated …"}}`. A bad *real* key comes back from the upstream
+instead — same status, but the body is the provider's own error, and the request
+never reached the vault.
 
 ## Development
 

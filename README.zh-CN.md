@@ -36,7 +36,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
    `cargo install` 装到 `~/.cargo/bin`,sudo 看不到这个目录。所以后面要跑 `sudo keysink deploy` 时,写成 `sudo ~/.cargo/bin/keysink deploy`。
 
-   也可以从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。npm 包只是同一个二进制的启动壳;Linux x64 需要 glibc 2.35+,没覆盖到的平台(musl/Alpine、Windows arm64)请回退到 `cargo install`。
+   也可以从 [Releases](https://github.com/wusende/keysink/releases) 下载对应平台的二进制——Linux / macOS / Windows,amd64 / arm64——加执行权限放进 `PATH`。npm 包只是同一个二进制的启动壳;Linux x86_64 需要 glibc 2.35+,arm64 需要 2.39+,没覆盖到的平台(musl/Alpine、Windows arm64)请回退到 `cargo install`。
 
 2. 启动网关(standalone 模式,无需 root、无需装服务):
 
@@ -53,7 +53,20 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
    # 非交互:printf %s "$KEY" | keysink route add claude --base-url … --auth x-api-key
    ```
 
-   它会打印 agent 需要的那两行。路由热重载进运行中的网关,大约 1 秒,加路由不需要重启。
+   它会打印 vkey 和 agent 需要的那两行:
+
+   ```
+   route `claude` created (key goes in, never out: cannot be read/exported)
+   auth: x-api-key    base_url: https://api.anthropic.com
+   vkey: ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
+   (vkey is shown only this once; if lost, only `keysink route rotate claude` can issue a new one)
+   gateway: http://127.0.0.1:8787 (running)
+   agent-side config (OpenAI-compatible clients usually need /v1 in base_url):
+     BASE_URL=http://127.0.0.1:8787
+     TOKEN=ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
+   ```
+
+   路由热重载进运行中的网关,大约 1 秒,加路由不需要重启。
 
 4. 把 agent 指过来:
 
@@ -72,6 +85,8 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
 客户端发来的鉴权头会被剥掉、按路由重建,所以客户端没法夹带自己的凭证。其余原样透传:方法、路径、body、`Accept`、流式响应,query string 也保留(鉴权参数由路由管理)。SSE 按块转发,不会把整个响应缓冲起来。
 
+`--auth` 只管 keysink → 上游这一段。入站方向,vkey 落在 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key`、`api-key` 任一个头里都能认出来,所以客户端的鉴权方式和路由的鉴权方式不需要一致。
+
 因为 vkey 决定路由,"这个 agent 到底打哪个上游"就变成了 keysink 侧的决策,而不是客户端侧的。同一个端口上的两个 agent,可以打两个不同的供应商,也可以打同一个供应商但用不同的真 key。
 
 ## 日常命令
@@ -79,7 +94,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 ```
 keysink init                     # 脚本/无终端环境的首次入口(交互终端里 serve 会自动初始化)
 keysink route add|ls|show|rotate|update|rm|enable|disable
-keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N]
+keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N] [--accept-degraded]
 keysink status | doctor
 keysink export --output FILE      # 需要主密码;剥离所有 key 值
 keysink rekey [--yes]             # 轮换保险库主密钥
@@ -92,11 +107,27 @@ keysink deploy | uninstall        # 系统安装 / 对称卸载
 - `--header 'K:V'` 注入静态 header(可重复);`--proxy URL|direct` 设单路由上游代理,默认跟随 `HTTP(S)_PROXY`
 - `--retry-on-status CODE` 按路由覆盖可重试的状态码集合(400..=599)
 
+常用的几个动作:
+
+```bash
+keysink route update claude --base-url https://api.openai.com     # 换上游
+printf %s "$NEW_KEY" | keysink route update claude --route-key -   # 换真 key
+keysink route rotate claude                                       # 换 vkey,旧的立即失效
+```
+
+`status` 打印保险库摘要(位置、schema、路由数)。`doctor` 跑完整性检查——属主、权限、key 能否解析、store 能否解密、备份能否解密——出问题先跑它。
+
+要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.1.5","uptime_secs":…,"routes":2}`。
+
+`--accept-degraded` 是保险库坏了时的逃生口:主 store 解密失败时,允许网关改用 `vault.age.bak` 启动。那份备份落后一次写入,所以这段时间里被轮换或删除的 vkey 会重新生效——它只是让 agent 继续跑,不是可以长待的状态。`doctor` 会告诉你哪个文件坏了、怎么恢复。
+
 ## 保险库在哪
 
 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`;系统安装:`/var/lib/keysink`)。用 `--home` 或 `KEYSINK_VAULT_HOME` 换位置。
 
 主密码只用于加密和恢复 `export` 备份——服务、加 key、轮换、停用都不问主密码,所以忘了密码不会卡住守护进程重启。
+
+`vault.key` 是明文的 age identity 文件(`0600`),并不由主密码保护:保险库的防护是文件权限加独立 UID。服务态可以把 identity 放到保险库目录外面——`KEYSINK_MASTER_KEY`(直接给 age identity)或 `KEYSINK_MASTER_KEY_FILE`(给一个文件路径),systemd 的 `LoadCredential` 要的就是这种。
 
 ## Linux 系统服务
 
@@ -135,9 +166,9 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 客户端发来的 `authorization`、`x-api-key`、`x-goog-api-key`、`api-key`、`anthropic-api-key`、`openai-api-key` 都会在转发前丢弃。
 
-`--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。
+`--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。保留 5 份轮转日志(每份 10 MB),被拒的请求按指纹每秒只放 1 个进来——所以未鉴权的请求洪水没法把取证记录冲掉。
 
-`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。
+`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉。
 
 ## 它不是什么
 
@@ -157,7 +188,11 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 **本地代理岂不是单点故障?**
 
-是个本地进程,所以是的——它挂了请求就失败。`keysink status` 会报当前监听地址并探测可达性,systemd 下 unit 失败会自动重启。保险库是普通文件,进程崩了不会丢 key。
+是个本地进程,所以是的——它挂了请求就失败。`GET /__keysink/health` 能看出它活着没有、是不是在用落后一份的备份;systemd 下 unit 失败会自动重启。保险库是普通文件,进程崩了不会丢 key。
+
+**agent 报 401,是 vkey 错还是真 key 错?**
+
+keysink 自己回的 401,body 是 keysink 的 JSON,响应头带 `x-keysink-request-id`,例如 `{"error":{"type":"authentication_error","message":"virtual key is invalid or has been rotated …"}}`。真 key 错则是上游回的——状态码一样,但 body 是供应商自己的错误格式,说明请求已经转发出去了。
 
 ## 开发
 

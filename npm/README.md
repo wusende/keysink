@@ -15,7 +15,7 @@ keysink/
 
 ## 为什么是这个形态
 
-一开始按 esbuild 那套做了 6 个包（主包 + 5 个平台包），每个用户只下 3.4MB。但实际发布时：
+一开始按 esbuild 那套做了 6 个包（主包 + 5 个平台包），用户装一次要下两个包、约 7MB（主包 + 自己平台那一个）。但实际发布时：
 
 1. npm 把这个新账号的新包转成了 `0.0.0-stage` 占位审核态，5 个包都要人工批；
 2. `keysink-win32-x64` 这个**包名**被反垃圾规则直接 403（同类案例 `keelrun-cli-win32-x64`，结论是必须提工单，重试无效）。
@@ -28,7 +28,7 @@ npm registry 有 npmmirror 等完整镜像，GitHub Releases 没有，国内用�
 | 指标 | 数值 |
 |---|---|
 | tarball | ~16.6 MB |
-| 解压后 | ~37 MB |
+| 解压后 | ~39 MB（registry 的 `unpackedSize`，2026-11 实测） |
 | 安装时网络 | 只需 npm registry（可走镜像） |
 | postinstall | 无 |
 | `--ignore-scripts` | 不受影响 |
@@ -41,7 +41,8 @@ npm registry 有 npmmirror 等完整镜像，GitHub Releases 没有，国内用�
 2. **首次手工发布**：
 
    ```bash
-   eval "$(clashctl env)"              # 只有本机需要，CI 不需要
+   # 本机需要代理拉 GitHub 资产；CI 不需要。用你自己的代理地址
+   export HTTPS_PROXY=http://127.0.0.1:7890
    bash scripts/npm-pack.sh            # 从 GitHub Releases 拉 5 个资产并校验 sha256
    bash scripts/npm-publish.sh --dry-run
    bash scripts/npm-publish.sh --otp 123456
@@ -67,7 +68,7 @@ npm registry 有 npmmirror 等完整镜像，GitHub Releases 没有，国内用�
 
    ```bash
    for p in keysink-linux-x64 keysink-linux-arm64 keysink-darwin-x64 keysink-darwin-arm64; do
-     npm unpublish "$p" --force
+     npm unpublish "$p" --force || true   # 没发成功过的包会报 404，忽略
    done
    ```
 
