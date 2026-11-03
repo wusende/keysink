@@ -21,9 +21,9 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
 **一个真 key,拆成多个可独立吊销的虚拟 key。** 每个 agent 一条路由:同一个上游,各自的 vkey,各管各的。吊销或停用其中一个,其余照常。
 
-**重试不会重复扣费。** `429`/`503`/`504` 重试两次,但**网络层失败的 POST 绝不重放**,SSE 一旦开始流式输出就不再重试。很多简易代理在这里做错,一次重放就是一次重复计费。
+**重试不会重复扣费。** `429`/`503`/`504` 重试两次,但**网络层失败的 POST 绝不重放**,SSE 一旦开始流式输出就不再重试。一次重放就是账单上多一笔。
 
-最后才是名字里那件事:agent 被 prompt 注入后能泄露它环境里的一切,但真 key 从来没在它环境里。
+名字就是这件事:被 prompt 注入的 agent 能把环境里的东西全吐出来,而真 key 从来不在里面。
 
 ## 快速开始
 
@@ -77,7 +77,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
    Claude Code:`settings.json` 里 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`。其它客户端:provider 的 `base_url` + `apiKey`。
 
-   vkey 走的就是客户端本来就在发的那个头——`Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `api-key`——所以对多数客户端来说,这只是一次 base URL 改动,客户端代码、SDK、鉴权流程全都不用动。
+   vkey 走的就是客户端本来就在发的那个头——`Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `api-key`——所以对多数客户端来说,这只是一次 base URL 改动。
 
 ## 路由是怎么走的
 
@@ -87,7 +87,7 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
 `--auth` 只管 keysink → 上游这一段。入站方向,vkey 落在 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key`、`api-key` 任一个头里都能认出来,所以客户端的鉴权方式和路由的鉴权方式不需要一致。
 
-因为 vkey 决定路由,"这个 agent 到底打哪个上游"就变成了 keysink 侧的决策,而不是客户端侧的。同一个端口上的两个 agent,可以打两个不同的供应商,也可以打同一个供应商但用不同的真 key。
+同一个端口上的两个 agent,可以打两个不同的供应商,也可以打同一个供应商但用不同的真 key,彼此都不用知道。
 
 ## 日常命令
 
@@ -182,9 +182,7 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 **为什么保险库不放在当前目录?**
 
-- **一个用户一个保险库,不是一个目录一个。** 网关作为守护进程跑,CLI 从任何地方调用;CWD 相对路径意味着每个目录一个保险库,路由会"凭空消失",热重载也会坏掉。确实想换位置就用 `--home` / `KEYSINK_VAULT_HOME`。
-- **加固措施需要它自己掌控的目录。** `0700`/`0600`、`O_NOFOLLOW`、属主校验只有在一个专用目录里才有意义。CWD 权限随意,而且很可能是个 git 仓库或同步盘,`vault.key` + `vault.age` 会漏出去。
-- **这是操作系统期望应用数据待的地方**——XDG `$XDG_DATA_HOME`、`%LOCALAPPDATA%`、服务的 `/var/lib`。和 `~/.ssh`、`~/.gnupg`、`/var/lib/docker` 一个约定。
+一个用户一个保险库,不是一个目录一个:网关作为守护进程跑,CLI 从任何地方调用,CWD 相对路径会让每个目录一个库、路由凭空消失、热重载坏掉。而且 `0700`/`0600`、`O_NOFOLLOW`、属主校验只有在专用目录里才有意义——CWD 权限随意,很可能还是 git 仓库或同步盘,`vault.key` + `vault.age` 会漏出去。这也是系统期望应用数据待的地方(XDG `$XDG_DATA_HOME`、`%LOCALAPPDATA%`、服务的 `/var/lib`,和 `~/.ssh`、`/var/lib/docker` 一个约定)。确实想换位置就用 `--home` / `KEYSINK_VAULT_HOME`。
 
 **本地代理岂不是单点故障?**
 

@@ -33,10 +33,10 @@ the others keep working.
 
 **Retries that don't double-bill.** `429`/`503`/`504` are retried twice, but a
 POST whose network call failed is never replayed, and nothing is retried once SSE
-streaming has started. Most naive proxies get this wrong and you pay for it twice.
+streaming has started. A replayed POST is a second charge on your bill.
 
-And the part it's named after: an agent that gets prompt-injected can leak
-everything in its environment — but the real key was never in there.
+And the name: a prompt-injected agent can dump everything in its environment, and
+the real key was never in it.
 
 ## Quick start
 
@@ -100,8 +100,7 @@ everything in its environment — but the real key was never in there.
 
    The vkey rides in whatever header your client already sends — `Authorization:
    Bearer`, `x-api-key`, `x-goog-api-key` or `api-key` — so for most clients this
-   is a base-URL change and nothing else. Your existing client code, SDK and auth
-   flow stay untouched.
+   is a base-URL change and nothing else.
 
 ## How routing works
 
@@ -120,9 +119,8 @@ as they arrive instead of being buffered into a whole response.
 of `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `api-key`, so the
 client's auth style and the route's never have to match.
 
-Because the vkey picks the route, "which upstream does this agent talk to" is a
-keysink-side decision, not a client-side one. Two agents on the same port can
-talk to two different providers, or to the same provider with different keys.
+Two agents on the same port can talk to two different providers, or to the same
+provider with different keys, without either of them knowing.
 
 ## Everyday commands
 
@@ -235,11 +233,11 @@ of unauthenticated requests cannot rotate the forensic trail away.
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.
 
-Everything a request touches is bounded by default — body size, in-flight
-requests, connections, time — so a hung upstream or a misbehaving agent can't
-take the gateway down. Idle connections are bounded too: http1 heads must
-finish within 30s, and h2 connections that stop answering keep-alive PINGs
-are closed.
+Nothing is unbounded: 32 MB bodies (`--body-limit-mb`), 64 in-flight requests
+(`--max-concurrent`), a capped connection count, per-phase timeouts, and 30s to
+finish reading http1 request heads. An h2 connection that stops answering
+keep-alive PINGs is closed. A hung upstream or a misbehaving agent can't take
+the gateway down.
 
 ## What this is not
 
@@ -255,17 +253,15 @@ are closed.
 
 **Why isn't the vault in the current directory?**
 
-- **One vault per user, not per directory.** The gateway runs as a daemon while
-  the CLI is invoked from anywhere; a CWD-relative vault would mean a different
-  vault per directory, routes would "vanish", and hot reload would break. Use
-  `--home` / `KEYSINK_VAULT_HOME` when you want another location.
-- **The hardening needs a directory it controls.** `0700`/`0600`,
-  `O_NOFOLLOW` and owner checks only mean something in a dedicated directory.
-  CWD has arbitrary permissions and may well be a git repo or a synced folder
-  where `vault.key` + `vault.age` leak.
-- **It's where the OS expects app data** — XDG `$XDG_DATA_HOME`,
-  `%LOCALAPPDATA%`, `/var/lib` for services. Same convention as `~/.ssh`,
-  `~/.gnupg` or `/var/lib/docker`.
+One vault per user, not per directory. The gateway runs as a daemon while the CLI
+is invoked from anywhere, so a CWD-relative vault would mean a different vault
+per directory, routes that "vanish", and broken hot reload. The hardening needs
+a directory it controls too: `0700`/`0600`, `O_NOFOLLOW` and owner checks only
+mean something in a dedicated directory, while a CWD may well be a git repo or a
+synced folder where `vault.key` + `vault.age` leak. It is also where the OS
+expects app data (XDG `$XDG_DATA_HOME`, `%LOCALAPPDATA%`, `/var/lib` for
+services — same convention as `~/.ssh` or `/var/lib/docker`). Use `--home` /
+`KEYSINK_VAULT_HOME` when you want another location.
 
 **Is a local proxy a single point of failure?**
 
