@@ -1885,6 +1885,11 @@ async fn dot_segment_paths_and_proxy_methods_are_refused_before_the_upstream() {
         assert_eq!(status, 404, "dot-segment path {path:?} must be 404: {body}");
     }
 
+    // Asterisk-form targets are refused as the client error they are, instead
+    // of surfacing as a 500 configuration_error from the URL builder.
+    let (status, body) = raw_request(gw, &head("OPTIONS * HTTP/1.1")).await;
+    assert_eq!(status, 400, "asterisk-form must be 400: {body}");
+
     // And a plain in-prefix request still forwards normally.
     let (status, _) = raw_request(gw, &head("GET /v1/models HTTP/1.1")).await;
     assert_eq!(status, 200);

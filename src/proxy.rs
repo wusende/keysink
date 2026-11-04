@@ -884,6 +884,19 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         return response;
     }
 
+    if !path.is_empty() && !path.starts_with('/') {
+        // Asterisk-form ("OPTIONS *") and every other non-origin-form target:
+        // refused as the client error it is, instead of falling through to the
+        // URL builder and surfacing as a 500 configuration_error.
+        return deny(
+            "-",
+            None,
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "request target must be origin-form (a path starting with /)",
+        );
+    }
+
     if path_has_dot_segment(&path) {
         // The downstream URL parser removes dot segments while resolving the
         // final upstream URL, so forwarding one would let `/../x` or
@@ -1370,7 +1383,17 @@ async fn forward_with_retry(
 }
 
 pub(crate) fn extract_vkey(headers: &HeaderMap) -> Option<String> {
-    for name in ["authorization", "x-api-key", "x-goog-api-key", "api-key"] {
+    // Same set forward_headers strips: a client credential arriving under any
+    // of these names is either the vkey (recognized) or dropped at forward
+    // time — there is no name the gateway strips outbound but ignores inbound.
+    for name in [
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "api-key",
+        "anthropic-api-key",
+        "openai-api-key",
+    ] {
         let Some(value) = headers.get(name) else {
             continue;
         };
@@ -2400,6 +2423,13 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
         assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()));
+
+        // The rest of the outbound strip list is inbound-recognized too.
+        for name in ["anthropic-api-key", "openai-api-key"] {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(&token).unwrap());
+            assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()), "{name}");
+        }
 
         let mut h = HeaderMap::new();
         h.insert(

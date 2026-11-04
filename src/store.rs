@@ -142,7 +142,12 @@ pub fn load_identity(paths: &Paths) -> Result<age::x25519::Identity> {
     let raw = if let Ok(inline) = std::env::var("KEYSINK_MASTER_KEY") {
         inline
     } else if let Ok(file) = std::env::var("KEYSINK_MASTER_KEY_FILE") {
-        String::from_utf8(util::read_no_follow(Path::new(&file))?)
+        let key_file = Path::new(&file);
+        // Same standard as the default vault.key path: refuse symlinks and
+        // group/other-readable identities. 0400/0600 pass, so systemd
+        // LoadCredential credentials qualify.
+        util::ensure_private_file(key_file, "KEYSINK_MASTER_KEY_FILE")?;
+        String::from_utf8(util::read_no_follow(key_file)?)
             .map_err(|_| Error::msg("KEYSINK_MASTER_KEY_FILE is not UTF-8"))?
     } else {
         let key_path = paths.master_key();
@@ -354,6 +359,17 @@ pub(crate) fn encrypt_to(
 }
 
 pub(crate) fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<Vec<u8>> {
+    // A replaced vault.age already implies a same-UID compromise (out of
+    // scope), but age's reader grows the plaintext without bound: cap the
+    // ciphertext so a wedged hot reload cannot turn one bogus file into an
+    // OOM. Real vaults are a few KB; 64 MiB leaves generous headroom.
+    const MAX_CIPHERTEXT: usize = 64 * 1024 * 1024;
+    if ciphertext.len() > MAX_CIPHERTEXT {
+        return Err(Error::msg(format!(
+            "vault file exceeds the {} MiB decrypt limit; refusing to read it",
+            MAX_CIPHERTEXT / (1024 * 1024)
+        )));
+    }
     let decryptor = age::Decryptor::new(ciphertext)?;
     if decryptor.is_scrypt() {
         return Err(Error::msg(
@@ -540,6 +556,50 @@ mod tests {
             err.contains("init"),
             "error should hint at running init first: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn master_key_file_env_is_permission_checked_like_the_default_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k");
+        std::fs::write(&key, "not-a-real-identity-but-parses-later\n").unwrap();
+        std::fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // No other test reads this variable, so setting it here is race-free.
+        // SAFETY: single-threaded test process-wide usage of this variable.
+        unsafe { std::env::set_var("KEYSINK_MASTER_KEY_FILE", &key) };
+        let paths = Paths::vault(dir.path().join("v"));
+        let err = load_identity(&paths)
+            .err()
+            .expect("0644 identity must be refused")
+            .to_string();
+        assert!(
+            err.contains("permissions too wide"),
+            "0644 identity must be refused like the default path: {err}"
+        );
+
+        // 0600 passes the checks and proceeds to the (failing) identity parse.
+        std::fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = load_identity(&paths)
+            .err()
+            .expect("a bogus identity must still fail to parse")
+            .to_string();
+        assert!(
+            !err.contains("permissions"),
+            "0600 identity must get past the file checks: {err}"
+        );
+        // SAFETY: paired with the set_var above; see the note there.
+        unsafe { std::env::remove_var("KEYSINK_MASTER_KEY_FILE") };
+    }
+
+    #[test]
+    fn decrypt_refuses_oversized_ciphertext() {
+        let identity = age::x25519::Identity::generate();
+        let blob = vec![0u8; 64 * 1024 * 1024 + 1];
+        let err = decrypt(&blob, &identity).unwrap_err().to_string();
+        assert!(err.contains("decrypt limit"), "{err}");
     }
 
     #[test]

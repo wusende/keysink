@@ -151,6 +151,18 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 pub fn create_private_dir_all(path: &Path) -> Result<()> {
+    // Refuse a pre-existing symlink: create_dir_all resolves through it, and
+    // the 0700 chmod below would land on the symlink's target. Dirs this call
+    // creates are fine; the final component is re-checked by
+    // ensure_private_dir either way.
+    if let Ok(md) = fs::symlink_metadata(path)
+        && md.file_type().is_symlink()
+    {
+        return Err(Error::msg(format!(
+            "directory is a symlink, refusing to use it: {}",
+            path.display()
+        )));
+    }
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -251,7 +263,10 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| Error::msg(format!("invalid path: {}", path.display())))?;
-    let mut suffix = [0u8; 4];
+    // 8 random bytes, not 4: the temp name must be unguessable enough that a
+    // hostile local process cannot pre-occupy the whole name space and make
+    // every vault write fail with create_new collisions.
+    let mut suffix = [0u8; 8];
     rand::rng().fill_bytes(&mut suffix);
     let tmp = dir.join(format!(".{file_name}.tmp.{}", hex(&suffix)));
 
@@ -575,6 +590,24 @@ mod tests {
         let path = dir.path().join("vault.age");
         fs::write(&path, b"x").unwrap();
         assert!(owner_matches_dir(&path).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_all_refuses_a_preexisting_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_private_dir_all(&link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        // The symlinked target must be untouched.
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the chmod must not have landed on the target"
+        );
     }
 
     #[test]
