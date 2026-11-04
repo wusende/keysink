@@ -2,7 +2,9 @@ use crate::error::{Error, Result};
 use crate::model::{STORE_VERSION, Store};
 use crate::util;
 use age::secrecy::ExposeSecret;
-use fs2::FileExt;
+// The vault's read-mutate-write transaction holds a std::fs::File::lock()
+// (stable since 1.89): a blocking exclusive flock on unix, LockFileEx on
+// windows — the same semantics the fs2/fs4 crates provided, with no dep.
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -411,7 +413,7 @@ impl LockGuard {
         // When root first creates the lock file it ends up root:root and the service user can no longer open it;
         // follow the directory's owner here too, so the next lock doesn't lock itself out.
         util::inherit_dir_owner(&lock_path, &lock_path)?;
-        file.lock_exclusive()?;
+        file.lock()?;
         Ok(Self { file })
     }
 }

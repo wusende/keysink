@@ -23,7 +23,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, ReadBuf};
 use tracing::Instrument;
-use zeroize::Zeroizing;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -818,9 +817,14 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
 async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> Response {
     let started = Instant::now();
     let (parts, body) = req.into_parts();
-    let method = parts.method.clone();
-    let path = parts.uri.path().to_string();
-    let query = parts.uri.query().map(str::to_string);
+    // Borrowed views into `parts` (the header map moves out, method and URI
+    // stay borrowed): a rejected request — the common flood case — allocates
+    // nothing at all, and an accepted one clones the method only when it
+    // actually forwards. The method/URI borrows live as long as `parts`, which
+    // outlives every use below.
+    let method = &parts.method;
+    let path = parts.uri.path();
+    let query = parts.uri.query();
     let in_headers = parts.headers;
 
     // Rejected requests are audited too (route `-` means no route matched).
@@ -835,8 +839,8 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             &rid,
             route,
             hash,
-            &method,
-            &path,
+            method,
+            path,
             status,
             started,
         );
@@ -897,7 +901,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         );
     }
 
-    if path_has_dot_segment(&path) {
+    if path_has_dot_segment(path) {
         // The downstream URL parser removes dot segments while resolving the
         // final upstream URL, so forwarding one would let `/../x` or
         // `/v1/%2e%2e/x` escape the route's base_url prefix and reach
@@ -948,7 +952,11 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         );
     }
 
-    let Some(value) = &route.inline_key else {
+    // Borrowed straight from the snapshot's route table (held via `resolved`
+    // for the rest of the handler): the request path makes no copy of the raw
+    // key — the forwarded header/URL values below are the only copies, and
+    // they are what goes on the wire anyway.
+    let Some(key) = route.inline_key.as_deref() else {
         // validate guarantees non-empty; reaching here means the snapshot came from old data that never passed validate.
         tracing::error!(route = route_name, "route is missing route-only key");
         return deny(
@@ -959,7 +967,6 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
             "incomplete route configuration",
         );
     };
-    let key = Zeroizing::new(value.clone());
 
     if let Some(len) = in_headers
         .get(header::CONTENT_LENGTH)
@@ -996,8 +1003,8 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
                 &rid,
                 route_name,
                 Some(&hash),
-                &method,
-                &path,
+                method,
+                path,
                 StatusCode::SERVICE_UNAVAILABLE,
                 started,
             );
@@ -1061,7 +1068,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
 
     let is_stream = is_stream_request(&body);
 
-    let fwd_headers = match forward_headers(&in_headers, route, key.as_str(), is_stream) {
+    let fwd_headers = match forward_headers(&in_headers, route, key, is_stream) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, route = route_name, "failed to build upstream headers");
@@ -1075,13 +1082,7 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         }
     };
 
-    let url = match build_upstream_url(
-        &route.base_url,
-        &path,
-        query.as_deref(),
-        &route.auth,
-        key.as_str(),
-    ) {
+    let url = match build_upstream_url(&route.base_url, path, query, &route.auth, key) {
         Ok(u) => u,
         Err(e) => {
             tracing::error!(error = %e, route = route_name, "failed to build upstream URL");
@@ -1403,7 +1404,12 @@ pub(crate) fn extract_vkey(headers: &HeaderMap) -> Option<String> {
         let text = text.trim();
         let text = if name == "authorization" {
             match text.get(..7) {
-                Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &text[7..],
+                // RFC 7235 wants exactly one SP after the scheme, but clients
+                // have been seen sending more ("Bearer  ks_…"); any run of
+                // whitespace after the first is stripped. The scheme must
+                // still be separated by at least one space, so a glued
+                // `Bearersk_…` stays unrecognized.
+                Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => text[7..].trim_start(),
                 _ => text,
             }
         } else {
@@ -1554,8 +1560,7 @@ pub(crate) fn path_has_dot_segment(path: &str) -> bool {
             while i < bytes.len() {
                 if bytes[i] == b'%'
                     && let Some(hex) = bytes.get(i + 1..i + 3)
-                    && let Ok(byte) =
-                        u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
+                    && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
                 {
                     decoded.push(byte);
                     i += 3;
@@ -2419,6 +2424,22 @@ mod tests {
             HeaderValue::from_str(&format!("BEARER {token}")).unwrap(),
         );
         assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()));
+
+        // Extra spaces between the scheme and the token are tolerated
+        // (some HTTP clients send more than RFC 7235's single SP).
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer   {token}")).unwrap(),
+        );
+        assert_eq!(extract_vkey(&h).as_deref(), Some(token.as_str()));
+        // …but a scheme glued to the token is not the Bearer scheme.
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer{token}")).unwrap(),
+        );
+        assert_eq!(extract_vkey(&h).as_deref(), None);
 
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_str(&token).unwrap());

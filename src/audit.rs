@@ -1,4 +1,5 @@
 use crate::util;
+use arc_swap::ArcSwapOption;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -49,7 +50,16 @@ const WRITE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// - the request path only does try_send, never a synchronous open/write/chmod on a tokio worker;
 /// - a single writer naturally eliminates the race where two concurrent requests trigger the rotation rename at the same time.
 pub struct Audit {
-    writer: Mutex<Option<Writer>>,
+    /// Startup-fixed sender; `close()` swaps it out. ArcSwap instead of the
+    /// old Mutex<Option<Writer>> so the request path (`is_enabled` + `record`)
+    /// is two lock-free loads with no lock and no per-record sender clone; an
+    /// in-flight record keeps the channel alive past `close()` through its own
+    /// Arc. SyncSender is Sync (T: Send), so the ArcSwap needs no wrapper.
+    writer: ArcSwapOption<SyncSender<AuditEntry>>,
+    /// Writer thread handle, parked for `close()`: the thread exits only when
+    /// the channel disconnects, so the handle cannot live inside the swapped
+    /// Arc next to the sender it must outlive.
+    handle: Mutex<Option<JoinHandle<()>>>,
     /// Rejection-side admission state (see record_reject): bounded, checked
     /// on the calling thread before the queue.
     rejects: Mutex<RejectGate>,
@@ -91,11 +101,6 @@ impl Default for RejectGate {
     }
 }
 
-struct Writer {
-    tx: SyncSender<AuditEntry>,
-    handle: JoinHandle<()>,
-}
-
 #[derive(Serialize)]
 pub struct AuditEntry {
     pub ts: String,
@@ -132,7 +137,8 @@ fn reject_chain_path(path: &Path) -> PathBuf {
 impl Audit {
     pub fn disabled() -> Self {
         Self {
-            writer: Mutex::new(None),
+            writer: ArcSwapOption::empty(),
+            handle: Mutex::new(None),
             rejects: Mutex::new(RejectGate::default()),
             state: Arc::new(AuditState {
                 alive: AtomicBool::new(false),
@@ -147,14 +153,10 @@ impl Audit {
     /// (--audit-log or not), so the answer cannot change mid-request; callers
     /// skip `AuditEntry` construction entirely when this is false — its
     /// RFC3339 local-time format plus several String allocations are pure
-    /// waste on the default audit-off path. Same lock (and same early-out)
-    /// that `record` would take anyway.
+    /// waste on the default audit-off path.
     #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.writer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.writer.load().is_some()
     }
 
     /// Whether audit is doing what it says: disabled counts as healthy, an
@@ -193,7 +195,8 @@ impl Audit {
             .spawn(move || writer_loop(path, reject_path, rx, thread_state))
         {
             Ok(handle) => Self {
-                writer: Mutex::new(Some(Writer { tx, handle })),
+                writer: ArcSwapOption::from_pointee(tx),
+                handle: Mutex::new(Some(handle)),
                 rejects: Mutex::new(RejectGate::default()),
                 state,
             },
@@ -206,11 +209,9 @@ impl Audit {
 
     /// Records only route/fingerprint/status/latency/byte counts; never headers, bodies, or query.
     pub fn record(&self, entry: AuditEntry) {
-        let tx = {
-            let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().map(|w| w.tx.clone())
-        };
-        let Some(tx) = tx else {
+        // One lock-free load; the Arc keeps the channel open until this record
+        // is queued, even if close() swaps the writer out in between.
+        let Some(tx) = self.writer.load_full() else {
             return;
         };
         match tx.try_send(entry) {
@@ -299,10 +300,14 @@ impl Audit {
     /// On shutdown, drain the queue and wait for the writer thread to exit so tail audit lines are not lost.
     pub fn close(&self) {
         self.state.closed.store(true, Ordering::Relaxed);
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(w) = guard.take() {
-            drop(w.tx);
-            let _ = w.handle.join();
+        // Dropping the swapped-out sender — together with any in-flight
+        // record's Arc — disconnects the channel; the writer thread then
+        // drains the queue and exits, and the join below waits for exactly
+        // that. Records that load the sender after the swap see None and
+        // return silently.
+        drop(self.writer.swap(None));
+        if let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
         }
     }
 }
@@ -324,7 +329,12 @@ struct WriterLogs {
     reject: OpenLog,
 }
 
-fn writer_loop(path: PathBuf, reject_path: PathBuf, rx: Receiver<AuditEntry>, state: Arc<AuditState>) {
+fn writer_loop(
+    path: PathBuf,
+    reject_path: PathBuf,
+    rx: Receiver<AuditEntry>,
+    state: Arc<AuditState>,
+) {
     let _alive = AliveGuard(state.clone());
     // The handles stay open, buffered: lines batch in a BufWriter instead of
     // costing one write syscall each; the buffer flushes at capacity, when
@@ -729,8 +739,7 @@ mod tests {
             "same-fingerprint repeat within the interval must be suppressed"
         );
         assert_eq!(
-            count,
-            REJECT_GLOBAL_MAX,
+            count, REJECT_GLOBAL_MAX,
             "gate admits the window cap, all on the reject chain: {count}"
         );
 
@@ -753,7 +762,11 @@ mod tests {
         audit.close();
 
         let main_text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(main_text.lines().count(), 1, "main chain holds only real traffic");
+        assert_eq!(
+            main_text.lines().count(),
+            1,
+            "main chain holds only real traffic"
+        );
         assert!(
             !main_text.contains("rejected"),
             "main-chain line format must stay free of the reject marker: {main_text}"
@@ -779,7 +792,9 @@ mod tests {
         let rej = reject_chain_path(&path);
         std::fs::write(&rej, vec![b'x'; MAX_AUDIT_BYTES as usize + 1]).unwrap();
         let audit = Audit::new(path.clone());
-        audit.record(AuditEntry::new("M1", "claude", "fpOK", "GET", "/v1/x", 0, false));
+        audit.record(AuditEntry::new(
+            "M1", "claude", "fpOK", "GET", "/v1/x", 0, false,
+        ));
         for i in 0..(REJECT_GLOBAL_MAX + 5) {
             audit.record_reject(AuditEntry::new(
                 format!("R{i}"),

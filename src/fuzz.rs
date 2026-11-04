@@ -318,7 +318,7 @@ fn fuzz_extract_vkey_shape() {
         let token = vkey::generate();
         let scheme = match rng.random_range(0..5) {
             0 => format!("Bearer {token}"),
-            1 => format!("bearer   {token}"), // extra spaces: only the 7-byte prefix is stripped
+            1 => format!("bearer   {token}"), // extra spaces between scheme and token are tolerated
             2 => token.clone(),
             3 => format!("BEARER {token} extra"),
             _ => weird_string(rng),

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -39,6 +39,34 @@ fn local_offset(at: OffsetDateTime) -> UtcOffset {
     UtcOffset::local_offset_at(at).unwrap_or(UtcOffset::UTC)
 }
 
+/// Reuse window for the hot path's cached offset.
+const OFFSET_CACHE_SECS: u64 = 1;
+
+/// Cached variant of [`local_offset`] for the hot path — every audit row and
+/// every log line renders a timestamp, and `UtcOffset::local_offset_at`
+/// re-reads `TZ` / `/etc/localtime` on every call (the time crate keeps no
+/// cache), which at audit-on request rates is a zone-file parse per record.
+/// The system offset only changes at DST switches and tz updates, so the
+/// resolved value is reused for one second: at most one second of rows around
+/// a switch carry the pre-switch offset, and since the offset is part of the
+/// rendered string every instant stays unambiguous either way. The cold path
+/// ([`ts`], historical display) keeps per-instant resolution.
+fn cached_local_offset(at: OffsetDateTime) -> UtcOffset {
+    static OFFSET_SECS: AtomicI32 = AtomicI32::new(0);
+    static VALID_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+    let now = at.unix_timestamp().max(0) as u64;
+    if now < VALID_UNTIL.load(Ordering::Relaxed) {
+        return UtcOffset::from_whole_seconds(OFFSET_SECS.load(Ordering::Relaxed))
+            .unwrap_or(UtcOffset::UTC);
+    }
+    let offset = local_offset(at);
+    // Two racers may both refresh the same window; the value is identical.
+    OFFSET_SECS.store(offset.whole_seconds(), Ordering::Relaxed);
+    VALID_UNTIL.store(now.saturating_add(OFFSET_CACHE_SECS), Ordering::Relaxed);
+    offset
+}
+
 fn ts_at(at: OffsetDateTime, offset: UtcOffset) -> String {
     at.to_offset(offset)
         .format(&Rfc3339)
@@ -55,9 +83,10 @@ pub fn ts(secs: u64) -> String {
 }
 
 /// UTC fallback when the system zone cannot be resolved (see [`local_offset`]).
+/// Hot path (audit rows, log lines): uses [`cached_local_offset`].
 pub fn now_ts() -> String {
     let now = OffsetDateTime::now_utc();
-    now.to_offset(local_offset(now))
+    now.to_offset(cached_local_offset(now))
         .format(&Rfc3339)
         .unwrap_or_else(|_| now_secs().to_string())
 }
