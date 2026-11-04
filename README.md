@@ -115,9 +115,17 @@ never smuggle its own credentials through. Everything else — method, path, bod
 preserved with the auth parameter managed by the route. SSE chunks are forwarded
 as they arrive instead of being buffered into a whole response.
 
+Two edge refusals keep that passthrough honest: a request path containing dot
+segments (`..`, `%2e%2e`, or their `\`-separated forms) gets a 404 — the
+downstream URL parser collapses those, and forwarding one would let a request
+escape the route's base_url prefix on the upstream host. `CONNECT`, `TRACE` and
+`TRACK` get a 405 — a TRACE the upstream implements would echo the forwarded
+headers, real key included, back to the caller.
+
 `--auth` describes keysink → upstream only. Inbound, the vkey is accepted in any
-of `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `api-key`, so the
-client's auth style and the route's never have to match.
+of `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`, `api-key`,
+`anthropic-api-key` or `openai-api-key` — the same names stripped before
+forwarding — so the client's auth style and the route's never have to match.
 
 Two agents on the same port can talk to two different providers, or to the same
 provider with different keys, without either of them knowing.
@@ -139,8 +147,12 @@ Route options worth knowing:
 - `--auth bearer|x-api-key|header|basic|query|none` — OpenAI is Bearer, Claude
   `x-api-key`, Gemini `x-goog-api-key`. For anything else use `--auth header`
   plus `--auth-header NAME` and optional `--auth-prefix 'Bearer '`
-- `--header 'K:V'` injects static headers (repeatable); `--proxy URL|direct` sets
-  a per-route upstream proxy, defaulting to `HTTP(S)_PROXY`
+- `--header 'K:V'` injects static headers (repeatable) — a fallback, not an
+  override: if the client sends the same header, the client's value wins.
+  Only the auth header names are protected (they cannot be set statically at
+  all); treat this as route defaults, never as enforcement;
+  `--proxy URL|direct` sets a per-route upstream proxy, defaulting to
+  `HTTP(S)_PROXY`
 - `--retry-on-status CODE` overrides the retryable set per route (400..=599)
 
 Common moves:
@@ -236,8 +248,11 @@ machine-level isolation stays your job (tight sudo, separate UID).
 
 `--audit-log` records route, vkey fingerprint, status and latency — never
 headers, body or query. Off by default. Five rotated generations (10 MB each)
-are kept, and rejected requests are admitted at 1/s per fingerprint — a flood
-of unauthenticated requests cannot rotate the forensic trail away.
+are kept for real traffic. Rejected requests are throttled (1/s per
+fingerprint, 100/s globally) and written to their own rotation chain
+(`<audit-file>.rej`, another 5 × 10 MB) — a flood of unauthenticated requests
+can only ever rotate its own trail away, never the forensic record of real
+traffic.
 
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.

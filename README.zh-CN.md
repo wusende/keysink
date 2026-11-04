@@ -85,7 +85,9 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 
 客户端发来的鉴权头会被剥掉、按路由重建,所以客户端没法夹带自己的凭证。其余原样透传:方法、路径、body、`Accept`、流式响应,query string 也保留(鉴权参数由路由管理)。SSE 按块转发,不会把整个响应缓冲起来。
 
-`--auth` 只管 keysink → 上游这一段。入站方向,vkey 落在 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key`、`api-key` 任一个头里都能认出来,所以客户端的鉴权方式和路由的鉴权方式不需要一致。
+透传有两条网关自己拦下的边界:请求路径里出现点段(`..`、`%2e%2e`,含 `\` 分隔的变体)一律 404——下游的 URL 解析器会把它们归一化掉,放行等于允许请求逃出 base_url 前缀、打上游主机任意路径;`CONNECT`/`TRACE`/`TRACK` 一律 405——上游若实现了 TRACE,回显的正是注入后的真 key。
+
+`--auth` 只管 keysink → 上游这一段。入站方向,vkey 落在 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key`、`api-key`、`anthropic-api-key`、`openai-api-key` 任一个头里都能认出来(与转发前剥离的名单一致),所以客户端的鉴权方式和路由的鉴权方式不需要一致。
 
 同一个端口上的两个 agent,可以打两个不同的供应商,也可以打同一个供应商但用不同的真 key,彼此都不用知道。
 
@@ -104,7 +106,7 @@ keysink deploy | uninstall        # 系统安装 / 对称卸载
 值得知道的路由选项:
 
 - `--auth bearer|x-api-key|header|basic|query|none`——OpenAI 是 Bearer,Claude 是 `x-api-key`,Gemini 是 `x-goog-api-key`。其它情况用 `--auth header` 配 `--auth-header 名字`,需要前缀再加 `--auth-prefix 'Bearer '`
-- `--header 'K:V'` 注入静态 header(可重复);`--proxy URL|direct` 设单路由上游代理,默认跟随 `HTTP(S)_PROXY`
+- `--header 'K:V'` 注入静态 header(可重复)——是兜底不是强制:客户端发了同名 header 时以客户端的值为准;auth 名单里的头是唯一例外(它们根本不允许配成静态 header)。把它当路由默认值用,别当强制策略用;`--proxy URL|direct` 设单路由上游代理,默认跟随 `HTTP(S)_PROXY`
 - `--retry-on-status CODE` 按路由覆盖可重试的状态码集合(400..=599)
 
 常用的几个动作:
@@ -166,7 +168,7 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 客户端发来的 `authorization`、`x-api-key`、`x-goog-api-key`、`api-key`、`anthropic-api-key`、`openai-api-key` 都会在转发前丢弃。
 
-`--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。保留 5 份轮转日志(每份 10 MB),被拒的请求按指纹每秒只放 1 个进来——所以未鉴权的请求洪水没法把取证记录冲掉。
+`--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。真实流量保留 5 份轮转日志(每份 10 MB)。被拒的请求单独写进自己的轮转链(`<审计文件>.rej`,同样 5 × 10 MB),并按指纹每秒 1 条、全局每秒 100 条节流——未鉴权的请求洪水最多逐出拒绝记录自己的历史,动不了真实流量的取证记录。
 
 `--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。非流式响应体既按单块也按整体设上界,所以一分钟吐一个字节的上游也没法永久占住连接。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉。
 

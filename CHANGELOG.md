@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+**Security**
+
+- Request paths containing dot segments are refused with a 404 instead of
+  forwarded. `build_upstream_url` concatenated base + path verbatim, and the
+  downstream URL parser (reqwest/url) then removes dot segments while
+  resolving the final URL — so `GET /../admin/x` against a route with
+  `base_url …/v1` reached `/admin/x` upstream, and `/v1/%2e%2e/x` escaped the
+  same way (the RFC 3986 double-dot definition includes the `%2e` variants;
+  the WHATWG parser additionally treats `\` as a path separator for http(s)).
+  A vkey's reach is now the route's base_url prefix, matching what the docs
+  always implied. Locked in by a fuzz invariant that parses the built URL the
+  way reqwest will and asserts the resolved path stays inside the base
+  prefix, plus unit tests for every collapsible dot-segment form
+- `CONNECT`/`TRACE`/`TRACK` are refused with a 405 (plus `Allow`). A TRACE the
+  upstream implements would echo the forwarded headers — the injected real
+  key included — back into the agent's view, the one channel that defeats the
+  "real key never reaches the agent" model; CONNECT was meaningless without
+  the already-refused Upgrade support
+- Rejection audit rows moved to their own rotation chain (`<audit-file>.rej`,
+  5 × 10 MB). The per-fingerprint throttle keys on the rejected token's
+  fingerprint, so a flood of *randomized* fake vkeys evaded it entirely and
+  could rotate away the whole 60 MB forensic trail in ~35 minutes at the 100
+  rows/s global cap — the README claimed it couldn't, and that claim was
+  wrong. Rejections keep the same admission gates but can now only evict
+  their own chain; the main chain's line format is byte-identical for
+  existing consumers (the `rejected` flag is serialized only on the reject
+  chain)
+
+**Hardening**
+
+- `OPTIONS *` (asterisk-form) is refused with a 400 client error instead of
+  surfacing as a 500 `configuration_error` from the URL builder
+- `anthropic-api-key` and `openai-api-key` are accepted as inbound vkey
+  headers, matching the outbound strip list: a client sending only one of
+  them used to get a misleading 401 while the gateway stripped the same
+  names on the way out
+- `KEYSINK_MASTER_KEY_FILE` now gets the same file checks as the default
+  `vault.key`: symlinks and group/other-readable identities are refused
+  (0400/0600 pass — systemd `LoadCredential` credentials qualify). The env
+  path used to skip both checks entirely
+- `decrypt` caps the ciphertext at 64 MiB before handing it to age. A
+  replaced `vault.age` already implies a same-UID compromise (out of scope),
+  but age's reader grows the plaintext without bound; the cap keeps a wedged
+  hot reload from turning one bogus file into an OOM
+- `create_private_dir_all` refuses a pre-existing symlink instead of
+  resolving through it and landing the 0700 chmod on the symlink's target
+- The atomic-write temp name carries 8 random bytes instead of 4 — the old
+  65536-name space was predictable enough for a hostile local process to
+  pre-occupy and fail every vault write
+
 ## v0.2.0
 
 *Released 2026-11-04.*
