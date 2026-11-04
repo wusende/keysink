@@ -1,12 +1,19 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
+
+*Released 2026-11-04.*
 
 A stability and observability pass: the two remaining ways a single misbehaving
 peer could stall the whole gateway are closed, shutdown is bounded instead of
 relying on SIGKILL, and the states that used to fail silently (a stale snapshot,
 a dead audit writer, a panic) now report themselves. Drop-in upgrade — no config
 or storage changes.
+
+One operational note for system installs: the systemd unit is written to disk at
+`deploy` time, so upgrading the binary alone leaves the old unit in place. Re-run
+`sudo keysink deploy` to pick up `TimeoutStopSec` 10 → 30; without it a drain
+that runs near its 10s bound can still be SIGKILLed by the old stop timeout.
 
 **Stability**
 
@@ -33,7 +40,9 @@ or storage changes.
   remaining connections are dropped with a warning. An idle keep-alive connection
   now closes immediately (measured: 0.05s vs 28s)
 - `TimeoutStopSec` in the deployed unit goes 10 → 30, above the drain timeout, so
-  a normal stop no longer gets SIGKILLed before the drain can finish
+  a normal stop no longer gets SIGKILLed before the drain can finish. Existing
+  installs pick this up on the next `sudo keysink deploy` (the unit is written to
+  disk then, not shipped inside the binary)
 - Accept errors are split three ways instead of "descriptor pressure or fatal".
   Linux and the BSDs pass per-connection failures from the backlog up through
   `accept(2)` (an aborted handshake, protocol/route errors) and document that
