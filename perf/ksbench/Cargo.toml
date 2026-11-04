@@ -1,0 +1,24 @@
+[package]
+name = "ksbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "keysink's load driver and fake upstream (perf harness only, never published)"
+
+# A workspace member rather than an `examples/` target: `cargo package` refuses
+# to ship an example whose source is excluded from the crate (the manifest still
+# declares the target), and shipping a 500-line bench driver to every
+# `cargo install keysink` user is not what `exclude` is there to avoid. As a
+# member it is built on demand (`cargo build -p ksbench`) and invisible to the
+# published crate.
+[dependencies]
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json"] }
+# Same explicit provider as the gateway: the crate builds reqwest with
+# rustls-no-provider, so a Client cannot exist without one installed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

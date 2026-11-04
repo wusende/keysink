@@ -8,7 +8,13 @@ repository = "https://github.com/wusende/keysink"
 homepage = "https://github.com/wusende/keysink#readme"
 keywords = ["api-keys", "secrets", "llm", "proxy", "claude-code"]
 categories = ["authentication", "command-line-utilities", "development-tools", "network-programming"]
-exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts", "docs", "perf", "examples"]
+exclude = ["fuzz/corpus", "fuzz/artifacts", "scripts", "docs", "perf"]
+
+[workspace]
+# The perf harness is its own crate (perf/ksbench), not an `examples/` target:
+# an example whose source is excluded from the package still makes `cargo
+# publish` warn about a target it is dropping.
+members = ["perf/ksbench"]
 
 [dependencies]
 age = "0.12"

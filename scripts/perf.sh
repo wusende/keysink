@@ -29,7 +29,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BIN="$ROOT/target/release/keysink"
-KSBENCH="$ROOT/target/release/examples/ksbench"
+KSBENCH="$ROOT/target/release/ksbench"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULTS="$ROOT/perf/results/$STAMP"
 mkdir -p "$RESULTS"
@@ -99,7 +99,7 @@ log "env + build"
 cat "$RESULTS/env.txt"
 
 cargo build --release --locked
-cargo build --release --locked --example ksbench
+cargo build --release --locked -p ksbench
 
 # ---------------------------------------------------------------------------
 # 基础设施:上游 / vault / 网关
