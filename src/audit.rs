@@ -109,6 +109,24 @@ pub struct AuditEntry {
     pub bytes_in: usize,
     pub stream: bool,
     pub attempts: u8,
+    /// Whether this is a rejection row (auth failure, disabled route, body
+    /// limits, ...). Rejection rows are the one audit input an unauthenticated
+    /// peer controls, so they are written to a separate rotation chain
+    /// (`<audit-file>.rej`): a flood can only ever rotate its own chain away,
+    /// never the main chain's real-traffic rows. Not serialized on the main
+    /// chain — existing line formats stay byte-identical for consumers; on
+    /// the reject chain the field is redundant but self-describing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rejected: bool,
+}
+
+/// The separate rotation chain rejection rows are written to: same directory,
+/// `.rej` suffix, its own five generations. A flood of unauthenticated
+/// requests — the one audit input an attacker controls without any
+/// credential — can rotate this chain away, but never the main chain's
+/// real-traffic rows.
+fn reject_chain_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.rej", path.display()))
 }
 
 impl Audit {
@@ -154,11 +172,14 @@ impl Audit {
 
     pub fn new(path: PathBuf) -> Self {
         // mode(0o600) only takes effect at creation; if an existing file has overly broad permissions, warn once at startup.
-        if path.exists()
-            && let Err(e) = util::ensure_private_file(&path, "audit log")
-        {
-            tracing::warn!(error = %e, "audit log permissions too wide; consider tightening to 0600");
+        for existing in [path.as_path(), reject_chain_path(&path).as_path()] {
+            if existing.exists()
+                && let Err(e) = util::ensure_private_file(existing, "audit log")
+            {
+                tracing::warn!(error = %e, "audit log permissions too wide; consider tightening to 0600");
+            }
         }
+        let reject_path = reject_chain_path(&path);
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         let state = Arc::new(AuditState {
             alive: AtomicBool::new(true),
@@ -169,7 +190,7 @@ impl Audit {
         let thread_state = state.clone();
         match std::thread::Builder::new()
             .name("keysink-audit".into())
-            .spawn(move || writer_loop(path, rx, thread_state))
+            .spawn(move || writer_loop(path, reject_path, rx, thread_state))
         {
             Ok(handle) => Self {
                 writer: Mutex::new(Some(Writer { tx, handle })),
@@ -220,8 +241,13 @@ impl Audit {
     /// route configuration errors). Rejection rows are the one audit input an
     /// unauthenticated peer controls, so they pass an admission gate before
     /// the queue: per-fingerprint (one row per `REJECT_FP_INTERVAL`) plus a
-    /// global cap per window. Suppressed rows are counted, never silent.
-    pub fn record_reject(&self, entry: AuditEntry) {
+    /// global cap per window — and they land on the separate `.rej` rotation
+    /// chain, so even a sustained fingerprint-randomizing flood (every fake
+    /// token a fresh bucket, admitted up to the global cap) can only evict
+    /// its own trail, never the main chain's real-traffic rows. Suppressed
+    /// rows are counted, never silent.
+    pub fn record_reject(&self, mut entry: AuditEntry) {
+        entry.rejected = true;
         let admit = {
             let mut gate = self.rejects.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
@@ -290,49 +316,74 @@ impl Drop for AliveGuard {
     }
 }
 
-fn writer_loop(path: PathBuf, rx: Receiver<AuditEntry>, state: Arc<AuditState>) {
+/// Both rotation chains the writer maintains: real-traffic rows on the main
+/// path, rejection rows on the `.rej` path. Each chain rotates independently
+/// at MAX_AUDIT_BYTES; a flood can only ever cycle the reject chain.
+struct WriterLogs {
+    main: OpenLog,
+    reject: OpenLog,
+}
+
+fn writer_loop(path: PathBuf, reject_path: PathBuf, rx: Receiver<AuditEntry>, state: Arc<AuditState>) {
     let _alive = AliveGuard(state.clone());
-    // The handle stays open, buffered: lines batch in a BufWriter instead of
+    // The handles stay open, buffered: lines batch in a BufWriter instead of
     // costing one write syscall each; the buffer flushes at capacity, when
     // the queue goes idle (FLUSH_IDLE), and before rotation or shutdown. On
     // rotation or write failure the handle becomes None and the next record
     // reopens.
-    let mut log = OpenLog {
-        file: None,
-        written: 0,
+    let mut logs = WriterLogs {
+        main: OpenLog {
+            file: None,
+            written: 0,
+        },
+        reject: OpenLog {
+            file: None,
+            written: 0,
+        },
     };
     let mut failures = 0u32;
     loop {
         match rx.recv_timeout(FLUSH_IDLE) {
-            Ok(entry) => match append(&path, &mut log, &entry) {
-                Ok(()) => failures = 0,
-                Err(e) => {
-                    // Dropping the BufWriter attempts a best-effort flush of
-                    // whatever is still buffered; the next record reopens.
-                    log.file = None;
-                    failures += 1;
-                    state.dropped.fetch_add(1, Ordering::Relaxed);
-                    if failures == 1 || failures.is_multiple_of(100) {
-                        tracing::warn!(
-                            error = %e,
-                            failures,
-                            "failed to write audit log (backing off; audit lines are dropped until it recovers)"
-                        );
-                    }
-                    // Back off instead of retrying the open/write per line: a
-                    // full disk would otherwise cost a failed syscall and a
-                    // warn line for every record.
-                    if !wait_for_recovery(&rx, write_backoff(failures), &state) {
-                        break;
+            Ok(entry) => {
+                let (chain_path, chain) = if entry.rejected {
+                    (&reject_path, &mut logs.reject)
+                } else {
+                    (&path, &mut logs.main)
+                };
+                match append(chain_path, chain, &entry) {
+                    Ok(()) => failures = 0,
+                    Err(e) => {
+                        // Dropping the BufWriter attempts a best-effort flush of
+                        // whatever is still buffered; the next record reopens.
+                        chain.file = None;
+                        failures += 1;
+                        state.dropped.fetch_add(1, Ordering::Relaxed);
+                        if failures == 1 || failures.is_multiple_of(100) {
+                            tracing::warn!(
+                                error = %e,
+                                failures,
+                                "failed to write audit log (backing off; audit lines are dropped until it recovers)"
+                            );
+                        }
+                        // Back off instead of retrying the open/write per line: a
+                        // full disk would otherwise cost a failed syscall and a
+                        // warn line for every record.
+                        if !wait_for_recovery(&rx, write_backoff(failures), &state) {
+                            break;
+                        }
                     }
                 }
-            },
-            Err(RecvTimeoutError::Timeout) => flush_dirty(&mut log),
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                flush_dirty(&mut logs.main);
+                flush_dirty(&mut logs.reject);
+            }
             // Disconnected (after close): drain, flush, exit so tail audit lines are not lost.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    flush_dirty(&mut log);
+    flush_dirty(&mut logs.main);
+    flush_dirty(&mut logs.reject);
 }
 
 /// Wait after `failures` consecutive write failures: doubling, capped.
@@ -456,6 +507,7 @@ impl AuditEntry {
             bytes_in,
             stream,
             attempts: 1,
+            rejected: false,
         }
     }
 }
@@ -641,6 +693,7 @@ mod tests {
     fn rejection_rows_throttle_per_fingerprint_and_globally() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
+        let rej = reject_chain_path(&path);
         let audit = Audit::new(path.clone());
         audit.record_reject(AuditEntry::new("A1", "-", "fpX", "GET", "/x", 0, false));
         audit.record_reject(AuditEntry::new("A2", "-", "fpX", "GET", "/x", 0, false));
@@ -668,7 +721,7 @@ mod tests {
         ));
         audit.close();
 
-        let text = std::fs::read_to_string(path).unwrap();
+        let text = std::fs::read_to_string(&rej).unwrap();
         let count = text.lines().count();
         assert!(text.contains("\"A1\""));
         assert!(
@@ -677,8 +730,81 @@ mod tests {
         );
         assert_eq!(
             count,
-            1 + REJECT_GLOBAL_MAX,
-            "gate admits the window cap plus the forward"
+            REJECT_GLOBAL_MAX,
+            "gate admits the window cap, all on the reject chain: {count}"
+        );
+
+        // The randomized flood never touches the main chain: F1 is the only
+        // row there.
+        let main_text = std::fs::read_to_string(&path).unwrap();
+        assert!(main_text.contains("\"F1\""));
+        assert_eq!(main_text.lines().count(), 1);
+    }
+
+    #[test]
+    fn rejection_rows_land_on_the_reject_chain_and_main_format_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Audit::new(path.clone());
+        let mut main = AuditEntry::new("M1", "claude", "fpOK", "POST", "/v1/messages", 12, true);
+        main.status = 200;
+        audit.record(main);
+        audit.record_reject(AuditEntry::new("R1", "-", "fpX", "GET", "/x", 0, false));
+        audit.close();
+
+        let main_text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(main_text.lines().count(), 1, "main chain holds only real traffic");
+        assert!(
+            !main_text.contains("rejected"),
+            "main-chain line format must stay free of the reject marker: {main_text}"
+        );
+        assert!(main_text.contains("\"M1\""));
+
+        let rej_text = std::fs::read_to_string(path.with_extension("jsonl.rej")).unwrap();
+        assert_eq!(rej_text.lines().count(), 1);
+        assert!(rej_text.contains("\"R1\""));
+        assert!(
+            rej_text.contains("\"rejected\":true"),
+            "reject chain rows are self-describing: {rej_text}"
+        );
+    }
+
+    #[test]
+    fn reject_flood_can_only_ever_rotate_the_reject_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // Force the reject chain past its rotation threshold while the main
+        // chain holds a single sentinel row: the flood must cycle its own
+        // generations and leave the real-traffic trail untouched.
+        let rej = reject_chain_path(&path);
+        std::fs::write(&rej, vec![b'x'; MAX_AUDIT_BYTES as usize + 1]).unwrap();
+        let audit = Audit::new(path.clone());
+        audit.record(AuditEntry::new("M1", "claude", "fpOK", "GET", "/v1/x", 0, false));
+        for i in 0..(REJECT_GLOBAL_MAX + 5) {
+            audit.record_reject(AuditEntry::new(
+                format!("R{i}"),
+                "-",
+                format!("fp{i}"),
+                "GET",
+                "/x",
+                0,
+                false,
+            ));
+        }
+        audit.close();
+
+        let main_text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            main_text.contains("\"M1\"") && main_text.lines().count() == 1,
+            "the sentinel row must survive a reject-chain rotation: {main_text}"
+        );
+        assert!(
+            !path.with_extension("jsonl.1").exists(),
+            "the main chain must not have rotated"
+        );
+        assert!(
+            rej.with_file_name("audit.jsonl.rej.1").exists(),
+            "the reject chain must have rotated"
         );
     }
 }

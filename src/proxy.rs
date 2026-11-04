@@ -863,6 +863,42 @@ async fn handle_inner(state: Arc<AppState>, req: Request<Body>, rid: String) -> 
         );
     }
 
+    // Cheap head screening, same tier as the Upgrade refusal: both are refused
+    // before any body read or upstream work, so a flood of them cannot occupy
+    // permits. A TRACE the upstream implements would echo the forwarded
+    // headers — including the injected real key — back into the agent's view,
+    // which is exactly the channel the vault exists to close; CONNECT is
+    // meaningless without the Upgrade support refused above.
+    if matches!(method.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+        let mut response = deny(
+            "-",
+            None,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "unsupported",
+            "keysink does not proxy CONNECT/TRACE/TRACK",
+        );
+        response.headers_mut().insert(
+            header::ALLOW,
+            HeaderValue::from_static("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        );
+        return response;
+    }
+
+    if path_has_dot_segment(&path) {
+        // The downstream URL parser removes dot segments while resolving the
+        // final upstream URL, so forwarding one would let `/../x` or
+        // `/v1/%2e%2e/x` escape the route's base_url prefix and reach
+        // arbitrary paths on the upstream host with the real key attached.
+        // Refused outright: what the agent addressed is what the upstream sees.
+        return deny(
+            "-",
+            None,
+            StatusCode::NOT_FOUND,
+            "invalid_path",
+            "request path contains dot segments",
+        );
+    }
+
     let Some(token) = extract_vkey(&in_headers) else {
         return deny(
             "-",
@@ -1465,6 +1501,51 @@ pub(crate) fn forward_headers(
     Ok(out)
 }
 
+/// Whether the request path contains a dot segment: a segment that, after
+/// percent-decoding (and splitting on `\` too — the WHATWG URL parser treats
+/// a backslash as a path separator for the http(s) schemes this gateway
+/// forwards to), equals `.` or `..`.
+///
+/// The downstream URL parser (reqwest/url) removes such segments while
+/// resolving the final upstream URL — including the percent-encoded `%2e`
+/// variants the standard defines as dot segments — so forwarding one would
+/// let the request escape the route's base_url prefix and reach arbitrary
+/// paths on the upstream host with the real key attached. Defense in depth:
+/// the handler refuses these with a 404 before auth work; this check also
+/// guards `build_upstream_url` directly so the invariant is testable at the
+/// URL-building layer alone.
+pub(crate) fn path_has_dot_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(|seg| {
+        if !seg.contains('%') {
+            matches!(seg, "." | "..")
+        } else {
+            // Decode the segment the way a URL parser would see it: %XX
+            // escapes resolved (case-insensitive hex), invalid escapes left
+            // as literal bytes. A segment that then reads "." or ".." is a
+            // dot segment per RFC 3986 / WHATWG ("..", ".%2e", "%2e.",
+            // "%2e%2e" — longer runs like "..%2f" or "%2e%2e%2e" are literal
+            // segments no parser collapses).
+            let mut decoded = Vec::with_capacity(seg.len());
+            let bytes = seg.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%'
+                    && let Some(hex) = bytes.get(i + 1..i + 3)
+                    && let Ok(byte) =
+                        u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
+                {
+                    decoded.push(byte);
+                    i += 3;
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            matches!(decoded.as_slice(), b"." | b"..")
+        }
+    })
+}
+
 pub(crate) fn build_upstream_url(
     base_url: &str,
     path: &str,
@@ -1476,6 +1557,9 @@ pub(crate) fn build_upstream_url(
     let path = if path.is_empty() {
         "/"
     } else if path.starts_with('/') {
+        if path_has_dot_segment(path) {
+            return Err(Error::msg("inbound path contains dot segments"));
+        }
         path
     } else {
         return Err(Error::msg("inbound path does not start with /"));
@@ -2330,6 +2414,56 @@ mod tests {
         let mut r = route(Auth::Bearer);
         r.headers.insert("host".into(), "evil".into());
         assert!(r.validate("r").is_err());
+    }
+
+    #[test]
+    fn dot_segment_detection_covers_every_form_the_url_parser_collapses() {
+        for path in [
+            "/../x",
+            "/v1/../x",
+            "/a/./b",
+            "/a/b/.",
+            "/..",
+            "/.",
+            ".",
+            "..",
+            // percent-encoded variants (case-insensitive), per RFC 3986/WHATWG
+            "/x/%2e/y",
+            "/x/%2E%2e/z",
+            "/x/.%2e/w",
+            "/x/%2e./w",
+            // backslash is a path separator for http(s) in the WHATWG parser
+            "/a\\..\\b",
+            "\\..",
+            "/x\\..\\y",
+        ] {
+            assert!(path_has_dot_segment(path), "{path:?} must be flagged");
+        }
+        for path in [
+            "",
+            "/",
+            "/v1/models",
+            "/a/b/c",
+            "//",
+            // "..." and friends are literal segments no parser collapses
+            "/a/.../b",
+            "/a/..%2fx",
+            "/a/%2e%2e%2e/x",
+            "/a/%2fx",
+        ] {
+            assert!(!path_has_dot_segment(path), "{path:?} must pass");
+        }
+    }
+
+    #[test]
+    fn build_upstream_url_refuses_dot_segments() {
+        for path in ["/../x", "/v1/%2e%2e/x", "/a\\..\\b"] {
+            assert!(
+                build_upstream_url("https://up.test/v1", path, None, &Auth::None, "k").is_err(),
+                "{path:?} must be refused"
+            );
+        }
+        assert!(build_upstream_url("https://up.test/v1", "/v1/ok", None, &Auth::None, "k").is_ok());
     }
 
     #[test]

@@ -55,6 +55,11 @@ zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# The build_upstream_url fuzz invariant parses the built URL the way reqwest
+# will, to assert the resolved path stays inside the base_url prefix (the
+# audit's escape PoC happens at that parse layer, not in the string concat).
+# Already in the tree via reqwest; dev-only so the release build is unchanged.
+url = "2"
 # Parsing is only needed to assert RFC 3339 round-trips in tests; dev-only so
 # the release build does not carry the parser.
 time = { version = "0.3", features = ["parsing"] }

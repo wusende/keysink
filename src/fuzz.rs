@@ -8,7 +8,7 @@
 use crate::model::{Auth, Route, Store, Terminator, validate_name};
 use crate::proxy::{
     build_upstream_url, contains_terminator, extract_vkey, forward_headers, is_encoded,
-    is_stream_request, rid_from,
+    is_stream_request, path_has_dot_segment, rid_from,
 };
 use crate::retry::{RetryPolicy, parse_retry_after};
 use crate::store::decrypt;
@@ -465,12 +465,18 @@ fn fuzz_contains_terminator_finds_verbatim_and_case_variants() {
 #[test]
 fn fuzz_build_upstream_url_invariants() {
     run("build_upstream_url", 10_000, |rng, _| {
-        let base = weird_string(rng);
-        let path = match rng.random_range(0..4) {
+        let (base, sane_base) = match rng.random_range(0..4) {
+            0 => ("http://up.test/v1".to_string(), true),
+            1 => ("https://up.test".to_string(), true),
+            2 => ("http://up.test/v1/deep".to_string(), true),
+            _ => (weird_string(rng), false),
+        };
+        let path = match rng.random_range(0..5) {
             0 => format!("/{}", weird_string(rng)),
             1 => weird_string(rng), // may not start with '/' → must error, not panic
             2 => String::new(),
-            _ => format!("/v1/{}/{}%2e%2e/..", weird_string(rng), rng.random::<u32>()),
+            3 => format!("/v1/{}/{}%2e%2e/..", weird_string(rng), rng.random::<u32>()),
+            _ => format!("/../{}", weird_string(rng)), // dot-segment escape attempt
         };
         let query = match rng.random_range(0..3) {
             0 => None,
@@ -494,11 +500,43 @@ fn fuzz_build_upstream_url_invariants() {
         let base_trimmed = base.trim_end_matches('/').to_string();
         let desc = format!("base={base:?} path={path:?} query={query:?} auth={auth:?} key={key:?}");
         let exec = Box::new(move || {
-            if let Ok(url) = build_upstream_url(&base, &path, query.as_deref(), &auth, &key) {
+            let built = build_upstream_url(&base, &path, query.as_deref(), &auth, &key);
+            if path_has_dot_segment(&path) || (!path.is_empty() && !path.starts_with('/')) {
+                // Dot segments are refused outright (the downstream URL parser
+                // would normalize them away and let the request escape the
+                // base_url prefix), as are paths that do not start with '/'.
+                assert!(
+                    built.is_err(),
+                    "must refuse, got {built:?}: path={path:?} base={base:?}"
+                );
+            } else if let Ok(url) = &built {
                 assert!(
                     url.starts_with(&base_trimmed),
                     "URL does not start with base prefix: {url:?} base={base_trimmed:?}"
                 );
+                if sane_base {
+                    // The escape invariant at the layer that actually matters:
+                    // the audit escape PoC produced a string-level-prefixed URL
+                    // that still resolved OUTSIDE the base path once the
+                    // downstream URL parser removed dot segments. Parse the
+                    // built URL the way reqwest will and assert the resolved
+                    // path stays inside the base_url's path prefix.
+                    let base_parsed = url::Url::parse(&base_trimmed).expect("sane base parses");
+                    let built_parsed = url::Url::parse(url).expect("built URL parses");
+                    let base_path = base_parsed.path();
+                    let built_path = built_parsed.path();
+                    let inside = if base_path == "/" {
+                        built_path.starts_with('/')
+                    } else {
+                        let prefix = base_path.trim_end_matches('/');
+                        built_path == prefix || built_path.starts_with(&format!("{prefix}/"))
+                    };
+                    assert!(
+                        inside,
+                        "upstream path escaped the base_url prefix: built={url:?} \
+                         resolved path={built_path:?} base={base_trimmed:?}"
+                    );
+                }
                 if let crate::model::Auth::Query { param } = &auth {
                     let sane = !param.is_empty()
                         && param

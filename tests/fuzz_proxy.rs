@@ -1814,3 +1814,84 @@ async fn queue_bound_sheds_valid_request_with_503() {
         started.elapsed()
     );
 }
+
+// ---------- refusals at the gateway edge (path dot segments, proxy methods) ----------
+
+/// Sends one raw HTTP/1.1 request over a fresh TCP connection: unlike a real
+/// HTTP client, this bypasses client-side URL normalization, so the gateway
+/// sees the path exactly as an attacker would send it.
+async fn raw_request(addr: SocketAddr, request: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split("\r\n")
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+#[tokio::test]
+async fn dot_segment_paths_and_proxy_methods_are_refused_before_the_upstream() {
+    let (mock, hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let (gw, vks) = spawn_gateway(store, RetryPolicy::default(), 1 << 20).await;
+    let vk = vks["main"].clone();
+    let host = format!("127.0.0.1:{}", gw.port());
+    let head = |target: &str| {
+        format!(
+            "{target}\r\nHost: {host}\r\nAuthorization: Bearer {vk}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    // CONNECT/TRACE/TRACK are refused with 405 before any upstream work. A
+    // TRACE the upstream implements would echo the forwarded headers — the
+    // injected real key included — back into the agent's view.
+    for (line, name) in [
+        (format!("CONNECT {host} HTTP/1.1"), "CONNECT"),
+        ("TRACE /v1/x HTTP/1.1".to_string(), "TRACE"),
+        ("TRACK /v1/x HTTP/1.1".to_string(), "TRACK"),
+    ] {
+        let (status, body) = raw_request(gw, &head(&line)).await;
+        assert_eq!(status, 405, "{name} must be 405: {body}");
+        assert!(body.contains("does not proxy"), "{name}: {body}");
+    }
+    let (status, body) = raw_request(gw, &head("TRACE /v1/x HTTP/1.1")).await;
+    assert_eq!(status, 405);
+    assert!(
+        body.to_lowercase().contains("allow: "),
+        "405 must advertise Allow: {body}"
+    );
+
+    // Dot segments (literal, percent-encoded, backslash-separated) are refused
+    // with 404: the downstream URL parser would collapse them and let the
+    // request escape the route's base_url prefix on the upstream host.
+    for path in ["/../x", "/v1/%2e%2e/x", "/a\\..\\b", "/a/./b"] {
+        let (status, body) = raw_request(gw, &head(&format!("GET {path} HTTP/1.1"))).await;
+        assert_eq!(status, 404, "dot-segment path {path:?} must be 404: {body}");
+    }
+
+    // And a plain in-prefix request still forwards normally.
+    let (status, _) = raw_request(gw, &head("GET /v1/models HTTP/1.1")).await;
+    assert_eq!(status, 200);
+
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        1,
+        "only the plain request may have reached the upstream"
+    );
+}
