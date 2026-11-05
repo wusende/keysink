@@ -1,6 +1,6 @@
 {
   "name": "keysink",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local gateway that keeps real AI API keys out of agents (Claude Code, OpenAI, MCP): agents hold revocable virtual keys, real keys stay in an encrypted vault.",
   "license": "MIT",
   "author": "wusende",

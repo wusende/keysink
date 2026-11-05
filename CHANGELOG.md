@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.2.1
+
+*Released 2026-11-05.*
+
+A security-hardening and performance pass: the request-escape and header-echo
+channels found in the audit are closed, rejection rows can no longer wash out
+the forensic trail, and the audit write path shed its locks and clones.
+Drop-in upgrade — no config or storage changes.
 
 **Security**
 
@@ -51,6 +58,37 @@
 - The atomic-write temp name carries 8 random bytes instead of 4 — the old
   65536-name space was predictable enough for a hostile local process to
   pre-occupy and fail every vault write
+
+**Performance**
+
+- The audit write path is lock-free: the writer handle moved from
+  `Mutex<Option<Writer>>` to an `ArcSwapOption` sender, so `is_enabled` +
+  `record` are two atomic loads per audited request instead of two mutex
+  acquisitions and a sender clone. The writer thread's join handle parks
+  beside the slot and `close()` keeps its drain-then-join semantics (an
+  in-flight record holds the channel open through its own Arc, so tail rows
+  still land). Measured 7.7ms → 3.6ms for 5k records; the audit-on/audit-off
+  throughput gap narrowed from ~3% to ~1%
+- Timestamp rendering reuses the resolved UTC offset for one second: the time
+  crate re-reads `TZ` / `/etc/localtime` on every `local_offset_at` call, which
+  used to run once per audit row and once per log line. Historical display
+  (`ts`) keeps per-instant resolution, so a DST switch can carry the
+  pre-switch offset for at most one second of rows — and the offset is part of
+  the rendered string, so every instant stays unambiguous either way
+- Rejected requests allocate nothing: method/path/query stay borrowed views
+  into the request parts, and the upstream key is read straight from the
+  snapshot's route table instead of cloned per request (accepted requests
+  clone only what goes on the wire)
+- `Authorization: Bearer` tolerates extra whitespace between the scheme and
+  the token (RFC 7235 wants exactly one SP; some clients send more). A glued
+  `Bearer ks_…` is still not recognized as the Bearer scheme
+- Dependencies: tokio's features narrowed from `full` to the set in use —
+  keeping `parking_lot` explicitly, because dropping it with the rest of
+  `full` measurably cost ~4% on the 80k-rps request ladder (tokio compiles its
+  runtime and sync primitives against parking_lot when the feature is
+  present); and fs2 (unmaintained) dropped for std's `File::lock` (stable
+  since 1.89, the same blocking exclusive flock on unix / LockFileEx on
+  windows), which also removes fs2's three `winapi` leftovers from the tree
 
 ## v0.2.0
 
