@@ -49,8 +49,11 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 # Explicit feature set, matching what the crate actually uses (rt, net, io,
 # time, sync, signal): "full" would also pull fs/process/io-std into every
-# downstream build of this crates.io-published library.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+# downstream build of this crates.io-published library. parking_lot is kept
+# explicitly: "full" implies it, and tokio compiles its runtime and sync
+# primitives against parking_lot when present — dropping it measurably
+# regressed high-concurrency throughput (~4% on the 80k-rps ladder).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "parking_lot"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1"
