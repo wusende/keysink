@@ -1861,7 +1861,45 @@ pub(crate) fn cmd_rekey(paths: &Paths, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Rejects an `--output` that would overwrite the vault itself.
+///
+/// The export is written with [`util::atomic_write`], which replaces whatever
+/// is at the target path. Pointing it at `vault.key` or `vault.age` would
+/// destroy the only copy of the vault and leave the backup in its place.
+fn resolve_output_path(paths: &Paths, output: &std::path::Path) -> Result<PathBuf> {
+    let protected = [
+        paths.master_key(),
+        paths.master_key_bak(),
+        paths.store(),
+        paths.store_bak(),
+        paths.lock(),
+        paths.gateway_addr(),
+    ];
+    // Compare resolved paths when possible so `--output ./v/x.age` and
+    // `--output ../vault/vault.age` are caught too; a non-existent output
+    // falls back to the literal comparison of its last component.
+    let output_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
+    let home_abs = std::path::absolute(&paths.home).unwrap_or_else(|_| paths.home.to_path_buf());
+    let in_vault = output_abs.parent() == Some(home_abs.as_path());
+    if in_vault {
+        for candidate in protected {
+            let name = candidate.file_name();
+            if output_abs.file_name() == name {
+                return Err(Error::msg(format!(
+                    "refusing to export over the vault file {}; choose a different --output",
+                    output.display()
+                )));
+            }
+        }
+    }
+    Ok(output.to_path_buf())
+}
+
 pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
+    // `--output` goes through atomic_write, which would happily replace a vault
+    // file — turning a backup into the only remaining copy of the vault and
+    // destroying the real one.
+    let output = resolve_output_path(paths, &args.output)?;
     let master = check_master_password(paths, args.password_stdin)?;
     let passphrase: Zeroizing<String> = if let Some(file) = &args.passphrase_file {
         let bytes = Zeroizing::new(std::fs::read(file)?);
@@ -1876,8 +1914,8 @@ pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
     if passphrase.is_empty() {
         return Err(Error::msg("passphrase must not be empty"));
     }
-    let stripped = store::export(paths, &args.output, &passphrase)?;
-    println!("exported: {}", args.output.display());
+    let stripped = store::export(paths, &output, &passphrase)?;
+    println!("exported: {}", output.display());
     println!(
         "Note: the export contains the working vkeys of every route — anyone who can decrypt it \
          can use your gateway while it runs. Store it as carefully as the keys themselves."
@@ -2036,6 +2074,50 @@ mod tests {
             .to_string();
         assert!(err.contains("symlink"), "{err}");
         assert!(target.join("vault.key").exists());
+    }
+
+    #[test]
+    fn export_refuses_to_overwrite_vault_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        store::init(&paths, false, "test-password").unwrap();
+        let before = std::fs::read(paths.store()).unwrap();
+
+        for target in [paths.store(), paths.master_key(), paths.store_bak()] {
+            let err = cmd_export(
+                &paths,
+                ExportArgs {
+                    output: target.clone(),
+                    passphrase_file: None,
+                    password_stdin: true,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("refusing to export over the vault file"),
+                "expected the vault-file guard to fire first: {err}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(paths.store()).unwrap(),
+            before,
+            "the vault store must not be replaced by an export"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_allows_a_separate_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let out = dir.path().join("backup.age");
+        resolve_output_path(&paths, &out).unwrap();
+        // A file inside the vault directory that is not a vault file is fine.
+        let other = paths.home.join("backup.age");
+        resolve_output_path(&paths, &other).unwrap();
+        // ...but the vault files themselves are not.
+        assert!(resolve_output_path(&paths, &paths.store()).is_err());
     }
 
     #[test]
