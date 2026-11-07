@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, ReadBuf};
@@ -411,6 +411,28 @@ async fn sniff_protocol(
     Ok(seen)
 }
 
+/// Middleware that fires a one-shot notification when the first request on a
+/// connection arrives.
+///
+/// `serve_inbound` uses it to bound the phase before the first request: hyper
+/// completes the h2 handshake only after the peer's SETTINGS frame, and the
+/// h2 keep-alive PING (which is the bound for an established h2 connection)
+/// starts only after the handshake. `header_read_timeout` is http1-only. A
+/// peer that sends the 24-byte h2 preface (or stalls inside the SETTINGS
+/// frame) would otherwise hold its connection slot forever — a cheap one-shot
+/// DoS on `--allow-remote` deployments. Once the first request is dispatched,
+/// the deadline is disarmed and the normal per-request/drain bounds apply.
+async fn note_first_request(
+    State((first, seen)): State<(Arc<tokio::sync::Notify>, Arc<AtomicBool>)>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !seen.swap(true, Ordering::Relaxed) {
+        first.notify_one();
+    }
+    next.run(req).await
+}
+
 /// Replays the sniffed bytes ahead of the live socket so hyper sees the exact
 /// byte stream it would have read itself. Writes pass straight through
 /// (WebSocket upgrades included).
@@ -638,24 +660,54 @@ pub async fn serve_inbound(
                 .http2()
                 .keep_alive_interval(Some(HTTP2_KEEPALIVE_INTERVAL));
             builder.http2().keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
+            // The h2 PING above only starts after the handshake completes.
+            // Until the first request is dispatched, a peer can hold the
+            // connection slot by sending just the preface (or stalling in the
+            // SETTINGS frame), so arm a first-request deadline around the
+            // connection future. The middleware notifies and disarms it as
+            // soon as the first request reaches the router.
+            let first_request = Arc::new(tokio::sync::Notify::new());
+            let app = app.layer(axum::middleware::from_fn_with_state(
+                (first_request.clone(), Arc::new(AtomicBool::new(false))),
+                note_first_request,
+            ));
             let conn = builder.serve_connection_with_upgrades(
                 hyper_util::rt::TokioIo::new(PrefaceIo {
                     io: stream,
                     preface,
                     pos: 0,
                 }),
-                hyper_util::service::TowerToHyperService::new(app.clone()),
+                hyper_util::service::TowerToHyperService::new(app),
             );
             let mut conn = std::pin::pin!(conn);
             let served = tokio::select! {
                 res = &mut conn => res,
+                _ = first_request.notified() => {
+                    // The connection is past the handshake and has served its
+                    // first request; the per-request bounds and the h2
+                    // keep-alive (or http1 header timer) own it from here.
+                    tokio::select! {
+                        res = &mut conn => res,
+                        _ = drain_rx.changed() => {
+                            // Shutdown started: stop accepting requests on this
+                            // connection and close it once the in-flight response
+                            // finishes (an idle keep-alive connection closes now).
+                            // h2 peers get a GOAWAY instead.
+                            conn.as_mut().graceful_shutdown();
+                            conn.await
+                        }
+                    }
+                }
+                // No request ever arrived: close the stalled handshake. This is
+                // the whole-phase analogue of the http1 header timeout.
+                _ = tokio::time::sleep(limits.header_timeout) => {
+                    tracing::debug!("inbound connection sent no request before the head timeout; closing");
+                    return;
+                }
                 _ = drain_rx.changed() => {
-                    // Shutdown started: stop accepting requests on this
-                    // connection and close it once the in-flight response
-                    // finishes (an idle keep-alive connection closes now).
-                    // h2 peers get a GOAWAY instead.
-                    conn.as_mut().graceful_shutdown();
-                    conn.await
+                    // Shutdown while still waiting for the first request: there
+                    // is no response to drain, so drop the connection now.
+                    return;
                 }
             };
             if let Err(e) = served {
@@ -3201,6 +3253,48 @@ mod serve_inbound_tests {
             "expected clean EOF, got {:?}",
             closed.unwrap_err()
         );
+
+        server.abort();
+    }
+
+    /// Regression (h2 handshake DoS): sending only the 24-byte h2 preface
+    /// used to hold a connection slot forever. The preface satisfied the
+    /// sniff, hyper then waited for the client SETTINGS frame, and the h2
+    /// keep-alive PING only starts after that handshake completes. The
+    /// first-request deadline must close the connection instead.
+    #[tokio::test]
+    async fn serve_inbound_drops_h2_handshake_stall_within_head_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head_timeout = Duration::from_millis(300);
+        let server = tokio::spawn(serve_inbound(
+            listener,
+            build_app(test_state()),
+            InboundLimits {
+                header_timeout: head_timeout,
+                max_connections: 8,
+                drain_timeout: Some(Duration::from_secs(5)),
+                loop_iterations: None,
+                live_connections: None,
+                counters: None,
+            },
+            std::future::pending(),
+        ));
+
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(H2_PREFACE).await.unwrap();
+        let _closed = tokio::time::timeout(head_timeout * 10, async {
+            let mut buf = [0u8; 16];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) => return Ok::<(), std::io::Error>(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("an h2 handshake stall must be dropped within the head timeout");
 
         server.abort();
     }
