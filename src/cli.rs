@@ -1911,24 +1911,70 @@ fn resolve_output_path(paths: &Paths, output: &std::path::Path) -> Result<PathBu
         paths.lock(),
         paths.gateway_addr(),
     ];
-    // Compare resolved paths when possible so `--output ./v/x.age` and
-    // `--output ../vault/vault.age` are caught too; a non-existent output
-    // falls back to the literal comparison of its last component.
-    let output_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
-    let home_abs = std::path::absolute(&paths.home).unwrap_or_else(|_| paths.home.to_path_buf());
-    let in_vault = output_abs.parent() == Some(home_abs.as_path());
-    if in_vault {
-        for candidate in protected {
-            let name = candidate.file_name();
-            if output_abs.file_name() == name {
-                return Err(Error::msg(format!(
-                    "refusing to export over the vault file {}; choose a different --output",
-                    output.display()
-                )));
-            }
+    // Compare every name the output can denote against every name a vault
+    // file can denote. A parent-equality check let `<vault>/sub/../vault.age`
+    // through (std::path::absolute keeps `..` components) and missed a vault
+    // directory reached through a symlink.
+    let output_forms = path_forms(output);
+    for candidate in &protected {
+        if path_forms(candidate)
+            .iter()
+            .any(|f| output_forms.contains(f))
+        {
+            return Err(Error::msg(format!(
+                "refusing to export over the vault file {}; choose a different --output",
+                output.display()
+            )));
         }
     }
     Ok(output.to_path_buf())
+}
+
+/// Lexically normalized absolute form: `.` and `..` resolved without touching
+/// the filesystem, so `<vault>/sub/../vault.age` collapses to the path it
+/// actually names. [`std::path::absolute`] alone keeps `..` components, which
+/// is exactly the hole a mistyped `--output` can spell a vault file through.
+fn lexical_absolute(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Popping the root is a no-op (its parent is itself).
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Every filesystem name `path` can denote right now: the canonical form when
+/// the file exists, the parent-canonical form when only its directory does,
+/// and the lexical form as the fallback that needs no filesystem at all.
+/// Comparing all of them against the same forms of each vault file is what
+/// keeps `..` chains and symlinked directories from spelling a vault file
+/// differently from the way the vault itself spells it.
+fn path_forms(path: &std::path::Path) -> Vec<PathBuf> {
+    let mut forms = Vec::with_capacity(3);
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        forms.push(canon);
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(canon_parent) = std::fs::canonicalize(parent)
+    {
+        let joined = canon_parent.join(name);
+        if !forms.contains(&joined) {
+            forms.push(joined);
+        }
+    }
+    let lex = lexical_absolute(path);
+    if !forms.contains(&lex) {
+        forms.push(lex);
+    }
+    forms
 }
 
 pub(crate) fn cmd_export(paths: &Paths, args: ExportArgs) -> Result<()> {
@@ -2203,6 +2249,72 @@ mod tests {
         resolve_output_path(&paths, &other).unwrap();
         // ...but the vault files themselves are not.
         assert!(resolve_output_path(&paths, &paths.store()).is_err());
+    }
+
+    /// Regression: `std::path::absolute` keeps `..` components, so the old
+    /// parent-equality check never matched `<vault>/sub/../vault.age` and the
+    /// export destroyed the store it was pointed at.
+    #[test]
+    fn export_refuses_a_dot_dot_spelling_of_a_vault_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        store::init(&paths, false, "test-password").unwrap();
+        let before = std::fs::read(paths.store()).unwrap();
+
+        let sneaky = paths.home.join("sub").join("..").join("vault.age");
+        // `sub` need not even exist: the lexical form alone must catch it.
+        let err = resolve_output_path(&paths, &sneaky)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to export over the vault file"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(paths.store()).unwrap(),
+            before,
+            "the vault store must not be replaced by an export"
+        );
+    }
+
+    /// Same hole, symlink flavor: a vault directory reached under another name
+    /// still houses the same vault files, so the export must refuse.
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_through_a_symlinked_vault_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        store::init(&paths, false, "test-password").unwrap();
+        let before = std::fs::read(paths.store()).unwrap();
+
+        let link = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&paths.home, &link).unwrap();
+        let err = resolve_output_path(&paths, &link.join("vault.age"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to export over the vault file"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(paths.store()).unwrap(), before);
+    }
+
+    #[test]
+    fn lexical_absolute_collapses_dot_components() {
+        use std::path::Path;
+        assert_eq!(
+            lexical_absolute(Path::new("/vault/sub/../vault.age")),
+            PathBuf::from("/vault/vault.age")
+        );
+        assert_eq!(
+            lexical_absolute(Path::new("/vault/./vault.age")),
+            PathBuf::from("/vault/vault.age")
+        );
+        // `..` above the root stays the root instead of eating it.
+        assert_eq!(
+            lexical_absolute(Path::new("/../vault.age")),
+            PathBuf::from("/vault.age")
+        );
     }
 
     #[test]
