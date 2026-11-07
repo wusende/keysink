@@ -129,7 +129,9 @@ keysink route rotate claude                                       # 换 vkey,旧
 
 `~/.local/share/keysink`(Windows:`%LOCALAPPDATA%\keysink`;系统安装:`/var/lib/keysink`)。用 `--home` 或 `KEYSINK_VAULT_HOME` 换位置。
 
-主密码只用于加密和恢复 `export` 备份——服务、加 key、轮换、停用都不问主密码,所以忘了密码不会卡住守护进程重启。
+主密码只保护 `export` 备份(写备份前会校验)——服务、加 key、轮换、停用都不问主密码,所以忘了密码不会卡住守护进程重启。
+
+`export` 是**配置**备份,不是可还原的保险库:里面是路由(base_url、认证方式、重试策略、vkey),所有真 key 都被剥离,既不能直接当 `vault.age` 用,也解不出一份能跑的工作库。恢复只能手工来——`age -d` 解出来后重建路由,再用 `route update <name> --route-key -` 逐条重输 key。真正能还原的是 `vault.key` + `vault.age`,要备份的是这两个。
 
 `vault.key` 是明文的 age identity 文件(`0600`),并不由主密码保护:保险库的防护是文件权限加独立 UID。服务态可以把 identity 放到保险库目录外面——`KEYSINK_MASTER_KEY`(直接给 age identity)或 `KEYSINK_MASTER_KEY_FILE`(给一个文件路径),systemd 的 `LoadCredential` 要的就是这种。
 

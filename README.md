@@ -199,9 +199,16 @@ bad and how to restore it.
 `~/.local/share/keysink` (Windows: `%LOCALAPPDATA%\keysink`; system installs:
 `/var/lib/keysink`). Move it with `--home` or `KEYSINK_VAULT_HOME`.
 
-The master password is only used to encrypt and restore `export` backups —
-serving, adding, rotating and disabling keys never ask for it, so a daemon
-restart can't be blocked by a forgotten password.
+The master password only protects `export` backups (and is verified before one
+is written) — serving, adding, rotating and disabling keys never ask for it, so
+a daemon restart can't be blocked by a forgotten password.
+
+`export` is a **configuration** backup, not a restorable vault: it contains the
+routes (base URLs, auth method, retry policy, vkeys) with every real key
+stripped, so it can neither be dropped in as `vault.age` nor decrypted into a
+working vault. Recovery is manual — `age -d` it, then re-create the routes and
+re-enter each key with `route update <name> --route-key -`. The copy that
+actually restores is `vault.key` + `vault.age`, so back those two up.
 
 `vault.key` is a plain age identity file (`0600`), not something the master
 password protects: the vault's protection is file mode plus a separate UID. For

@@ -224,7 +224,7 @@ fn cmd_init(paths: &Paths, force: bool, password_stdin: bool) -> Result<()> {
     }
     println!();
     println!(
-        "master password is only used to encrypt and restore `export` backups; writes/rotation/serve never need it."
+        "master password is only used to encrypt and verify `export` backups; writes/rotation/serve never need it."
     );
     println!("Next steps:");
     println!("  keysink route add claude --base-url https://api.anthropic.com");
