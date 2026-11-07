@@ -194,18 +194,28 @@ curl -sS -o /dev/null "http://127.0.0.1:$GW_PORT/echo" \
   -H 'Authorization: Bearer ks_rejected000000000000000000000000000000000000000'
 # The audit writer batches lines in a BufWriter that flushes after FLUSH_IDLE
 # (50ms); the greps race that flush on a fast machine, so poll for the content.
+# Rejection rows go to their own rotation chain (`<file>.rej`), so the 401 row
+# belongs there, not in the real-traffic file.
 wait_audit() {
+  local file="$1" needle="$2"
   for _ in $(seq 1 50); do
-    grep -q "$1" "$TMP/audit.jsonl" 2>/dev/null && return 0
+    grep -q "$needle" "$file" 2>/dev/null && return 0
     sleep 0.1
   done
+  echo "audit assertion failed: $needle not found in $file" >&2
   return 1
 }
-wait_audit '"route":"echo"'
-wait_audit '"route":"-"'
-wait_audit '"status":401'
-if grep -q 'real-key-123\|ks_' "$TMP/audit.jsonl"; then
+wait_audit "$TMP/audit.jsonl" '"route":"echo"'
+wait_audit "$TMP/audit.jsonl.rej" '"route":"-"'
+wait_audit "$TMP/audit.jsonl.rej" '"status":401'
+if grep -q 'real-key-123\|ks_' "$TMP/audit.jsonl" "$TMP/audit.jsonl.rej"; then
   echo "audit log leaked a secret or vkey" >&2
+  exit 1
+fi
+# Rejection rows must stay off the real-traffic chain: that separation is what
+# stops an unauthenticated flood from rotating the forensic trail away.
+if grep -q '"rejected":true' "$TMP/audit.jsonl"; then
+  echo "a rejection row landed on the real-traffic audit chain" >&2
   exit 1
 fi
 
@@ -227,8 +237,14 @@ kill "$GATEWAY_PID" 2>/dev/null || true
 wait "$GATEWAY_PID" 2>/dev/null || true
 VKEYD="$(printf 'real-key-123\n' | ks route add direct-route --base-url "http://127.0.0.1:$UP_PORT" \
   --auth bearer --proxy direct | new_vkey)"
-# Gateway running with a dead system proxy: routes without proxy fall back to the system proxy → 502; direct routes bypass it → 200
-ALL_PROXY=http://127.0.0.1:1 "$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" >"$TMP/gw3.log" 2>&1 &
+# Gateway running with a dead system proxy: routes without proxy fall back to
+# the system proxy → 502; direct routes bypass it → 200.
+#
+# NO_PROXY in the ambient environment wins over ALL_PROXY for loopback targets
+# (curl/reqwest semantics), which silently makes the fallback route go direct
+# and the assertion moot. Clear it for this run so the case tests what it says.
+ALL_PROXY=http://127.0.0.1:1 NO_PROXY= no_proxy= \
+  "$BIN" --home "$VAULT" serve --listen "127.0.0.1:$GW_PORT" >"$TMP/gw3.log" 2>&1 &
 GATEWAY_PID=$!
 wait_health
 CODE="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$GW_PORT/echo" \
