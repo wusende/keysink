@@ -89,6 +89,24 @@ impl Paths {
     }
 }
 
+/// Whether the process is configured to load the master identity from outside
+/// the vault (`KEYSINK_MASTER_KEY` / `KEYSINK_MASTER_KEY_FILE`).
+///
+/// `init` and `rekey` always create/replace `vault.key`; with an external
+/// identity configured, the running gateway would keep using the external one
+/// and could no longer decrypt a store encrypted to the new file key. The CLI
+/// refuses those operations up front; the library functions stay usable for
+/// tests and for callers that manage the identity themselves.
+pub fn external_identity_configured() -> bool {
+    std::env::var_os("KEYSINK_MASTER_KEY").is_some()
+        || std::env::var_os("KEYSINK_MASTER_KEY_FILE").is_some()
+}
+
+/// Creates a new `vault.key` + `vault.age` pair.
+///
+/// Always generates a fresh identity; the CLI refuses to call this while
+/// [`external_identity_configured`] is true, because the service would keep
+/// using the external identity and could not decrypt the new store.
 pub fn init(paths: &Paths, force: bool, password: &str) -> Result<()> {
     let key_exists = paths.master_key().exists();
     let store_exists = paths.store().exists();

@@ -181,6 +181,14 @@ fn data_home_fallback(_home: Option<&std::ffi::OsStr>) -> PathBuf {
 }
 
 fn cmd_init(paths: &Paths, force: bool, password_stdin: bool) -> Result<()> {
+    if store::external_identity_configured() {
+        return Err(Error::msg(
+            "KEYSINK_MASTER_KEY / KEYSINK_MASTER_KEY_FILE is set: init creates vault.key and \
+             encrypts the store to it, so the external identity could not decrypt the vault. \
+             Initialize without the variable, then point the gateway at the generated vault.key \
+             (or copy it to the credential path).",
+        ));
+    }
     let password = crate::password::read_new_password(password_stdin)?;
     store::init(paths, force, &password)?;
     println!("vault initialized: {}", paths.home.display());
@@ -1805,6 +1813,14 @@ fn looks_like_vault(home: &std::path::Path) -> bool {
 }
 
 pub(crate) fn cmd_rekey(paths: &Paths, yes: bool) -> Result<()> {
+    if store::external_identity_configured() {
+        return Err(Error::msg(
+            "refusing to rotate the master key while KEYSINK_MASTER_KEY / KEYSINK_MASTER_KEY_FILE \
+             is set: rekey replaces vault.key, but the running gateway keeps using the external \
+             identity and could no longer decrypt the store. Rotate the external credential first \
+             (or unset it and use the vault file), then retry.",
+        ));
+    }
     if !yes {
         if !std::io::stdin().is_terminal() {
             return Err(Error::msg("non-interactive mode requires --yes"));
