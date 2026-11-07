@@ -17,7 +17,6 @@ pub struct Store {
     #[serde(default)]
     pub routes: BTreeMap<String, Route>,
 }
-
 impl Default for Store {
     fn default() -> Self {
         Self::new()
@@ -77,7 +76,7 @@ impl Drop for Route {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Route {
     pub vkey: String,
     pub base_url: String,
@@ -104,6 +103,37 @@ pub struct Route {
     pub note: String,
     #[serde(default)]
     pub created: u64,
+}
+
+/// Debug that never prints the secret.
+///
+/// A derived impl would put `inline_key` (the real upstream credential) into
+/// every `{:?}` — a fuzz artifact, a panic message, a log line added later.
+/// The vault's whole promise is that the key cannot come out, so the type
+/// itself must not hand it out.
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Route")
+            .field("vkey", &crate::vkey::mask(&self.vkey))
+            .field("base_url", &self.base_url)
+            .field(
+                "inline_key",
+                &match &self.inline_key {
+                    Some(_) => "<redacted>",
+                    None => "<missing>",
+                },
+            )
+            .field("auth", &self.auth)
+            .field("headers", &self.headers)
+            .field("enabled", &self.enabled)
+            .field("max_retries", &self.max_retries)
+            .field("retry_on_status", &self.retry_on_status)
+            .field("sse_terminator", &self.sse_terminator)
+            .field("proxy", &self.proxy)
+            .field("note", &self.note)
+            .field("created", &self.created)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -428,6 +458,21 @@ mod tests {
     #[test]
     fn validates_ok() {
         sample().validate().unwrap();
+    }
+
+    #[test]
+    fn route_debug_never_prints_the_secret() {
+        let mut s = sample();
+        s.routes.get_mut("r").unwrap().inline_key = Some("never-leak-me".into());
+        let text = format!("{:?}", s);
+        assert!(
+            !text.contains("never-leak-me"),
+            "Debug must redact the route-only key: {text}"
+        );
+        assert!(text.contains("<redacted>"), "{text}");
+        // The Store Debug includes every route, so it must be covered too.
+        let store_text = format!("{:?}", s.routes["r"]);
+        assert!(!store_text.contains("never-leak-me"), "{store_text}");
     }
 
     #[test]
