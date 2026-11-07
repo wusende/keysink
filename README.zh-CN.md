@@ -216,4 +216,4 @@ cargo build --release
 bash scripts/smoke.sh    # 端到端:假上游、转发 / SSE / 重试 / 热重载 / 导出剥离
 ```
 
-`cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加 `perf/ksbench` 里的性能压测(load driver + 假上游)。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物,开了 `NPM_PUBLISH` 后同时发布 npm 包(见 `npm/README.md`)。
+`cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加 `perf/ksbench` 里的性能压测(load driver + 假上游)。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物,开了 `CRATES_PUBLISH` / `NPM_PUBLISH` 后同时发布 crates.io 和 npm 包(见 `docs/publishing.md`)。

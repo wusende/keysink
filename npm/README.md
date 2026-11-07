@@ -51,7 +51,7 @@ npm registry 有 npmmirror 等完整镜像，GitHub Releases 没有，国内用�
    注意：如果账号仍处于「新发布者审核」状态，`npm publish` 可能又生成 `0.0.0-stage`
    占位包，需要去 npmjs.com 的 **Staged Packages** 批准，或提工单。
 
-3. **给 `keysink` 配 Trusted Publisher**（npmjs.com → 包 → Settings → Trusted publishing）：
+3. **给 `keysink` 配 Trusted Publisher**（npmjs.com → 包 → Settings → Trusted publishing；crates.io 的同名配置见 `docs/publishing.md`）：
 
    | 字段 | 值 |
    |---|---|

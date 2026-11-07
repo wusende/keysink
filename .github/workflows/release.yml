@@ -108,6 +108,64 @@ jobs:
             ${{ matrix.artifact }}.*
           body: ${{ steps.changelog.outputs.body }}
 
+  # Publishes the crate to crates.io through trusted publishing (OIDC): the repo
+  # holds no CARGO_REGISTRY_TOKEN, the workflow trades a short-lived OIDC token
+  # for a 30-minute publish token. crates.io verifies repository + workflow name,
+  # so this job only works while release.yml keeps its name and the trusted
+  # publisher entry stays configured (Settings → Trusted Publishing).
+  #
+  # Gated on the CRATES_PUBLISH repository variable, same shape as NPM_PUBLISH:
+  # the entry can only be added by a crate owner from the web UI, and a tag
+  # release should not go red while that is still pending. Until CRATES_PUBLISH
+  # is set to true, tag releases skip this job. Setup: docs/publishing.md.
+  crates:
+    name: publish crates.io
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && vars.CRATES_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token, exchanged for a crates.io publish token
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # Re-pushing a tag, or re-running the job after a network blip, must not
+      # try to publish twice: crates.io versions are immutable and a second
+      # upload of the same version is a hard failure. Mirrors
+      # scripts/npm-publish.sh, which skips versions already on the registry.
+      #
+      # The tag/version assertion is the last guard against shipping a binary
+      # named v0.3.0 while Cargo.toml still says 0.2.2 — the npm side only
+      # checks that its manifest agrees with Cargo.toml, not with the tag.
+      - name: check registry
+        id: gate
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          # curl -f turns HTTP 404 into exit 22, so only that means "not
+          # published yet"; any other failure is the API being unreachable and
+          # must not be read as a green light to upload.
+          status=0
+          curl -sf -A "keysink-release-ci" \
+            "https://crates.io/api/v1/crates/keysink/$version" >/dev/null || status=$?
+          case "$status" in
+            0)  echo "skip keysink@$version (already published)" ;;
+            22) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *)  echo "crates.io API unreachable (curl exit $status); refusing to guess" >&2
+                exit 1 ;;
+          esac
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.gate.outputs.publish == 'true'
+        id: auth
+      - name: publish
+        if: steps.gate.outputs.publish == 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
   # Publishes the same binaries to npm as one self-contained package: every
   # platform lives in vendor/<platform>-<arch>/ inside `keysink`, so installing
   # needs only the npm registry (mirror-friendly) and runs no install scripts.

@@ -353,5 +353,5 @@ bash scripts/smoke.sh    # end-to-end: fake upstream, forwarding / SSE / retry /
 `cargo test` includes a seeded fuzz suite (22 targets over the pure helpers, a
 vault corruption matrix, and end-to-end fuzz against a mock upstream) plus the
 perf harness in `perf/ksbench`. Pushing a `v*` tag makes GitHub Actions build and
-publish release artifacts for all platforms, plus the npm packages once
-`NPM_PUBLISH` is enabled (see `npm/README.md`).
+publish release artifacts for all platforms, plus crates.io and the npm package
+once `CRATES_PUBLISH` / `NPM_PUBLISH` are enabled (see `docs/publishing.md`).
