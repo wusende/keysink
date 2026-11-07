@@ -250,6 +250,29 @@ impl Route {
                 "route `{name}` max_retries must not exceed 10"
             )));
         }
+        // The route-only key is injected verbatim into a header for these auth
+        // types. Validate it the same way as the other header fields: a key
+        // with a control character (a newline from a multi-line stdin pipe,
+        // for instance) would otherwise pass validation and turn every request
+        // on the route into a 500 at forward time.
+        if let Some(key) = &self.inline_key {
+            let injected = match &self.auth {
+                Auth::Bearer => Some(format!("Bearer {key}")),
+                Auth::XApiKey => Some(key.clone()),
+                Auth::Header { prefix, .. } => Some(format!("{prefix}{key}")),
+                // Basic base64-encodes the pair, Query percent-encodes the
+                // value, and None never injects it: control characters cannot
+                // break those header/URL constructions.
+                Auth::Basic { .. } | Auth::Query { .. } | Auth::None => None,
+            };
+            if let Some(value) = injected
+                && axum::http::HeaderValue::from_str(&value).is_err()
+            {
+                return Err(Error::msg(format!(
+                    "route `{name}` route-only key contains characters that cannot be sent in an HTTP header (control characters such as newlines are not allowed)"
+                )));
+            }
+        }
         if let Some(statuses) = &self.retry_on_status
             && let Some(bad) = statuses.iter().find(|s| !(400..=599).contains(*s))
         {
@@ -501,6 +524,46 @@ mod tests {
             prefix: String::new(),
         };
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_inline_key_the_auth_header_would_refuse() {
+        // Bearer / x-api-key / custom-header inject the route-only key into a
+        // header verbatim; a control character must be rejected at save time
+        // instead of 500ing every request later.
+        for auth in [
+            Auth::Bearer,
+            Auth::XApiKey,
+            Auth::Header {
+                name: "x-auth".into(),
+                prefix: "Bearer ".into(),
+            },
+        ] {
+            for bad in ["key\npart", "key\rpart", "key\u{0}part", "key\u{7f}part"] {
+                let mut s = sample();
+                s.routes.get_mut("r").unwrap().auth = auth.clone();
+                s.routes.get_mut("r").unwrap().inline_key = Some(bad.into());
+                assert!(
+                    s.validate().is_err(),
+                    "{auth:?} key {bad:?} should be rejected"
+                );
+            }
+        }
+        // Basic base64-encodes the pair and Query percent-encodes the value,
+        // so the same bytes cannot break the constructed header/URL.
+        for auth in [
+            Auth::Basic {
+                username: "user".into(),
+            },
+            Auth::Query {
+                param: "key".into(),
+            },
+        ] {
+            let mut s = sample();
+            s.routes.get_mut("r").unwrap().auth = auth;
+            s.routes.get_mut("r").unwrap().inline_key = Some("key\npart".into());
+            s.validate().unwrap();
+        }
     }
 
     #[test]

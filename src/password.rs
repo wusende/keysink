@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::util;
 use rand::Rng;
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 
 const LOG_N: u8 = 15;
 const R: u32 = 8;
@@ -130,8 +130,11 @@ pub fn read_existing_password(from_stdin: bool) -> Result<String> {
 }
 
 fn read_line() -> Result<String> {
+    // One line, matching the --password-stdin documentation: read_to_string
+    // used to swallow a multi-line pipe and turn the extra lines into part of
+    // the password.
     let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
+    std::io::stdin().read_line(&mut text)?;
     while text.ends_with('\n') || text.ends_with('\r') {
         text.pop();
     }

@@ -9,7 +9,7 @@ use crate::vkey;
 use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -986,8 +986,11 @@ fn resolve_required(given: Option<String>, label: &str, flag: &str) -> Result<St
 }
 
 fn read_stdin() -> Result<Zeroizing<String>> {
+    // One line, as documented: a key is a single credential, and reading to
+    // EOF used to silently turn a multi-line pipe into a key containing
+    // newlines (which then failed in every forwarded header).
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
+    std::io::stdin().read_line(&mut buf)?;
     Ok(Zeroizing::new(buf))
 }
 
