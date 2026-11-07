@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**Docs**
+
+- `docs/perf-test-plan.md` now exists: the scenario matrix, metric
+  definitions and aggregation behind `scripts/perf.sh` lived only in script
+  comments, and two of those comments pointed at this file before it was
+  ever committed
+- The README gains a measured performance baseline (one machine, one run;
+  `scripts/perf.sh` reproduces it on your own hardware) and a pre-1.0 note
+  that the CLI surface may still change between releases; the Chinese README
+  picks up the docs.rs and Platforms badges the English one already had
+
 ## v0.2.2
 
 *Released 2026-11-07.*

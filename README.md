@@ -9,6 +9,9 @@ English | [简体中文](README.zh-CN.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/wusende/keysink/releases/latest)
 
+> Pre-1.0: the CLI and route surface may still change between releases; each
+> release's operational notes are in the [changelog](CHANGELOG.md).
+
 A small local gateway that keeps your real API keys out of your agents. The
 agent gets a revocable virtual key (`ks_…`); keysink holds the real key in an
 encrypted local vault and swaps it in only at forward time.
@@ -302,6 +305,30 @@ immediately, so a restart no longer waits out a 30s header timeout; the
 systemd unit's `TimeoutStopSec=30` is the backstop above that. The store
 watcher is supervised too: if it dies it is restarted, and if it stops ticking
 the log says so.
+
+## Performance
+
+One machine's reference numbers (Apple M4 Pro, macOS 26, release build of
+v0.2.2; 1 KB POST over loopback, 10-second runs) — treat them as order of
+magnitude and reproduce with the harness on your own hardware:
+
+| scenario | direct | through keysink |
+|---|---|---|
+| 1 KB echo, concurrency 8 | 102k rps · p50 75 µs · p99 136 µs | 51k rps · p50 153 µs · p99 238 µs |
+| 1 KB echo, concurrency 64 | — | 80k rps · p50 785 µs · p99 1.4 ms |
+| SSE time-to-first-chunk (upstream waits 50 ms) | p50 52.4 ms | p50 52.7 ms (+0.3 ms) |
+| SSE inter-chunk gap (p50) | 0 µs | 4 µs |
+
+The two extra loopback hops cost real throughput on tiny requests — roughly
+half at the same concurrency, about 80 µs at p50. Against an LLM upstream
+that answers in hundreds of milliseconds and streams for seconds, both are
+noise.
+
+`scripts/perf.sh` is the full harness: a concurrency ladder, request bodies
+up to 32 MB in three `stream`-marker shapes, SSE streams up to 16 MB,
+behavior at the concurrency cap, audit on/off, per-request log cost, hot
+reload under load, and a 10-minute soak with RSS sampling. Methodology and
+metric definitions: `docs/perf-test-plan.md`.
 
 ## What this is not
 

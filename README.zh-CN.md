@@ -4,8 +4,12 @@
 
 [![CI](https://github.com/wusende/keysink/actions/workflows/ci.yml/badge.svg)](https://github.com/wusende/keysink/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/keysink.svg)](https://crates.io/crates/keysink)
+[![docs.rs](https://img.shields.io/docsrs/keysink)](https://docs.rs/keysink)
 [![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/wusende/keysink/releases/latest)
+
+> 1.0 之前,CLI 与路由接口仍可能在版本间变动;每个版本的操作注意事项见 [CHANGELOG](CHANGELOG.md)。
 
 本机小型网关:真 API key 不进 agent。agent 只拿到可随时吊销的虚拟 key(`ks_…`),真 key 加密存在本地保险库,只在转发那一刻替换进去。
 
@@ -185,6 +189,21 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 `--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。非流式响应体既按单块也按整体设上界,所以一分钟吐一个字节的上游也没法永久占住连接。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉,连上后迟迟不发第一个请求(包括卡在 h2 握手里的)也会在 head 超时被关掉。每个转发请求还有整体预算(10 分钟):重试、退避和可重试响应体的丢弃共享这份预算,所以配了很大的 `--max-retries` 也不会占住入口槽位几十分钟。
 
 关闭流程也是可控的:`serve` 停止接受新连接,通知每条活着的连接处理完当前响应后关闭(`Connection: close`,h2 发 `GOAWAY`),最多 drain `--drain-timeout-secs`(默认 10,`0` 表示一直等),到点还在的连打一行 warning 后丢弃。空闲 keep-alive 连接会立即关闭,重启不用再等 30 秒的 head 超时;systemd unit 里的 `TimeoutStopSec=30` 是更上一层的兜底。store 监听器也加了看门狗:死了会重启,停止 tick 会在日志里报出来。
+
+## 性能
+
+一台参考机器上的实测数字(Apple M4 Pro,macOS 26,v0.2.2 release 构建;1 KB POST 走 loopback,每轮 10 秒)——当数量级看,用下面的测试工具在自己的机器上复现:
+
+| 场景 | 直连 | 经 keysink |
+|---|---|---|
+| 1 KB echo,并发 8 | 102k rps · p50 75 µs · p99 136 µs | 51k rps · p50 153 µs · p99 238 µs |
+| 1 KB echo,并发 64 | — | 80k rps · p50 785 µs · p99 1.4 ms |
+| SSE 首块到达(上游等 50 ms) | p50 52.4 ms | p50 52.7 ms(+0.3 ms) |
+| SSE 块间隔(p50) | 0 µs | 4 µs |
+
+小请求下多两跳 loopback 是有代价的:同并发下吞吐大约减半,p50 多出约 80 µs——对几百毫秒起、还要流式输出好几秒的 LLM 上游,都是噪声。
+
+`scripts/perf.sh` 是完整的测试工具:并发阶梯、最大 32 MB 的三种 `stream` 标记形态的请求体、最大 16 MB 的 SSE 流、并发上限处的行为、审计开/关、每请求日志成本、负载下的热重载,以及带 RSS 采样的 10 分钟 soak。方案与指标定义见 `docs/perf-test-plan.md`。
 
 ## 它不是什么
 
