@@ -121,7 +121,7 @@ keysink route rotate claude                                       # 换 vkey,旧
 
 `status` 打印保险库摘要(位置、schema、路由数)。`doctor` 跑完整性检查——属主、权限、key 能否解析、store 能否解密、备份能否解密——出问题先跑它。
 
-要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"degraded":false,"version":"0.2.0","uptime_secs":…,"routes":2}`;另外还有以前看不见的状态:`snapshot_age_secs`(当前快照已服务多久——监听器只在保险库变更时才重载,保险库稳定不变时它会随 uptime 正常增长,反映的是数据新旧而不是监听器健康,别拿它做告警)、`reload_failures` / `reload_attempts`(真正的重载信号:保险库一直坏着时 failures 会持续上涨)、`shed_connections` / `accept_errors`(连接上限丢弃数、每连接 accept 错误数),以及 `audit` / `audit_ok` / `audit_dropped`(审计写线程死掉时 `audit_ok:false`,而不是默默丢每一行)。
+要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"healthy":true,"degraded":false,"version":"0.2.1","uptime_secs":…,"routes":2}`;另外还有以前看不见的状态:`snapshot_age_secs`(当前快照已服务多久——监听器只在保险库变更时才重载,保险库稳定不变时它会随 uptime 正常增长,反映的是数据新旧而不是监听器健康,别拿它做告警)、`reload_failures` / `reload_attempts`(真正的重载信号:保险库一直坏着时 failures 会持续上涨)、`shed_connections` / `accept_errors`(连接上限丢弃数、每连接 accept 错误数),以及 `audit` / `audit_ok` / `audit_dropped`(审计写线程死掉或写不进去时 `audit_ok:false`,而不是默默丢每一行)、`watcher_age_secs`(监听器上次 tick 距今多久)。`ok` 只说明进程在应答;`healthy` 才说明它服务的数据可信——快照来自过期备份、热重载持续失败、审计写不进去、监听器停止 tick 时都会变 false。存活探针看 `ok`(别重启还在应答的网关),告警和就绪探针看 `healthy`。
 
 `--accept-degraded` 是保险库坏了时的逃生口:主 store 解密失败时,允许网关改用 `vault.age.bak` 启动。那份备份落后一次写入,所以这段时间里被轮换或删除的 vkey 会重新生效——它只是让 agent 继续跑,不是可以长待的状态。`doctor` 会告诉你哪个文件坏了、怎么恢复。
 
@@ -172,7 +172,7 @@ printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
 
 `--audit-log` 记录路由、vkey 指纹、状态码和延迟——不记 header、body、query。默认关闭。真实流量保留 5 份轮转日志(每份 10 MB)。被拒的请求单独写进自己的轮转链(`<审计文件>.rej`,同样 5 × 10 MB),并按指纹每秒 1 条、全局每秒 100 条节流——未鉴权的请求洪水最多逐出拒绝记录自己的历史,动不了真实流量的取证记录。
 
-`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。非流式响应体既按单块也按整体设上界,所以一分钟吐一个字节的上游也没法永久占住连接。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉。
+`--listen` 可以绑非 loopback 地址,但那样 TLS 和网络暴露面就得你自己解决;预期部署方式只有 loopback。请求的每个环节默认都有上界——body 大小、并发数、连接数、时间——上游挂死或 agent 失常不会拖垮网关。非流式响应体既按单块也按整体设上界,所以一分钟吐一个字节的上游也没法永久占住连接。空闲连接也有界:http1 的 head 必须在 30 秒内发完,h2 连接如果不再回应 keep-alive PING 会被关掉,连上后迟迟不发第一个请求(包括卡在 h2 握手里的)也会在 head 超时被关掉。每个转发请求还有整体预算(10 分钟):重试、退避和可重试响应体的丢弃共享这份预算,所以配了很大的 `--max-retries` 也不会占住入口槽位几十分钟。
 
 关闭是优雅且有界的:`serve` 停止接受新连接,通知每条活着的连接处理完当前响应后关闭(`Connection: close`,h2 发 `GOAWAY`),最多 drain `--drain-timeout-secs`(默认 10,`0` 表示一直等),到点还在的连打一行 warning 后丢弃。空闲 keep-alive 连接会立即关闭,重启不用再等 30 秒的 head 超时;systemd unit 里的 `TimeoutStopSec=30` 是更上一层的兜底。store 监听器也加了看门狗:死了会重启,停止 tick 会在日志里报出来。
 

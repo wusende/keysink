@@ -273,8 +273,14 @@ Nothing is unbounded: 32 MB bodies (`--body-limit-mb`), 64 in-flight requests
 finish reading http1 request heads. A non-streaming response body is bounded
 both per chunk and as a whole, so an upstream that trickles a byte a minute
 cannot hold a connection forever. An h2 connection that stops answering
-keep-alive PINGs is closed. A hung upstream or a misbehaving agent can't take
+keep-alive PINGs is closed, and a connection that never sends its first
+request (including one that stalls inside the h2 handshake) is closed at the
+head timeout. A hung upstream or a misbehaving agent can't take
 the gateway down.
+
+Every forwarded request also has a whole-forward budget (10 minutes): retry
+attempts, backoff sleeps and retryable-body drains share it, so a route with a
+large `--max-retries` cannot hold an inbound slot for tens of minutes.
 
 Shutdown is graceful and bounded: `serve` stops accepting, tells every live
 connection to finish and close (`Connection: close`, h2 `GOAWAY`), and drains

@@ -345,6 +345,7 @@ fn build_state(
         inbound_body_timeout,
         permit_queue_timeout,
         body_total_budget: keysink::proxy::BODY_TOTAL_BUDGET,
+        forward_total_budget: keysink::proxy::FORWARD_TOTAL_BUDGET,
         reload: Arc::new(keysink::proxy::ReloadStatus::default()),
         counters: Arc::new(keysink::proxy::ServeCounters::default()),
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(max_inbound)),
@@ -783,6 +784,91 @@ async fn retryable_status_with_stalled_body_does_not_wedge_the_handler() {
         "discard must give up at the read idle, took {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn total_forward_budget_bounds_a_retry_storm() {
+    // Regression: per-attempt header_timeout alone let a route with
+    // max_retries = 10 hold an inbound permit for ~20 minutes. The
+    // whole-forward budget must end the retry storm instead, and the last
+    // response seen is returned to the client.
+    let (mock, hits) = spawn_mock().await;
+    let mut store = Store::new();
+    store.routes.insert(
+        "main".into(),
+        route_to(
+            &format!("http://{mock}"),
+            Terminator::Auto,
+            Auth::Bearer,
+            true,
+        ),
+    );
+    let policy = RetryPolicy {
+        max_retries: 10,
+        statuses: vec![503].into(),
+        // Each attempt burns its full header timeout against /hang: the
+        // whole-forward budget is what has to stop the ladder.
+        initial_backoff: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(20),
+        header_timeout: Duration::from_millis(50),
+    };
+    let (mut state, vks) = build_state(
+        store,
+        policy,
+        1 << 20,
+        keysink::proxy::BODY_READ_IDLE,
+        keysink::proxy::CLIENT_BODY_TIMEOUT,
+        64,
+        keysink::proxy::PERMIT_QUEUE_TIMEOUT,
+    );
+    Arc::get_mut(&mut state)
+        .expect("the test holds the only Arc to the state")
+        .forward_total_budget = Duration::from_millis(200);
+    let app = keysink::proxy::build_app(state);
+    #[cfg(unix)]
+    raise_fd_limit();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(keysink::proxy::serve_inbound(
+        listener,
+        app,
+        keysink::proxy::InboundLimits {
+            header_timeout: Duration::from_secs(30),
+            max_connections: 8,
+            drain_timeout: Some(Duration::from_secs(5)),
+            loop_iterations: None,
+            live_connections: None,
+            counters: None,
+        },
+        std::future::pending(),
+    ));
+
+    let started = Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        // GET so the header timeout is replayable: this exercises the retry
+        // ladder rather than the POST-replay guard.
+        reqwest::Client::new()
+            .get(format!("http://{addr}/hang"))
+            .header("authorization", format!("Bearer {}", vks["main"]))
+            .send(),
+    )
+    .await
+    .expect("the forward budget must end the retry storm")
+    .unwrap();
+    assert_eq!(resp.status(), 504, "the budget ends as an upstream timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the request must stop near the 200ms budget, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        hits.load(Ordering::Relaxed) < 11,
+        "the budget must cut the retries short, saw {} attempts",
+        hits.load(Ordering::Relaxed)
+    );
+
+    server.abort();
 }
 
 #[tokio::test]

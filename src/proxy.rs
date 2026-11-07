@@ -45,6 +45,10 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// give up". SSE bodies are bounded by STREAM_READ_TIMEOUT instead.
 pub const BODY_READ_IDLE: Duration = crate::retry::DEFAULT_HEADER_TIMEOUT;
 
+/// Whole-forward budget for one request (see [`crate::retry::FORWARD_TOTAL_BUDGET`]);
+/// re-exported here next to the other phase bounds.
+pub const FORWARD_TOTAL_BUDGET: Duration = crate::retry::FORWARD_TOTAL_BUDGET;
+
 /// Whole-response budget for a non-streaming body, on top of the per-chunk
 /// read idle. The idle bound alone only catches an upstream that goes silent:
 /// one that trickles a byte every minute is "alive" forever, and each such
@@ -167,6 +171,10 @@ pub struct AppState {
     pub permit_queue_timeout: Duration,
     /// Whole-body budget for a non-streaming upstream response (BODY_TOTAL_BUDGET in production; tests inject a small value).
     pub body_total_budget: Duration,
+    /// Whole-forward budget: all retry attempts, backoffs and retryable-body
+    /// drains combined (FORWARD_TOTAL_BUDGET in production; tests inject a
+    /// small value). Bounds how long one request can hold an inbound permit.
+    pub forward_total_budget: Duration,
     /// Hot-reload health, published for the health endpoint and the watcher watchdog.
     pub reload: Arc<ReloadStatus>,
     /// Serve-loop counters (shed connections, per-connection accept errors),
@@ -1328,6 +1336,23 @@ async fn discard_body_limited(mut resp: reqwest::Response, budget: Duration) {
     }
 }
 
+/// Sleeps out a retry backoff, clamped to what is left of the whole-forward
+/// deadline: a Retry-After of 60s must not sleep past a budget that has less
+/// time left.
+pub(crate) async fn sleep_before_retry(
+    policy: &RetryPolicy,
+    attempt: u8,
+    retry_after: Option<Duration>,
+    deadline: Instant,
+) {
+    let wait = policy
+        .backoff(attempt as u32, retry_after)
+        .min(deadline.saturating_duration_since(Instant::now()));
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_with_retry(
     state: &AppState,
@@ -1343,6 +1368,11 @@ async fn forward_with_retry(
 ) -> Forwarded {
     let policy = state.retry.for_route(route);
     let max_retries = policy.max_retries;
+    // Whole-forward deadline: every attempt's header wait, every backoff sleep
+    // and every retryable-body drain must fit inside it. Without it, a route
+    // with max_retries = 10 holds an inbound permit for ~20 minutes and
+    // --max-concurrent such requests wedge the gateway.
+    let deadline = Instant::now() + state.forward_total_budget;
     // POST replay safety (§4.2): on a response-header timeout or a network
     // error mid-send, the request may already have reached the upstream and
     // been billed, so a retry is a second POST. Only connect-class errors
@@ -1361,24 +1391,35 @@ async fn forward_with_retry(
             req.body(body.clone())
         };
 
-        let send = tokio::time::timeout(policy.header_timeout, req.send()).await;
+        // The per-attempt header timeout is additionally clamped to what is
+        // left of the whole-forward budget.
+        let attempt_timeout = policy
+            .header_timeout
+            .min(deadline.saturating_duration_since(Instant::now()));
+        let send = tokio::time::timeout(attempt_timeout, req.send()).await;
 
         let resp = match send {
             Err(_) => {
+                let exhausted = Instant::now() >= deadline;
                 tracing::warn!(
                     attempt,
                     route = route_name,
+                    exhausted,
                     "timed out waiting for upstream response headers"
                 );
-                if idempotent && attempt < max_retries {
-                    tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
+                if idempotent && attempt < max_retries && !exhausted {
+                    sleep_before_retry(&policy, attempt, None, deadline).await;
                     continue;
                 }
                 return Forwarded {
                     response: error_response(
                         StatusCode::GATEWAY_TIMEOUT,
                         "upstream_timeout",
-                        "upstream response header timeout",
+                        if exhausted {
+                            "upstream did not answer within the total forwarding budget"
+                        } else {
+                            "upstream response header timeout"
+                        },
                         rid,
                     ),
                     attempts: attempt + 1,
@@ -1392,8 +1433,11 @@ async fn forward_with_retry(
                     connect = e.is_connect(),
                     "upstream request failed"
                 );
-                if network_retry_allowed(e.is_connect(), idempotent) && attempt < max_retries {
-                    tokio::time::sleep(policy.backoff(attempt as u32, None)).await;
+                if network_retry_allowed(e.is_connect(), idempotent)
+                    && attempt < max_retries
+                    && Instant::now() < deadline
+                {
+                    sleep_before_retry(&policy, attempt, None, deadline).await;
                     continue;
                 }
                 return Forwarded {
@@ -1410,7 +1454,7 @@ async fn forward_with_retry(
         };
 
         let status = resp.status().as_u16();
-        if policy.is_retryable(status) && attempt < max_retries {
+        if policy.is_retryable(status) && attempt < max_retries && Instant::now() < deadline {
             let retry_after = resp
                 .headers()
                 .get(header::RETRY_AFTER)
@@ -1422,8 +1466,11 @@ async fn forward_with_retry(
                 route = route_name,
                 "upstream returned retryable status"
             );
-            discard_body_limited(resp, state.body_read_idle).await;
-            tokio::time::sleep(policy.backoff(attempt as u32, retry_after)).await;
+            let drain_budget = state
+                .body_read_idle
+                .min(deadline.saturating_duration_since(Instant::now()));
+            discard_body_limited(resp, drain_budget).await;
+            sleep_before_retry(&policy, attempt, retry_after, deadline).await;
             continue;
         }
 
@@ -3168,6 +3215,7 @@ mod serve_inbound_tests {
             inbound_body_timeout: CLIENT_BODY_TIMEOUT,
             permit_queue_timeout: PERMIT_QUEUE_TIMEOUT,
             body_total_budget: BODY_TOTAL_BUDGET,
+            forward_total_budget: FORWARD_TOTAL_BUDGET,
             reload: Arc::new(ReloadStatus::default()),
             counters: Arc::new(ServeCounters::default()),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -3191,6 +3239,7 @@ mod serve_inbound_tests {
             inbound_body_timeout: CLIENT_BODY_TIMEOUT,
             permit_queue_timeout: PERMIT_QUEUE_TIMEOUT,
             body_total_budget: BODY_TOTAL_BUDGET,
+            forward_total_budget: FORWARD_TOTAL_BUDGET,
             reload: Arc::new(ReloadStatus::default()),
             counters: Arc::new(ServeCounters::default()),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(8)),

@@ -9,6 +9,16 @@ pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
 pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// Whole-forward budget: every attempt's header wait, the backoff sleeps and
+/// the retryable-body drains, combined.
+///
+/// `header_timeout` alone bounds one attempt; a route with `max_retries = 10`
+/// could therefore hold an inbound permit for ~20 minutes (10 retries × 120s
+/// plus backoff), and `--max-concurrent` such requests wedge the gateway
+/// without any client-visible error. The forwarding phase is where the permit
+/// is held, so this is the bound that matters.
+pub const FORWARD_TOTAL_BUDGET: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_retries: u8,
@@ -135,5 +145,26 @@ mod tests {
         assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
         assert_eq!(parse_retry_after("0"), None);
         assert_eq!(parse_retry_after("garbage"), None);
+    }
+
+    /// A Retry-After longer than the remaining forward budget must not sleep
+    /// past it, or the request outlives the budget it was clamped to. Wrapped
+    /// in a timeout so an unclamped 30s sleep fails fast instead of hanging.
+    #[tokio::test]
+    async fn forward_budget_clamps_the_retry_sleep() {
+        let policy = RetryPolicy::default();
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::proxy::sleep_before_retry(&policy, 0, Some(Duration::from_secs(30)), deadline),
+        )
+        .await
+        .expect("the sleep must be clamped to the deadline, not the 30s Retry-After");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "slept {:?} for a 10ms budget",
+            started.elapsed()
+        );
     }
 }

@@ -321,6 +321,7 @@ async fn watcher_hot_reload_scenarios() {
         inbound_body_timeout: keysink::proxy::CLIENT_BODY_TIMEOUT,
         permit_queue_timeout: keysink::proxy::PERMIT_QUEUE_TIMEOUT,
         body_total_budget: keysink::proxy::BODY_TOTAL_BUDGET,
+        forward_total_budget: keysink::proxy::FORWARD_TOTAL_BUDGET,
         reload: Arc::new(keysink::proxy::ReloadStatus::default()),
         counters: Arc::new(keysink::proxy::ServeCounters::default()),
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(64)),

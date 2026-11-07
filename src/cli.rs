@@ -1161,6 +1161,7 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         inbound_body_timeout: proxy::CLIENT_BODY_TIMEOUT,
         permit_queue_timeout: proxy::PERMIT_QUEUE_TIMEOUT,
         body_total_budget: proxy::BODY_TOTAL_BUDGET,
+        forward_total_budget: proxy::FORWARD_TOTAL_BUDGET,
         reload: Arc::new(proxy::ReloadStatus::default()),
         counters: counters.clone(),
         inbound_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent)),
