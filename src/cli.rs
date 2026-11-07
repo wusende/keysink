@@ -1287,19 +1287,34 @@ async fn shutdown_signal() {
 
 /// Resolves with the caught signal's number (2 = SIGINT, 15 = SIGTERM), so
 /// the second-signal exit can report the code matching what actually fired.
+///
+/// A handler that fails to register is *not* a shutdown request: the old code
+/// let the `if let Ok(...)` fall through and resolved immediately, which would
+/// have run the whole shutdown path at startup. On failure the arm parks
+/// instead, leaving the other signal (and SIGTERM/SIGKILL from the service
+/// manager) in charge.
 async fn wait_for_shutdown_signal() -> u8 {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-        2
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => 2,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to register the SIGINT handler");
+                std::future::pending::<u8>().await
+            }
+        }
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut sig) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            sig.recv().await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+                15
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to register the SIGTERM handler");
+                std::future::pending::<u8>().await
+            }
         }
-        15
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<u8>();
