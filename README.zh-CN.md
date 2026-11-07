@@ -96,6 +96,8 @@ agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 ```
 keysink init                     # 脚本/无终端环境的首次入口(交互终端里 serve 会自动初始化)
 keysink route add|ls|show|rotate|update|rm|enable|disable
+# `route rm` 会永久销毁 route-only key,因此需要确认(`--yes` 用于脚本);
+# 只想停止服务、保留 key 用 `route disable`
 keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N] [--accept-degraded]
 keysink status | doctor
 keysink export --output FILE      # 需要主密码;剥离所有 key 值

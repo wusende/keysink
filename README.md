@@ -135,6 +135,8 @@ provider with different keys, without either of them knowing.
 ```
 keysink init                     # first entry point in scripts / headless environments (interactive serve auto-initializes)
 keysink route add|ls|show|rotate|update|rm|enable|disable
+# `route rm` destroys the route-only key, so it asks for confirmation
+# (`--yes` in scripts); `route disable` keeps the key and just stops serving it
 keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N] [--accept-degraded]
 keysink status | doctor
 keysink export --output FILE      # needs master password; strips all key values

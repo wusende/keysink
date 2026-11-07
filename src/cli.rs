@@ -254,6 +254,9 @@ pub enum RouteCmd {
     /// Remove a route
     Rm {
         name: String,
+        /// Skip the confirmation prompt (required when stdin is not a terminal)
+        #[arg(long)]
+        yes: bool,
     },
     Enable {
         name: String,
@@ -672,7 +675,31 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             println!("route `{}` updated (vkey unchanged)", args.name);
             Ok(())
         }
-        RouteCmd::Rm { name } => {
+        RouteCmd::Rm { name, yes } => {
+            // Removing a route destroys its route-only key — the one secret
+            // with no read or export channel anywhere — so make the operator
+            // confirm. `route disable` keeps the key and is the reversible
+            // option; mention it.
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    return Err(Error::msg(format!(
+                        "refusing to delete route `{name}` without confirmation: this permanently \
+                         discards its route-only key. Re-run with --yes, or use `keysink route \
+                         disable {name}` to keep the key and just stop serving it"
+                    )));
+                }
+                eprintln!(
+                    "Deleting route `{name}` discards its route-only key for good; it cannot be read \
+                     or exported back. Use `keysink route disable {name}` to keep the key instead."
+                );
+                eprint!("Delete it anyway? [y/N] ");
+                std::io::stderr().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+                    return Err(Error::msg("cancelled"));
+                }
+            }
             store::update(paths, |store| {
                 store
                     .routes
@@ -2074,6 +2101,55 @@ mod tests {
             .to_string();
         assert!(err.contains("symlink"), "{err}");
         assert!(target.join("vault.key").exists());
+    }
+
+    #[test]
+    fn route_rm_requires_confirmation_off_a_tty() {
+        // No terminal in tests: the command must refuse instead of deleting
+        // the route-only key silently.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        store::init(&paths, false, "test-password").unwrap();
+        store::update(&paths, |s| {
+            s.routes.insert(
+                "r".into(),
+                Route::new(
+                    vkey::generate(),
+                    "https://example.com".into(),
+                    "k".into(),
+                    Auth::Bearer,
+                    BTreeMap::new(),
+                ),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        if !std::io::stdin().is_terminal() {
+            let err = cmd_route(
+                &paths,
+                RouteCmd::Rm {
+                    name: "r".into(),
+                    yes: false,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("--yes"), "{err}");
+            assert!(!err.contains("does not exist"), "{err}");
+            let unlocked = store::unlock(&paths).unwrap();
+            assert!(unlocked.store.routes.contains_key("r"));
+        }
+        cmd_route(
+            &paths,
+            RouteCmd::Rm {
+                name: "r".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        let unlocked = store::unlock(&paths).unwrap();
+        assert!(!unlocked.store.routes.contains_key("r"));
     }
 
     #[test]
