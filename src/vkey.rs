@@ -18,7 +18,14 @@ pub fn generate() -> String {
 }
 
 pub fn is_well_formed(token: &str) -> bool {
-    token.starts_with(PREFIX) && token.len() == PREFIX.len() + 43
+    // Length and prefix are the cheap checks; the character set is what makes
+    // a hand-edited store fail loudly at startup instead of producing a vkey
+    // that no client can ever send (and that `is_well_formed` would bless).
+    token.starts_with(PREFIX)
+        && token.len() == PREFIX.len() + 43
+        && token[PREFIX.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 pub fn hash(token: &str) -> [u8; 32] {
@@ -135,6 +142,22 @@ mod tests {
         let m = mask("ks_ééééééééabcdefgh");
         assert!(m.contains('…'));
         assert!(mask("ks_é").is_ascii());
+    }
+
+    #[test]
+    fn is_well_formed_rejects_non_base64url_characters() {
+        let good = generate();
+        assert!(is_well_formed(&good));
+        // Same length, wrong alphabet: a hand-edited store must not pass.
+        let mut bad = good.clone();
+        bad.replace_range(PREFIX.len()..PREFIX.len() + 1, "+");
+        assert!(!is_well_formed(&bad), "{bad}");
+        let mut bad = good.clone();
+        bad.replace_range(good.len() - 1.., "/");
+        assert!(!is_well_formed(&bad), "{bad}");
+        let mut bad = good;
+        bad.replace_range(PREFIX.len()..PREFIX.len() + 1, "=");
+        assert!(!is_well_formed(&bad), "{bad}");
     }
 
     #[test]
