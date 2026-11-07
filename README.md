@@ -176,8 +176,8 @@ watcher health, so don't alert on it), `reload_failures` / `reload_attempts`
 (the actual reload signals: failures climbs while the vault stays broken, e.g.
 undecryptable), `shed_connections` / `accept_errors` (connection-cap and
 per-connection accept-error counts), and `audit` / `audit_ok` /
-`audit_dropped` (a dead audit writer reports `audit_ok:false` instead of
-silently dropping every line).
+`audit_dropped` (a dead audit writer or a failed audit write reports
+`audit_ok:false` instead of silently dropping every line).
 
 `--accept-degraded` covers a broken vault: when the primary store fails to
 decrypt, the gateway can start from `vault.age.bak` instead. That backup is one
@@ -252,7 +252,9 @@ are kept for real traffic. Rejected requests are throttled (1/s per
 fingerprint, 100/s globally) and written to their own rotation chain
 (`<audit-file>.rej`, another 5 × 10 MB) — a flood of unauthenticated requests
 can only ever rotate its own trail away, never the forensic record of real
-traffic.
+traffic. `serve` verifies both files are openable for append at startup and
+refuses to start otherwise; a write failure at runtime turns `audit_ok` false
+until a write succeeds again.
 
 `--listen` will bind a non-loopback address if you insist, but then TLS and
 network exposure are yours to solve; the intended deployment is loopback only.

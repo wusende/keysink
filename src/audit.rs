@@ -1,3 +1,4 @@
+use crate::error::{Error, Result};
 use crate::util;
 use arc_swap::ArcSwapOption;
 use serde::Serialize;
@@ -79,6 +80,11 @@ pub struct Audit {
 struct AuditState {
     alive: AtomicBool,
     closed: AtomicBool,
+    /// The last write/flush attempt failed and audit has not recovered yet.
+    /// `alive` only says the writer thread exists; a writer that exists but
+    /// cannot write (an unwritable path, a full disk) must still make
+    /// `healthy()` false.
+    write_failed: AtomicBool,
     dropped: AtomicU64,
     dead_warned: AtomicBool,
 }
@@ -143,6 +149,7 @@ impl Audit {
             state: Arc::new(AuditState {
                 alive: AtomicBool::new(false),
                 closed: AtomicBool::new(true),
+                write_failed: AtomicBool::new(false),
                 dropped: AtomicU64::new(0),
                 dead_warned: AtomicBool::new(false),
             }),
@@ -160,9 +167,12 @@ impl Audit {
     }
 
     /// Whether audit is doing what it says: disabled counts as healthy, an
-    /// enabled audit whose writer thread died does not.
+    /// enabled audit whose writer thread died or whose last write failed does
+    /// not.
     pub fn healthy(&self) -> bool {
-        !self.is_enabled() || self.state.alive.load(Ordering::Relaxed)
+        !self.is_enabled()
+            || (self.state.alive.load(Ordering::Relaxed)
+                && !self.state.write_failed.load(Ordering::Relaxed))
     }
 
     /// Lines dropped so far (queue full or a failed write). Surfaced on the
@@ -186,6 +196,7 @@ impl Audit {
         let state = Arc::new(AuditState {
             alive: AtomicBool::new(true),
             closed: AtomicBool::new(false),
+            write_failed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             dead_warned: AtomicBool::new(false),
         });
@@ -312,6 +323,31 @@ impl Audit {
     }
 }
 
+/// Verifies both rotation chains (the main path and its `.rej` sibling) can be
+/// opened for append before the gateway starts.
+///
+/// `Audit::new` only spawns the writer; it used to accept an unwritable path
+/// (a symlink, a directory, an unwritable parent) and the gateway started with
+/// audit "enabled" while every record was dropped. `serve` calls this first so
+/// a bad `--audit-log` is a startup error instead of a silent loss of the
+/// forensic trail.
+pub fn probe(path: &Path) -> Result<()> {
+    let reject_path = reject_chain_path(path);
+    for target in [path, reject_path.as_path()] {
+        util::private_open_options(0o600)
+            .create(true)
+            .append(true)
+            .open(target)
+            .map_err(|e| {
+                Error::msg(format!(
+                    "audit log {} cannot be opened for append: {e}",
+                    target.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 /// Marks the writer thread dead on every exit path, a panic included.
 struct AliveGuard(Arc<AuditState>);
 
@@ -361,11 +397,15 @@ fn writer_loop(
                     (&path, &mut logs.main)
                 };
                 match append(chain_path, chain, &entry) {
-                    Ok(()) => failures = 0,
+                    Ok(()) => {
+                        failures = 0;
+                        state.write_failed.store(false, Ordering::Relaxed);
+                    }
                     Err(e) => {
                         // Dropping the BufWriter attempts a best-effort flush of
                         // whatever is still buffered; the next record reopens.
                         chain.file = None;
+                        state.write_failed.store(true, Ordering::Relaxed);
                         failures += 1;
                         state.dropped.fetch_add(1, Ordering::Relaxed);
                         if failures == 1 || failures.is_multiple_of(100) {
@@ -385,15 +425,15 @@ fn writer_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_dirty(&mut logs.main);
-                flush_dirty(&mut logs.reject);
+                flush_dirty(&mut logs.main, &state);
+                flush_dirty(&mut logs.reject, &state);
             }
             // Disconnected (after close): drain, flush, exit so tail audit lines are not lost.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    flush_dirty(&mut logs.main);
-    flush_dirty(&mut logs.reject);
+    flush_dirty(&mut logs.main, &state);
+    flush_dirty(&mut logs.reject, &state);
 }
 
 /// Wait after `failures` consecutive write failures: doubling, capped.
@@ -424,7 +464,7 @@ fn wait_for_recovery(rx: &Receiver<AuditEntry>, backoff: Duration, state: &Audit
     }
 }
 
-fn flush_dirty(log: &mut OpenLog) {
+fn flush_dirty(log: &mut OpenLog, state: &AuditState) {
     let Some(writer) = log.file.as_mut() else {
         return;
     };
@@ -434,6 +474,7 @@ fn flush_dirty(log: &mut OpenLog) {
     if let Err(e) = writer.flush() {
         tracing::warn!(error = %e, "failed to flush audit log");
         log.file = None;
+        state.write_failed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -555,6 +596,42 @@ mod tests {
     }
 
     #[test]
+    fn write_failure_is_reported_unhealthy_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::new(dir.path().join("audit.jsonl"));
+        assert!(audit.healthy());
+        audit.state.write_failed.store(true, Ordering::Relaxed);
+        assert!(
+            !audit.healthy(),
+            "a writer that cannot write must not look healthy"
+        );
+        audit.state.write_failed.store(false, Ordering::Relaxed);
+        assert!(audit.healthy(), "a recovered write restores health");
+        audit.close();
+    }
+
+    #[test]
+    fn probe_creates_both_rotation_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        probe(&path).unwrap();
+        assert!(path.exists());
+        assert!(dir.path().join("audit.jsonl.rej").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.jsonl");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("audit.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = probe(&link).unwrap_err().to_string();
+        assert!(err.contains("cannot be opened for append"), "{err}");
+    }
+
+    #[test]
     fn write_backoff_doubles_and_caps() {
         assert_eq!(write_backoff(1), WRITE_BACKOFF_START);
         assert_eq!(write_backoff(2), WRITE_BACKOFF_START * 2);
@@ -570,6 +647,7 @@ mod tests {
         let state = AuditState {
             alive: AtomicBool::new(true),
             closed: AtomicBool::new(false),
+            write_failed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             dead_warned: AtomicBool::new(false),
         };
@@ -583,6 +661,7 @@ mod tests {
         let state = AuditState {
             alive: AtomicBool::new(true),
             closed: AtomicBool::new(false),
+            write_failed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             dead_warned: AtomicBool::new(false),
         };

@@ -1063,7 +1063,17 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
                     parent.display()
                 )));
             }
-            Audit::new(path.clone())
+            crate::audit::probe(path)?;
+            let audit = Audit::new(path.clone());
+            if !audit.is_enabled() {
+                // Audit::new only logs on a failed writer-thread spawn; with
+                // --audit-log explicitly requested, running without audit is a
+                // configuration error, not a silent degradation.
+                return Err(Error::msg(
+                    "failed to start the audit writer thread; refusing to run with auditing silently disabled",
+                ));
+            }
+            audit
         }
         None => Audit::disabled(),
     };
