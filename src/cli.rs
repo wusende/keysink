@@ -1202,11 +1202,19 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         // be the listener's address, not the requested one — `--listen
         // 127.0.0.1:0` (any free port) would otherwise be recorded as `:0`.
         let bound = listener.local_addr().unwrap_or(addr);
-        util::atomic_write(
+        // The address file is a convenience for `route add`; a read-only or
+        // full vault directory must not stop the gateway from serving.
+        if let Err(e) = util::atomic_write(
             &paths.gateway_addr(),
             format!("{bound}\n").as_bytes(),
             0o600,
-        )?;
+        ) {
+            tracing::warn!(
+                error = %e,
+                path = %paths.gateway_addr().display(),
+                "cannot record the listen address; `route add` will not be able to report it (serve continues)"
+            );
+        }
         tracing::info!(addr = %bound, routes, from_backup, store = %store_path.display(), "keysink started");
         if let Some(path) = args.audit_log {
             tracing::info!(audit = %path.display(), "audit enabled");
