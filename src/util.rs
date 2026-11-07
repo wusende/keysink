@@ -206,6 +206,27 @@ pub fn read_no_follow(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Same as [`read_no_follow`], but refuses to buffer more than `limit` bytes.
+///
+/// Reading first and checking the length afterwards defeats the purpose of a
+/// size cap: a huge (or sparse) file would already be in memory by the time
+/// the check runs. `take(limit + 1)` bounds the allocation and the extra byte
+/// proves the file is over the limit.
+pub fn read_no_follow_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = private_open_options(0).read(true).open(path)?;
+    let mut buf = Vec::new();
+    let mut reader = file.take(limit as u64 + 1);
+    reader.read_to_end(&mut buf)?;
+    if buf.len() > limit {
+        return Err(Error::msg(format!(
+            "file exceeds the {} MiB limit; refusing to read it: {}",
+            limit / (1024 * 1024),
+            path.display()
+        )));
+    }
+    Ok(buf)
+}
+
 /// Writes a new file with 0600; fails if it already exists (prevents silently overwriting a key).
 pub fn write_new_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut f = private_open_options(0o600)
@@ -585,6 +606,16 @@ mod tests {
         let parsed = OffsetDateTime::parse(&text, &Rfc3339).unwrap();
         let skew = (parsed.unix_timestamp() - now_secs() as i64).abs();
         assert!(skew <= 5, "now_ts drifted: {text}");
+    }
+
+    #[test]
+    fn read_no_follow_limited_refuses_before_buffering_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        fs::write(&path, b"hello").unwrap();
+        assert_eq!(read_no_follow_limited(&path, 5).unwrap(), b"hello");
+        let err = read_no_follow_limited(&path, 4).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[test]

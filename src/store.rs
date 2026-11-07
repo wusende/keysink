@@ -10,6 +10,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Upper bound on the encrypted store. age's reader grows the plaintext
+/// without bound, so a wedged hot reload must not be able to turn one bogus
+/// file into an OOM. Real vaults are a few KB; 64 MiB leaves generous
+/// headroom. Enforced before the file is buffered (see
+/// [`util::read_no_follow_limited`]) as well as inside [`decrypt`].
+const MAX_CIPHERTEXT: usize = 64 * 1024 * 1024;
+
 pub struct Unlocked {
     pub store: Store,
     pub identity: age::x25519::Identity,
@@ -213,7 +220,7 @@ pub fn load_store(paths: &Paths, identity: &age::x25519::Identity) -> Result<(St
 
 pub fn load_store_file(path: &Path, identity: &age::x25519::Identity) -> Result<Store> {
     util::ensure_private_file(path, "vault.age")?;
-    let ciphertext = util::read_no_follow(path).map_err(|e| match e {
+    let ciphertext = util::read_no_follow_limited(path, MAX_CIPHERTEXT).map_err(|e| match e {
         Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => Error::msg(format!(
             "failed to read {}: Permission denied; the file owner/permissions may have been rewritten by root (the service user cannot read it). \
              Use `sudo -u keysink keysink ...` to manage the vault, or restore ownership to the service user and retry",
@@ -286,11 +293,13 @@ pub fn save_store(paths: &Paths, store: &Store, identity: &age::x25519::Identity
     if paths.store().exists() {
         // Read the old ciphertext once: it confirms the file still decrypts (so we don't clobber the only usable backup)
         // and doubles as the backup content for the atomic write — fs::copy crashing mid-way would leave a truncated .bak.
-        let sane = util::read_no_follow(&paths.store()).ok().and_then(|bytes| {
-            let plain = decrypt(&bytes, identity).ok()?;
-            serde_json::from_slice::<Store>(&plain).ok()?;
-            Some(bytes)
-        });
+        let sane = util::read_no_follow_limited(&paths.store(), MAX_CIPHERTEXT)
+            .ok()
+            .and_then(|bytes| {
+                let plain = decrypt(&bytes, identity).ok()?;
+                serde_json::from_slice::<Store>(&plain).ok()?;
+                Some(bytes)
+            });
         match sane {
             Some(bytes) => {
                 if let Err(e) = util::atomic_write(&paths.store_bak(), &bytes, 0o600) {
@@ -399,7 +408,6 @@ pub(crate) fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Re
     // scope), but age's reader grows the plaintext without bound: cap the
     // ciphertext so a wedged hot reload cannot turn one bogus file into an
     // OOM. Real vaults are a few KB; 64 MiB leaves generous headroom.
-    const MAX_CIPHERTEXT: usize = 64 * 1024 * 1024;
     if ciphertext.len() > MAX_CIPHERTEXT {
         return Err(Error::msg(format!(
             "vault file exceeds the {} MiB decrypt limit; refusing to read it",
@@ -709,6 +717,27 @@ mod tests {
         );
         // SAFETY: paired with the set_var above; see the note there.
         unsafe { std::env::remove_var("KEYSINK_MASTER_KEY_FILE") };
+    }
+
+    #[test]
+    fn load_store_file_refuses_an_oversized_file_before_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.age");
+        let file = fs::File::create(&path).unwrap();
+        // Sparse: no 64 MiB of data is actually written, but a plain
+        // read_to_end would still buffer 64 MiB before the old post-read
+        // check. The limited read must stop at the cap.
+        file.set_len((MAX_CIPHERTEXT + 1) as u64).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let identity = age::x25519::Identity::generate();
+        let err = load_store_file(&path, &identity).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[test]
