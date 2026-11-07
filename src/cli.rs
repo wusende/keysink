@@ -2336,19 +2336,28 @@ mod tests {
 
     #[test]
     fn lexical_absolute_collapses_dot_components() {
-        use std::path::Path;
+        // Anchor on the current dir: on Windows a leading `/` is not absolute
+        // (no drive prefix) and std::path::absolute anchors it to the current
+        // drive's root, so a literal `/vault` expectation only holds on unix.
+        let base = std::env::current_dir().unwrap();
         assert_eq!(
-            lexical_absolute(Path::new("/vault/sub/../vault.age")),
-            PathBuf::from("/vault/vault.age")
+            lexical_absolute(&base.join("vault/sub/../vault.age")),
+            base.join("vault").join("vault.age")
         );
         assert_eq!(
-            lexical_absolute(Path::new("/vault/./vault.age")),
-            PathBuf::from("/vault/vault.age")
+            lexical_absolute(&base.join("vault/./vault.age")),
+            base.join("vault").join("vault.age")
         );
-        // `..` above the root stays the root instead of eating it.
+        // `..` pops the base's parent; popping past the root stays at the root
+        // instead of eating it, so only the file name is asserted (the anchor
+        // depth differs per platform once the pops hit the top).
         assert_eq!(
-            lexical_absolute(Path::new("/../vault.age")),
-            PathBuf::from("/vault.age")
+            lexical_absolute(&base.join("sub/../vault.age")),
+            base.join("vault.age")
+        );
+        assert_eq!(
+            lexical_absolute(&base.join("../../../vault.age")).file_name(),
+            Some(std::ffi::OsStr::new("vault.age"))
         );
     }
 
