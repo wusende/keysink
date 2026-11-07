@@ -676,6 +676,17 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
             Ok(())
         }
         RouteCmd::Rm { name, yes } => {
+            // Existence first: confirming a deletion and only then hearing
+            // "does not exist" makes the operator approve a no-op. On the
+            // `.bak` fallback the roster is one write behind, so the degraded
+            // case skips the pre-check and lets the locked update below decide
+            // (it refuses degraded writes outright).
+            {
+                let unlocked = store::unlock(paths)?;
+                if !unlocked.from_backup && !unlocked.store.routes.contains_key(&name) {
+                    return Err(Error::msg(format!("route `{name}` does not exist")));
+                }
+            }
             // Removing a route destroys its route-only key — the one secret
             // with no read or export channel anywhere — so make the operator
             // confirm. `route disable` keeps the key and is the reversible
@@ -2205,6 +2216,30 @@ mod tests {
         .unwrap();
         let unlocked = store::unlock(&paths).unwrap();
         assert!(!unlocked.store.routes.contains_key("r"));
+    }
+
+    /// Regression: the existence check used to run after the confirmation
+    /// gate, so removing a missing route demanded `--yes` (or a y/N answer)
+    /// before admitting there was nothing to delete.
+    #[test]
+    fn route_rm_of_a_missing_route_errors_before_asking_for_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::vault(dir.path().join("vault"));
+        store::init(&paths, false, "test-password").unwrap();
+
+        // Off a tty, the old order returned the "re-run with --yes" refusal
+        // for a route that does not exist; it must say "does not exist".
+        let err = cmd_route(
+            &paths,
+            RouteCmd::Rm {
+                name: "nope".into(),
+                yes: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("--yes"), "{err}");
     }
 
     #[test]
