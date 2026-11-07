@@ -46,6 +46,11 @@ const REJECT_FP_TABLE_MAX: usize = 4096;
 /// syscall spin and a log flood.
 const WRITE_BACKOFF_START: Duration = Duration::from_millis(50);
 const WRITE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// How long `close()` waits for the writer thread to drain before detaching
+/// it: long enough for a normal flush (the queue is at most 1024 records), and
+/// short enough that a writer stuck on a hung mount cannot hold shutdown past
+/// the service manager's stop timeout.
+const CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Audit disk writes run on a dedicated thread + bounded channel:
 /// - the request path only does try_send, never a synchronous open/write/chmod on a tokio worker;
@@ -321,7 +326,15 @@ impl Audit {
         }
     }
 
-    /// On shutdown, drain the queue and wait for the writer thread to exit so tail audit lines are not lost.
+    /// On shutdown, drain the queue and wait for the writer thread to exit so
+    /// tail audit lines are not lost — but only for a bounded time.
+    ///
+    /// The writer does blocking file I/O. On a hung mount (NFS, a stalled
+    /// disk) `join()` never returns, and shutdown would hang until the service
+    /// manager SIGKILLs the process — losing the very flush this close exists
+    /// for. Past the timeout the writer is detached: the process is exiting
+    /// anyway, and the alternative (a stuck gateway) is worse than a truncated
+    /// audit tail, which the health endpoint already reported.
     pub fn close(&self) {
         self.state.closed.store(true, Ordering::Relaxed);
         // Dropping the swapped-out sender — together with any in-flight
@@ -330,8 +343,22 @@ impl Audit {
         // that. Records that load the sender after the swap see None and
         // return silently.
         drop(self.writer.swap(None));
-        if let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let deadline = Instant::now() + CLOSE_JOIN_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if handle.is_finished() {
             let _ = handle.join();
+        } else {
+            // Detach: the thread is stuck in a write. Say so once; there is
+            // nothing else the exiting process can do about it.
+            tracing::warn!(
+                timeout_ms = CLOSE_JOIN_TIMEOUT.as_millis(),
+                "audit writer did not finish flushing in time; detaching it (tail lines may be lost)"
+            );
         }
     }
 }
@@ -642,6 +669,29 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = probe(&link).unwrap_err().to_string();
         assert!(err.contains("cannot be opened for append"), "{err}");
+    }
+
+    #[test]
+    fn close_detaches_a_stuck_writer_instead_of_hanging() {
+        // A writer thread parked in a write must not be able to hold shutdown:
+        // close() waits at most CLOSE_JOIN_TIMEOUT, then detaches.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::new(dir.path().join("audit.jsonl"));
+        // Replace the writer handle with one whose thread never finishes.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        *audit.handle.lock().unwrap() = Some(stuck);
+
+        let started = Instant::now();
+        audit.close();
+        assert!(
+            started.elapsed() < CLOSE_JOIN_TIMEOUT + Duration::from_secs(2),
+            "close() must not wait for a stuck writer, took {:?}",
+            started.elapsed()
+        );
+        let _ = release_tx.send(());
     }
 
     #[test]
