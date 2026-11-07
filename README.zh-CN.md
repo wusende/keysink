@@ -121,7 +121,7 @@ keysink route rotate claude                                       # 换 vkey,旧
 
 `status` 打印保险库摘要(位置、schema、路由数)。`doctor` 跑完整性检查(属主、权限、key 能否解析、store 能否解密、备份能否解密),出问题先跑它。
 
-要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"healthy":true,"degraded":false,"version":"0.2.1","uptime_secs":…,"routes":2}`,以及以下运行状态:
+要确认网关本身活着,用 `GET /__keysink/health`,返回 `{"ok":true,"healthy":true,"degraded":false,"version":"0.2.2","uptime_secs":…,"routes":2}`,以及以下运行状态:
 
 - `snapshot_age_secs`:当前快照已服务多久。监听器只在保险库变更时才重载,保险库稳定不变时它会随 uptime 正常增长;反映的是数据新旧,不是监听器健康,别拿它做告警。
 - `reload_failures` / `reload_attempts`:真正的重载信号,保险库一直坏着(比如解不开)时 failures 会持续上涨。

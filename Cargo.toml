@@ -1,6 +1,6 @@
 [package]
 name = "keysink"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 # Minimum toolchain: edition 2024 requires 1.85; `std::fs::File::lock` (the
 # vault transaction lock) is stable since 1.89, and the `let`-chains used

@@ -1,5 +1,157 @@
 # Changelog
 
+## v0.2.2
+
+*Released 2026-11-07.*
+
+A hardening and observability pass from a full review of the 0.2.1 commit
+series: every phase that could still hold a resource indefinitely got a bound,
+the vault refuses to act on stale or foreign state, and the health endpoint
+grows a `healthy` flag separate from liveness so a gateway serving a stale
+backup stops looking ready.
+
+One operational note: `route rm` now requires `--yes` when stdin is not a
+terminal (removing a route destroys its route-only key). Scripts that removed
+routes must add `--yes`; `route disable` remains the reversible alternative.
+Drop-in otherwise — no config or storage changes.
+
+**Stability**
+
+- Every forwarded request has a whole-forward budget (10 minutes): each
+  attempt's header wait, the backoff sleeps and the retryable-body drains are
+  clamped to it. `header_timeout` alone bounds one attempt, so a route with
+  `max_retries = 10` could hold an inbound permit for ~20 minutes, and
+  `--max-concurrent` such requests wedged the gateway with no client-visible
+  error. The budget ends the retry ladder as a 504, and a Retry-After longer
+  than the remaining budget sleeps only until the deadline
+- A connection that never sends its first request is closed at the head
+  timeout. hyper completes the h2 handshake only after the peer's SETTINGS
+  frame, and the h2 keep-alive PING starts only after that — a peer sending
+  just the 24-byte preface (or stalling inside SETTINGS) held its connection
+  slot forever, a one-shot remote DoS on `--allow-remote` deployments. A
+  middleware notifies once the first request is dispatched and the deadline is
+  disarmed; the per-request bounds and the h2 keep-alive own the connection
+  from there
+- The audit close is bounded (3s). The writer does blocking file I/O, and on a
+  hung mount `join()` never returned, holding shutdown until the service
+  manager SIGKILLed the process — losing the very flush the close exists for.
+  Past the timeout the thread is detached with a warning (tail lines may be
+  lost; health already reported the failure)
+- A failed signal-handler registration is no longer treated as a shutdown
+  request: the old code let `if let Ok(...)` fall through and resolved the
+  shutdown future immediately at startup. On failure the arm parks, leaving
+  the other signal (and SIGTERM/SIGKILL from the service manager) in charge
+- A read-only vault directory no longer stops `serve` at the `gateway.addr`
+  write. The address file is a convenience for `route add`; failing to record
+  it now logs a warning and the gateway keeps serving
+
+**Security**
+
+- `export` refuses an `--output` that names a vault file — across canonical,
+  parent-canonical and lexical spellings. `--output <vault>/vault.age` was the
+  original hole (`atomic_write` would have replaced the store and left the
+  backup as the only copy); the first guard compared path parents, and since
+  `std::path::absolute` keeps `..` components, `<vault>/sub/../vault.age`
+  slipped through it, as did a vault directory reached through a symlink. The
+  guard now compares every name each path can denote
+- Vault writes are refused while the store is being served from the stale
+  `.bak` fallback. Writing from the one-generation-behind backup silently
+  revived revoked/rotated vkeys and destroyed the evidence of whatever broke
+  the primary; the fallback exists for a running gateway's availability, not
+  for a write. Read-only commands still work, with a warning naming both files
+- `init` and `rekey` refuse while `KEYSINK_MASTER_KEY` /
+  `KEYSINK_MASTER_KEY_FILE` is configured. Both replace `vault.key`, and the
+  running gateway keeps using the external identity — the new store would be
+  undecryptable for it. Rotate the external credential first
+- `uninstall` only deletes a directory that actually looks like a keysink
+  vault (marker files, or the `init --force` `.old.*` leftovers), and refuses
+  a symlinked `--home`. The path comes straight from `--home` /
+  `KEYSINK_VAULT_HOME` and the command recursively deletes it; a typo
+  (`--home .`) used to erase whatever was there. System installs are anchored
+  at the deploy path and skip the marker check
+- Route-only keys are validated at save time for the auth types that inject
+  them verbatim into a header (`bearer` / `x-api-key` / custom header): a
+  control character (a newline from a multi-line pipe) used to pass validation
+  and turn every request on the route into a 500 at forward time. `basic`
+  base64-encodes the pair, `query` percent-encodes the value, `none` never
+  injects it — those accept the same bytes
+- `--password-stdin` and `--route-key -` read exactly one line.
+  `read_to_string` used to swallow a multi-line pipe and turn the extra lines
+  into part of the secret (a key with newlines then failed in every forwarded
+  header; a password just silently differed from what was meant)
+- vkeys must be base64url. The well-formedness check was prefix + length, so a
+  hand-edited store with `+`/`/`/`=` in the token passed and produced a vkey no
+  client could ever send; the character set now fails loudly at startup
+- `Route`'s `Debug` redacts the route-only key and masks the vkey. A derived
+  impl put the real upstream credential into every `{:?}` — a fuzz artifact, a
+  panic message, a log line added later. `headers` / `proxy` / `note` print
+  as-is, matching what `route show` already shows the vault's owner
+- The synthetic SSE error tail follows the stream's observed dialect: an
+  `auto` stream that showed Anthropic `event: message_start` lines gets an
+  Anthropic-shaped error event when truncated, instead of an OpenAI
+  `data: [DONE]` tail the client cannot parse. Best-effort on purpose (a
+  marker split across chunks is missed and the old behavior remains); explicit
+  terminators are never overridden
+
+**Observability**
+
+- `/__keysink/health` reports a `healthy` flag separate from `ok`. `ok` says
+  the process answers; `healthy` says it is serving data it can trust — it
+  goes false when the snapshot came from the stale backup, the hot reload
+  keeps failing, the audit writer cannot write, or the watcher stopped
+  ticking (`watcher_age_secs` is new). Point liveness probes at `ok`, alerting
+  and readiness at `healthy`
+- `serve` verifies both audit rotation chains are openable for append at
+  startup and refuses to start otherwise; `Audit::new` used to accept an
+  unwritable path and the gateway ran "audited" while dropping every row. A
+  write failure at runtime turns `audit_ok` false until the write path
+  recovers — the writer probes the chains on its idle tick, so an idle gateway
+  recovers too, and the next record re-verifies (previously the flag cleared
+  only on the next successful record, so a zero-traffic gateway stayed
+  unhealthy forever after its disk healed)
+- With audit off, rejected requests no longer build an `AuditEntry` (RFC3339
+  timestamp + several Strings) or take the rejection-gate mutex: a credential
+  flood on an audit-off gateway used to pay that per request for rows that can
+  never be written
+
+**Performance**
+
+- The hot-reload fingerprint drops the `.bak` stat. Every write that touches
+  `.bak` also rewrites the live store (`save_store` backs up, then writes;
+  `rekey` touches both), so including it only made one logical change look
+  like two and triggered a second, redundant reload
+
+**Docs**
+
+- User-facing errors name `vault.key` / `vault.age` instead of the retired
+  `master.key` / `store.age` names
+- The README states what `export` actually is: a configuration backup (routes
+  and metadata, real keys stripped) that can be neither dropped in as
+  `vault.age` nor decrypted into a working vault — the copy that restores is
+  `vault.key` + `vault.age`
+- Both READMEs rewritten where they read badly: the health fields are a bullet
+  list instead of one sentence with six nested parentheticals, the worst
+  translationese sentences are rewritten, and the English 401 FAQ is corrected
+  (an upstream 401 means the request was forwarded, not that it "never reached
+  the vault" — the Chinese README already had it right)
+
+**Packaging**
+
+- `rust-version = "1.89"` is declared: edition 2024 needs 1.85, the let-chains
+  used throughout are 1.88+, and the vault transaction lock (`std::fs::File::lock`)
+  is stable since 1.89 — `cargo install` now fails with the real requirement
+  instead of a wall of syntax errors
+
+**Tests**
+
+- New regressions: an h2 handshake stall must be dropped within the head
+  timeout; a retry storm must end at the whole-forward budget; the export
+  guard must catch `..` spellings and symlinked vault directories; `route rm`
+  must check existence before confirmation; audit health must recover via the
+  idle probe without new traffic; the symlink-refusal test no longer assumes
+  the umask; the smoke script asserts rejection rows land on the `.rej` chain
+  and clears `NO_PROXY` so the dead-proxy fallback case tests what it says
+
 ## v0.2.1
 
 *Released 2026-11-05.*
