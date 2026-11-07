@@ -2,6 +2,7 @@
 name = "ksbench"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.89"
 publish = false
 description = "keysink's load driver and fake upstream (perf harness only, never published)"
 

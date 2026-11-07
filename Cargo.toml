@@ -2,6 +2,11 @@
 name = "keysink"
 version = "0.2.1"
 edition = "2024"
+# Minimum toolchain: edition 2024 requires 1.85; `std::fs::File::lock` (the
+# vault transaction lock) is stable since 1.89, and the `let`-chains used
+# throughout are 1.88+. Declaring it keeps `cargo install` failing with the
+# real requirement instead of a wall of syntax errors.
+rust-version = "1.89"
 description = "Local gateway that keeps real AI API keys out of agents (Claude Code, OpenAI, MCP): agents hold revocable virtual keys, real keys stay in an encrypted vault."
 license = "MIT"
 repository = "https://github.com/wusende/keysink"
