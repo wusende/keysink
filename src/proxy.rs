@@ -2324,7 +2324,7 @@ fn tick_age(state: &AppState) -> u64 {
         .saturating_sub(state.reload.last_tick_secs.load(Ordering::Relaxed))
 }
 
-/// Polls the store.age / master.key mtime+size and swaps in a whole new snapshot on change.
+/// Polls the vault.age / vault.key mtime+size and swaps in a whole new snapshot on change.
 async fn watcher_loop(state: Arc<AppState>, paths: Paths) {
     // Zeroed so the first round after startup always reloads once,
     // covering the race where the CLI modified the store between serve

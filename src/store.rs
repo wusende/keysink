@@ -195,10 +195,10 @@ pub fn load_identity(paths: &Paths) -> Result<age::x25519::Identity> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| Error::msg("master.key is empty"))?;
+        .ok_or_else(|| Error::msg("the master identity is empty"))?;
 
     line.parse::<age::x25519::Identity>()
-        .map_err(|e| Error::Age(format!("failed to parse master.key: {e}")))
+        .map_err(|e| Error::Age(format!("failed to parse the master identity: {e}")))
 }
 
 pub fn unlock(paths: &Paths) -> Result<Unlocked> {
@@ -334,7 +334,7 @@ pub fn save_store(paths: &Paths, store: &Store, identity: &age::x25519::Identity
     util::atomic_write(&paths.store(), &ciphertext, 0o600)
 }
 
-/// Rotates the master key: first encrypt the store to both old and new keys, then replace master.key, finally converge on the new key.
+/// Rotates the master key: first encrypt the store to both old and new keys, then replace vault.key, finally converge on the new key.
 /// If any step crashes, at least one key can still decrypt the current store.
 pub fn rekey(paths: &Paths) -> Result<()> {
     paths.ensure_home()?;
@@ -435,7 +435,7 @@ pub(crate) fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Re
     let decryptor = age::Decryptor::new(ciphertext)?;
     if decryptor.is_scrypt() {
         return Err(Error::msg(
-            "this is a passphrase-encrypted age file and cannot be decrypted with master.key",
+            "this is a passphrase-encrypted age file and cannot be decrypted with the vault master key",
         ));
     }
     let mut plaintext = Vec::new();
@@ -443,7 +443,7 @@ pub(crate) fn decrypt(ciphertext: &[u8], identity: &age::x25519::Identity) -> Re
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|e| {
             Error::Age(format!(
-                "master.key does not match the store or the file is corrupt: {e}"
+                "the vault master key does not match the store or the file is corrupt: {e}"
             ))
         })?;
     reader.read_to_end(&mut plaintext)?;
@@ -854,10 +854,8 @@ mod tests {
             );
         }
         assert!(
-            !names
-                .iter()
-                .any(|n| n.starts_with("master.key") || n.starts_with("store.age")),
-            "the vault directory should not contain user-store naming: {names:?}"
+            names.iter().all(|n| n.starts_with("vault.")),
+            "the vault directory should only contain vault.* files: {names:?}"
         );
     }
 }
