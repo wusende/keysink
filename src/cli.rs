@@ -484,6 +484,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
         }
         RouteCmd::Ls => {
             let unlocked = store::unlock(paths)?;
+            warn_if_degraded(paths, unlocked.from_backup);
             if unlocked.store.routes.is_empty() {
                 println!("(empty)");
                 return Ok(());
@@ -507,6 +508,7 @@ pub(crate) fn cmd_route(paths: &Paths, cmd: RouteCmd) -> Result<()> {
         }
         RouteCmd::Show { name } => {
             let unlocked = store::unlock(paths)?;
+            warn_if_degraded(paths, unlocked.from_backup);
             let route = unlocked
                 .store
                 .routes
@@ -992,6 +994,7 @@ fn read_stdin() -> Result<Zeroizing<String>> {
 /// master password check before export; returns the password read so the export can reuse it.
 fn check_master_password(paths: &Paths, from_stdin: bool) -> Result<Zeroizing<String>> {
     let unlocked = store::unlock(paths)?;
+    warn_if_degraded(paths, unlocked.from_backup);
     let Some(hash) = unlocked.store.password_hash.as_deref() else {
         return Err(Error::msg(
             "master password not set; run init --force first to reinitialize and set one",
@@ -1287,6 +1290,7 @@ async fn wait_for_shutdown_signal() -> u8 {
 
 pub(crate) fn cmd_status(paths: &Paths) -> Result<()> {
     let unlocked = store::unlock(paths)?;
+    warn_if_degraded(paths, unlocked.from_backup);
     let store = &unlocked.store;
     println!("home:        {}", paths.home.display());
     println!("store:       {}", paths.store().display());
@@ -1824,6 +1828,22 @@ fn route_key_label(route: &Route) -> String {
     match &route.inline_key {
         Some(_) => "(route-only, cannot be read/exported)".to_string(),
         None => "(missing)".to_string(),
+    }
+}
+
+/// Surfaces the `.bak` fallback on read-only commands. Writes are refused
+/// outright in [`store::update`] / [`store::rekey`] / [`store::export`]; a
+/// read can still be useful for inspection, but the operator must know that
+/// the data is one generation behind and may revive revoked vkeys.
+fn warn_if_degraded(paths: &Paths, from_backup: bool) {
+    if from_backup {
+        eprintln!(
+            "warning: the primary store {} could not be decrypted; showing the older backup {}. \
+             Revoked or rotated vkeys may work again from it. Run `keysink doctor`, repair the \
+             primary, and retry before making changes.",
+            paths.store().display(),
+            paths.store_bak().display()
+        );
     }
 }
 

@@ -233,7 +233,34 @@ pub fn load_store_file(path: &Path, identity: &age::x25519::Identity) -> Result<
     Ok(store)
 }
 
+/// Refuses a destructive operation when the vault is being served from the
+/// `.bak` backup.
+///
+/// `unlock` falls back to the backup on any primary-store failure, which is
+/// right for a running gateway (availability) but wrong for a write: the
+/// backup is one generation behind, so writing from it silently revives
+/// revoked/rotated vkeys and destroys the evidence of whatever broke the
+/// primary. The caller must repair the primary first (or serve with
+/// `--accept-degraded` in the read-only gateway, which does not persist it).
+fn refuse_when_degraded(paths: &Paths, action: &str, from_backup: bool) -> Result<()> {
+    if !from_backup {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "refusing to {action}: the primary store {} could not be decrypted, so the vault is \
+         being read from the older backup {}. That backup is one write behind: revoked or \
+         rotated vkeys may work again from it. Save the broken primary for inspection, repair \
+         it first (for example by copying the backup over it), then retry. `keysink doctor` \
+         reports the exact failure.",
+        paths.store().display(),
+        paths.store_bak().display()
+    )))
+}
+
 /// Runs "read → mutate → atomic write" under file lock protection.
+///
+/// Refuses to write when the data came from the `.bak` fallback: see
+/// [`refuse_when_degraded`].
 pub fn update<F, T>(paths: &Paths, f: F) -> Result<T>
 where
     F: FnOnce(&mut Store) -> Result<T>,
@@ -243,8 +270,9 @@ where
     let Unlocked {
         mut store,
         identity,
-        ..
+        from_backup,
     } = unlock(paths)?;
+    refuse_when_degraded(paths, "write the vault", from_backup)?;
     let out = f(&mut store)?;
     save_store(paths, &store, &identity)?;
     Ok(out)
@@ -287,8 +315,9 @@ pub fn rekey(paths: &Paths) -> Result<()> {
     let Unlocked {
         store,
         identity: old,
-        ..
+        from_backup,
     } = unlock(paths)?;
+    refuse_when_degraded(paths, "rotate the master key", from_backup)?;
     let new = age::x25519::Identity::generate();
 
     let plaintext = Zeroizing::new(serde_json::to_vec_pretty(&store)?);
@@ -320,7 +349,12 @@ pub fn rekey(paths: &Paths) -> Result<()> {
 /// route-only keys (`inline_key`) are deliberately kept out of the export: such keys are only allowed inside routing
 /// and offer no read/backup channel. Returns the number of stripped routes; the caller is responsible for reporting it.
 pub fn export(paths: &Paths, output: &Path, passphrase: &str) -> Result<usize> {
-    let Unlocked { mut store, .. } = unlock(paths)?;
+    let Unlocked {
+        mut store,
+        from_backup,
+        ..
+    } = unlock(paths)?;
+    refuse_when_degraded(paths, "export the vault", from_backup)?;
     let mut stripped = 0usize;
     for route in store.routes.values_mut() {
         // take moves the value out of Route, bypassing Route::Drop's zeroing, so we must zeroize it manually
@@ -548,6 +582,87 @@ mod tests {
             store.routes["x"].note, "w",
             ".bak lags one generation behind and does not include the last write"
         );
+    }
+
+    #[test]
+    fn refuses_to_write_a_store_loaded_from_backup() {
+        let (_dir, paths) = tmp_paths();
+        init_test(&paths);
+        add_route(&paths, "r1");
+        add_route(&paths, "r2");
+        // .bak is now the previous generation (r1 only).
+        fs::write(paths.store(), b"corrupt-primary").unwrap();
+
+        let err = update(&paths, |store| {
+            store.routes.insert(
+                "r3".into(),
+                Route::new(
+                    crate::vkey::generate(),
+                    "https://example.com".into(),
+                    "v".into(),
+                    Auth::Bearer,
+                    BTreeMap::new(),
+                ),
+            );
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refusing to write"), "{err}");
+        assert!(err.contains("revoked or rotated"), "{err}");
+        // The corrupt primary must be left for inspection; the write must not
+        // have persisted the stale backup content over it.
+        assert_eq!(fs::read(paths.store()).unwrap(), b"corrupt-primary");
+        let unlocked = unlock(&paths).unwrap();
+        assert!(unlocked.from_backup);
+        assert!(unlocked.store.routes.contains_key("r1"));
+        assert!(!unlocked.store.routes.contains_key("r2"));
+        assert!(!unlocked.store.routes.contains_key("r3"));
+    }
+
+    #[test]
+    fn refuses_to_rekey_from_backup() {
+        let (_dir, paths) = tmp_paths();
+        init_test(&paths);
+        add_route(&paths, "r1");
+        add_route(&paths, "r2");
+        fs::write(paths.store(), b"corrupt-primary").unwrap();
+
+        let err = rekey(&paths).unwrap_err().to_string();
+        assert!(err.contains("refusing to rotate the master key"), "{err}");
+        // The key files are untouched, so recovering the backup by hand still works.
+        assert!(load_identity(&paths).is_ok());
+    }
+
+    #[test]
+    fn refuses_to_export_from_backup() {
+        let (_dir, paths) = tmp_paths();
+        init_test(&paths);
+        add_route(&paths, "r1");
+        add_route(&paths, "r2");
+        fs::write(paths.store(), b"corrupt-primary").unwrap();
+
+        let out = paths.home.join("backup.age");
+        let err = export(&paths, &out, "test-pass").unwrap_err().to_string();
+        assert!(err.contains("refusing to export the vault"), "{err}");
+        assert!(!out.exists(), "a refused export must not leave a file");
+    }
+
+    fn add_route(paths: &Paths, name: &str) {
+        update(paths, |store| {
+            store.routes.insert(
+                name.into(),
+                Route::new(
+                    crate::vkey::generate(),
+                    "https://example.com".into(),
+                    "v".into(),
+                    Auth::Bearer,
+                    BTreeMap::new(),
+                ),
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

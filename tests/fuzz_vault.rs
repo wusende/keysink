@@ -372,10 +372,14 @@ async fn watcher_hot_reload_scenarios() {
         "watcher must not downgrade a good snapshot to the .bak fallback"
     );
 
-    // 3. Repair via update(): unlock falls back to .bak (r1), r4 is added,
-    //    primary is rewritten — watcher adopts the repaired disk state.
+    // 3. Repair explicitly: writes on a degraded vault are refused, so the
+    //    operator first restores the .bak over the corrupt primary. update()
+    //    is then allowed again; r4 is added on top of the backup (r1) and the
+    //    watcher adopts the repaired disk state.
     let p = paths.clone();
     tokio::task::spawn_blocking(move || {
+        let bak = std::fs::read(p.store_bak()).unwrap();
+        write_private(&p.store(), &bak);
         store::update(&p, |s| {
             s.routes.insert("r4".into(), route());
             Ok(())
