@@ -627,6 +627,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         fs::create_dir(&target).unwrap();
+        // Do not assume what mode create_dir landed on: it is 0777 & ~umask.
+        // The invariant is that the refusal leaves it exactly as it was.
+        let before = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = create_private_dir_all(&link).unwrap_err().to_string();
@@ -634,7 +637,7 @@ mod tests {
         // The symlinked target must be untouched.
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o755,
+            before,
             "the chmod must not have landed on the target"
         );
     }
