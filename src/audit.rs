@@ -465,6 +465,20 @@ fn writer_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                // Recovery probe first, flush second: a probe that lands is
+                // immediately re-verified by the flush of any still-buffered
+                // line, so a still-broken write path ends the tick unhealthy.
+                // Without the probe, a write failure with no further traffic
+                // stuck `write_failed` forever — nothing ever retried the
+                // closed handle. The probe is the same open-for-append that a
+                // new record (and startup's `probe`) would perform, and any
+                // real write that still fails re-flags it.
+                if state.write_failed.load(Ordering::Relaxed)
+                    && reopen(&path, &mut logs.main).is_ok()
+                    && reopen(&reject_path, &mut logs.reject).is_ok()
+                {
+                    state.write_failed.store(false, Ordering::Relaxed);
+                }
                 flush_dirty(&mut logs.main, &state);
                 flush_dirty(&mut logs.reject, &state);
             }
@@ -523,17 +537,29 @@ struct OpenLog {
     written: u64,
 }
 
+/// (Re)opens a chain for append, rotating first if the previous generation
+/// filled up. Shared by the record path and the idle recovery probe, so a
+/// reopened chain gets the same rotation bookkeeping a new record would.
+/// A chain that is already open is left alone (its buffer is preserved).
+fn reopen(path: &Path, log: &mut OpenLog) -> std::io::Result<()> {
+    if log.file.is_some() {
+        return Ok(());
+    }
+    rotate_if_needed(path, log)?;
+    let file = util::private_open_options(0o600)
+        .create(true)
+        .append(true)
+        .open(path)?;
+    log.written = file.metadata()?.len();
+    log.file = Some(BufWriter::new(file));
+    Ok(())
+}
+
 fn append(path: &Path, log: &mut OpenLog, entry: &AuditEntry) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
     line.push(b'\n');
     if log.file.is_none() {
-        rotate_if_needed(path, log)?;
-        let file = util::private_open_options(0o600)
-            .create(true)
-            .append(true)
-            .open(path)?;
-        log.written = file.metadata()?.len();
-        log.file = Some(BufWriter::new(file));
+        reopen(path, log)?;
     }
     // Unreachable in practice (the block above just opened it), but the
     // invariant is enforced here instead of asserted with an unwrap.
@@ -637,8 +663,11 @@ mod tests {
 
     #[test]
     fn write_failure_is_reported_unhealthy_until_recovery() {
+        // The parent directory does not exist, so the writer's idle recovery
+        // probe can never reopen the chains: the flag this test sets by hand
+        // stays set until the test clears it, keeping the assertions race-free.
         let dir = tempfile::tempdir().unwrap();
-        let audit = Audit::new(dir.path().join("audit.jsonl"));
+        let audit = Audit::new(dir.path().join("missing").join("audit.jsonl"));
         assert!(audit.healthy());
         audit.state.write_failed.store(true, Ordering::Relaxed);
         assert!(
@@ -647,6 +676,53 @@ mod tests {
         );
         audit.state.write_failed.store(false, Ordering::Relaxed);
         assert!(audit.healthy(), "a recovered write restores health");
+        audit.close();
+    }
+
+    /// Regression: after a real write failure, `write_failed` used to clear
+    /// only on the next successful record. With no traffic at all — the exact
+    /// situation of an idle gateway whose audit disk hiccuped — the flag stuck
+    /// forever. The idle probe must restore health once the path is writable
+    /// again, without any new record arriving.
+    #[cfg(unix)]
+    #[test]
+    fn write_failure_recovers_via_the_idle_probe_without_new_traffic() {
+        if unsafe { libc::geteuid() } == 0 {
+            // root bypasses directory permissions, so the failure injection
+            // below would not fail.
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cond()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::new(dir.path().join("audit.jsonl"));
+
+        // Read-only parent: every open (and with it every write) fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        audit.record(AuditEntry::new("R1", "-", "fp", "GET", "/x", 0, false));
+        assert!(
+            wait_until(Duration::from_secs(2), || !audit.healthy()),
+            "the failed write must turn the audit unhealthy"
+        );
+
+        // Repair the directory. No further record is queued: only the idle
+        // probe may bring the flag back.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || audit.healthy()),
+            "the idle probe must recover health once the path is writable again"
+        );
         audit.close();
     }
 
