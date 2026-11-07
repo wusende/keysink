@@ -259,6 +259,12 @@ impl Audit {
     /// its own trail, never the main chain's real-traffic rows. Suppressed
     /// rows are counted, never silent.
     pub fn record_reject(&self, mut entry: AuditEntry) {
+        // Cheapest possible off path: without this, a credential flood on an
+        // audit-off gateway still takes the rejection-gate mutex and touches
+        // its fingerprint map for every request.
+        if !self.is_enabled() {
+            return;
+        }
         entry.rejected = true;
         let admit = {
             let mut gate = self.rejects.lock().unwrap_or_else(|e| e.into_inner());
@@ -710,6 +716,17 @@ mod tests {
             text.contains("R4"),
             "new file after rotation should contain only the last entry: {text}"
         );
+    }
+
+    #[test]
+    fn record_reject_does_not_touch_the_gate_when_audit_is_disabled() {
+        let audit = Audit::disabled();
+        audit.record_reject(AuditEntry::new("R1", "-", "fp", "GET", "/x", 0, false));
+        assert!(
+            audit.rejects.lock().unwrap().per_fp.is_empty(),
+            "the reject gate must not be populated when audit is off"
+        );
+        assert_eq!(audit.dropped(), 0);
     }
 
     #[test]

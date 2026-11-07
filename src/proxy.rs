@@ -1231,6 +1231,13 @@ fn record_reject(
     status: StatusCode,
     started: Instant,
 ) {
+    // The common case is audit disabled; rejection rows are also the highest
+    // frequency requests under a credential flood. Do not build an AuditEntry
+    // (RFC3339 timestamp + several Strings) for a row that can never be
+    // written.
+    if !state.audit.is_enabled() {
+        return;
+    }
     let mut entry = AuditEntry::new(
         rid.to_string(),
         route.to_string(),
