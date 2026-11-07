@@ -1665,6 +1665,37 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
         ));
     }
 
+    // The vault directory comes straight from --home / KEYSINK_VAULT_HOME, and
+    // this command recursively deletes it. Never trust the path alone: a typo
+    // (`--home .`, a shared project directory) would erase unrelated files.
+    // A system install is anchored at the deploy path, so the marker check is
+    // skipped there; everything else must actually look like a vault.
+    if home.exists() {
+        match std::fs::symlink_metadata(&home) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(Error::msg(format!(
+                    "refusing to uninstall through a symlink: {}",
+                    home.display()
+                )));
+            }
+            Ok(md) if !md.is_dir() => {
+                return Err(Error::msg(format!(
+                    "refusing to uninstall: {} is not a directory",
+                    home.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(Error::from(e)),
+        }
+        if !system && !looks_like_vault(&home) {
+            return Err(Error::msg(format!(
+                "refusing to delete {}: it does not look like a keysink vault (no vault.key/vault.age). \
+                 Point --home at the vault directory, or remove the directory yourself if you are sure.",
+                home.display()
+            )));
+        }
+    }
+
     if !yes {
         if !std::io::stdin().is_terminal() {
             return Err(Error::msg("non-interactive mode requires --yes"));
@@ -1737,6 +1768,27 @@ pub(crate) fn cmd_uninstall(paths: &Paths, yes: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a directory carries the files keysink itself writes. Used by
+/// `uninstall` as a guard: the command recursively deletes `--home`, so a
+/// mistyped or shared path must not erase unrelated data.
+fn looks_like_vault(home: &std::path::Path) -> bool {
+    const MARKERS: [&str; 4] = ["vault.key", "vault.age", "vault.age.bak", "vault.lock"];
+    if MARKERS.iter().any(|name| home.join(name).exists()) {
+        return true;
+    }
+    // A failed `init --force` can leave only the renamed `.old.<millis>` pairs.
+    std::fs::read_dir(home).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("vault.key.old.")
+                || name.starts_with("vault.age.old.")
+                || name.starts_with("vault.key.bak.old.")
+                || name.starts_with("vault.age.bak.old.")
+        })
+    })
 }
 
 pub(crate) fn cmd_rekey(paths: &Paths, yes: bool) -> Result<()> {
@@ -1896,6 +1948,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--flag"), "{err}");
+    }
+
+    #[test]
+    fn uninstall_refuses_a_directory_that_is_not_a_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("not-a-vault");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("keep.txt"), b"unrelated").unwrap();
+
+        let err = cmd_uninstall(&Paths::vault(home.clone()), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not look like a keysink vault"), "{err}");
+        assert!(
+            home.join("keep.txt").exists(),
+            "the unrelated directory must be untouched"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_a_real_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("vault");
+        let paths = Paths::vault(home.clone());
+        store::init(&paths, false, "test-password").unwrap();
+        cmd_uninstall(&paths, true).unwrap();
+        assert!(!home.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_refuses_a_symlinked_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("vault.key"), b"key").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = cmd_uninstall(&Paths::vault(link), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(target.join("vault.key").exists());
     }
 
     #[test]
