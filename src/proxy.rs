@@ -2049,7 +2049,7 @@ async fn stream_response(
                 }
                 Some(Err(_)) => {
                     tracing::warn!(rid = %scan.rid, "upstream SSE stream interrupted");
-                    let event = sse_error_event("upstream stream error", terminator);
+                    let event = sse_error_event("upstream stream error", scan.dialect());
                     scan.finish();
                     Some((Ok(event), (inner, scan)))
                 }
@@ -2061,7 +2061,8 @@ async fn stream_response(
                         rid = %scan.rid,
                         "SSE stream ended early without terminator marker, treating as truncated"
                     );
-                    let event = sse_error_event("upstream stream ended prematurely", terminator);
+                    let event =
+                        sse_error_event("upstream stream ended prematurely", scan.dialect());
                     scan.finish();
                     Some((Ok(event), (inner, scan)))
                 }
@@ -2086,6 +2087,10 @@ struct SseScan {
     done: bool,
     /// Tail of the previous chunk, at most `TERMINATOR_MAX_NEEDLE - 1` bytes.
     carry: Vec<u8>,
+    /// Whether the stream has shown an Anthropic-style event. Only consulted
+    /// by `Terminator::Auto`, to give a truncated Anthropic stream an
+    /// Anthropic-shaped error event instead of an OpenAI `data: [DONE]` tail.
+    saw_anthropic: bool,
     /// Request id for the (cold) interruption/truncation log lines.
     rid: String,
 }
@@ -2097,6 +2102,7 @@ impl SseScan {
             seen: false,
             done: false,
             carry: Vec::with_capacity(TERMINATOR_MAX_NEEDLE - 1),
+            saw_anthropic: false,
             rid,
         }
     }
@@ -2108,6 +2114,19 @@ impl SseScan {
         self.done = true;
     }
 
+    /// The dialect the synthetic error event must be shaped as.
+    ///
+    /// `Auto` normally defaults to the OpenAI shape, but an `Auto` stream that
+    /// showed Anthropic `event:` lines is an Anthropic stream: appending
+    /// `data: [DONE]` to it would be a shape the client does not understand.
+    fn dialect(&self) -> Terminator {
+        if self.terminator == Terminator::Auto && self.saw_anthropic {
+            Terminator::Anthropic
+        } else {
+            self.terminator
+        }
+    }
+
     /// Scans one upstream chunk. The chunk itself is searched in place; a
     /// marker straddling the previous carry and this chunk can only start
     /// within the last L-1 carry bytes and reach at most L-1 bytes into the
@@ -2116,6 +2135,12 @@ impl SseScan {
     fn feed(&mut self, chunk: &[u8]) {
         if self.seen || self.terminator == Terminator::None {
             return;
+        }
+        // Dialect detection for `Auto`: Anthropic streams are the only ones
+        // that emit `event:` lines. Only the first hit is recorded, and only
+        // until it is found.
+        if self.terminator == Terminator::Auto && !self.saw_anthropic && looks_anthropic(chunk) {
+            self.saw_anthropic = true;
         }
         if contains_terminator(chunk, self.terminator) {
             self.seen = true;
@@ -2144,6 +2169,23 @@ impl SseScan {
             self.carry.extend_from_slice(chunk);
         }
     }
+}
+
+/// Cheap dialect hint for `Terminator::Auto`: does this chunk contain an SSE
+/// event name only Anthropic emits? OpenAI-style and OpenAI-compatible streams
+/// send bare `data:` lines; Anthropic sends `event: message_start`,
+/// `event: content_block_delta`, `event: message_delta`, ... . A generic
+/// `event:` field is *not* enough (proxies use it for OpenAI streams too).
+///
+/// Best effort on purpose: a marker split across chunks is missed, and the
+/// only consequence is the previous behavior (an OpenAI-shaped error tail).
+fn looks_anthropic(chunk: &[u8]) -> bool {
+    const EVENT_NAMES: [&[u8]; 3] = [
+        b"event: message_start",
+        b"event: content_block_",
+        b"event: message_delta",
+    ];
+    EVENT_NAMES.iter().any(|needle| find_memmem(chunk, needle))
 }
 
 fn sse_error_event(message: &str, terminator: Terminator) -> Bytes {
@@ -2632,6 +2674,35 @@ mod tests {
             scan.feed(b"event: message_stop\n\n");
             assert!(!scan.seen && scan.carry.is_empty());
         }
+    }
+
+    #[test]
+    fn auto_dialect_follows_the_observed_stream_style() {
+        // An Anthropic-looking stream truncated mid-flight must get the
+        // Anthropic error shape, not an OpenAI `data: [DONE]` tail.
+        let mut scan = SseScan::new(Terminator::Auto, "R".into());
+        scan.feed(b"event: message_start\ndata: {}\n\n");
+        assert_eq!(scan.dialect(), Terminator::Anthropic);
+        let event = sse_error_event("boom", scan.dialect());
+        let text = std::str::from_utf8(&event).unwrap();
+        assert!(text.starts_with("event: error\n"), "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
+
+        // OpenAI-style data-only stream keeps the OpenAI shape.
+        let mut scan = SseScan::new(Terminator::Auto, "R".into());
+        scan.feed(b"data: {\"i\":0}\n\n");
+        assert_eq!(scan.dialect(), Terminator::Auto);
+
+        // A generic `event:` field is not an Anthropic signal: OpenAI
+        // compatible proxies emit those too, and they kept the OpenAI tail.
+        let mut scan = SseScan::new(Terminator::Auto, "R".into());
+        scan.feed(b"event: delta\ndata: {\"i\":0}\n\n");
+        assert_eq!(scan.dialect(), Terminator::Auto);
+
+        // Explicit terminators are never overridden by observation.
+        let mut scan = SseScan::new(Terminator::Openai, "R".into());
+        scan.feed(b"event: message_start\n\n");
+        assert_eq!(scan.dialect(), Terminator::Openai);
     }
 
     #[test]
