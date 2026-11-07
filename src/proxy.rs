@@ -2433,7 +2433,7 @@ async fn watcher_loop(state: Arc<AppState>, paths: Paths) {
     // Zeroed so the first round after startup always reloads once,
     // covering the race where the CLI modified the store between serve
     // finishing the initial store load and the watcher starting.
-    let mut last = (0u64, 0u64, 0u64);
+    let mut last = (0u64, 0u64);
     let mut failures = 0u32;
     let mut backup_warned = false;
     let mut delay = RELOAD_POLL;
@@ -2530,7 +2530,13 @@ async fn watcher_loop(state: Arc<AppState>, paths: Paths) {
     }
 }
 
-fn stamp(paths: &Paths) -> (u64, u64, u64) {
+/// Stat fingerprint of the two files the snapshot is built from.
+///
+/// `.bak` is deliberately not part of it: every write that touches `.bak`
+/// also rewrites the live store (save_store backs up, then writes; rekey
+/// touches both), so including it would only make one logical change look
+/// like two and trigger a second, redundant reload.
+fn stamp(paths: &Paths) -> (u64, u64) {
     fn one(path: &std::path::Path) -> u64 {
         let Ok(md) = std::fs::metadata(path) else {
             return 0;
@@ -2555,11 +2561,7 @@ fn stamp(paths: &Paths) -> (u64, u64, u64) {
             mtime ^ md.len().rotate_left(17)
         }
     }
-    (
-        one(&paths.store()),
-        one(&paths.master_key()),
-        one(&paths.store_bak()),
-    )
+    (one(&paths.store()), one(&paths.master_key()))
 }
 
 #[cfg(test)]
