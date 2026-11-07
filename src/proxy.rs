@@ -834,8 +834,22 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snap = state.snapshot.load();
     let uptime = state.started.elapsed().as_secs();
     let last_ok = state.reload.last_ok_secs.load(Ordering::Relaxed);
+    let reload_failures = state.reload.failures.load(Ordering::Relaxed);
+    let watcher_age = tick_age(&state);
+    let audit_ok = state.audit.healthy();
+    // `ok` answers "the process is up and serving"; `healthy` answers "it is
+    // serving data it can trust". They differ exactly when the gateway keeps
+    // answering from a stale snapshot: an orchestrator that only checks `ok`
+    // keeps a gateway that may be honoring revoked vkeys in the pool forever.
+    // A degraded backup, a failing hot reload, a dead/incorrectly writing
+    // audit writer, or a watcher that stopped ticking all make this false.
+    let healthy = !snap.from_backup
+        && reload_failures == 0
+        && audit_ok
+        && watcher_age <= WATCHDOG_STALE.as_secs();
     Json(json!({
         "ok": true,
+        "healthy": healthy,
         "degraded": snap.from_backup,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime,
@@ -845,10 +859,11 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // that stopped) — without these the outage was invisible to
         // monitoring until someone noticed a rotated key still working.
         "snapshot_age_secs": uptime.saturating_sub(last_ok),
-        "reload_failures": state.reload.failures.load(Ordering::Relaxed),
+        "reload_failures": reload_failures,
         "reload_attempts": state.reload.attempts.load(Ordering::Relaxed),
+        "watcher_age_secs": watcher_age,
         "audit": state.audit.is_enabled(),
-        "audit_ok": state.audit.healthy(),
+        "audit_ok": audit_ok,
         "audit_dropped": state.audit.dropped(),
         // Accept-loop visibility: the shed count is the only trace a connection
         // flood leaves, and per-connection accept errors used to be either
@@ -3161,6 +3176,29 @@ mod serve_inbound_tests {
         })
     }
 
+    /// Same state, with a live audit log instead of the disabled one.
+    fn test_state_with_audit(audit: Audit) -> Arc<AppState> {
+        Arc::new(AppState {
+            snapshot: ArcSwap::from_pointee(Snapshot {
+                store: Arc::new(Store::new()),
+                table: RouteTable::build(&Store::new()).unwrap(),
+                from_backup: false,
+            }),
+            clients: ProxyClients::new().unwrap(),
+            retry: RetryPolicy::default(),
+            body_limit: 1 << 20,
+            body_read_idle: BODY_READ_IDLE,
+            inbound_body_timeout: CLIENT_BODY_TIMEOUT,
+            permit_queue_timeout: PERMIT_QUEUE_TIMEOUT,
+            body_total_budget: BODY_TOTAL_BUDGET,
+            reload: Arc::new(ReloadStatus::default()),
+            counters: Arc::new(ServeCounters::default()),
+            inbound_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            audit,
+            started: Instant::now(),
+        })
+    }
+
     /// Regression: the reaping arm of the accept select must be disabled while
     /// the JoinSet is empty. `join_next` returns Ready(None) immediately for an
     /// empty set, so an unguarded arm is always ready — the loop spins on it
@@ -3546,6 +3584,51 @@ mod serve_inbound_tests {
             matches!(closed, Ok(Ok(0))),
             "the drained connection must be closed, got {closed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn health_ok_is_true_even_when_health_is_not() {
+        let state = test_state();
+        // Baseline: nothing is wrong.
+        let v = health_json(&state).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["healthy"], true);
+
+        // A degraded snapshot (served from .bak) keeps ok=true — the process
+        // does answer — but must not look healthy.
+        let current = state.snapshot.load_full();
+        state.snapshot.store(Arc::new(Snapshot {
+            store: current.store.clone(),
+            table: RouteTable::build(&current.store).unwrap(),
+            from_backup: true,
+        }));
+        let v = health_json(&state).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["healthy"], false);
+        assert_eq!(v["degraded"], true);
+
+        // Failing hot reload: the snapshot is good again, the vault is not.
+        state.snapshot.store(current);
+        state.reload.failures.store(2, Ordering::Relaxed);
+        let v = health_json(&state).await;
+        assert_eq!(v["healthy"], false);
+        state.reload.failures.store(0, Ordering::Relaxed);
+        assert_eq!(health_json(&state).await["healthy"], true);
+
+        // Audit dead while enabled.
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_audit(Audit::new(dir.path().join("audit.jsonl")));
+        state.audit.mark_unhealthy_for_test();
+        let v = health_json(&state).await;
+        assert_eq!(v["audit_ok"], false);
+        assert_eq!(v["healthy"], false);
+        state.audit.close();
+    }
+
+    async fn health_json(state: &Arc<AppState>) -> serde_json::Value {
+        let resp = health(State(state.clone())).await.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]

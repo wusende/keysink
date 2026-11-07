@@ -170,16 +170,23 @@ integrity checks — owner, permissions, key parses, store decrypts, backup
 decrypts — and is what to run when something looks wrong.
 
 To check the gateway itself, `GET /__keysink/health` returns
-`{"ok":true,"degraded":false,"version":"0.2.0","uptime_secs":…,"routes":2}`,
+`{"ok":true,"healthy":true,"degraded":false,"version":"0.2.1","uptime_secs":…,"routes":2}`,
 plus the state that used to be invisible: `snapshot_age_secs` (how long the
 served snapshot has been in place — the watcher only reloads on vault changes,
 so on a stable vault this grows with uptime; it reports data freshness, not
 watcher health, so don't alert on it), `reload_failures` / `reload_attempts`
 (the actual reload signals: failures climbs while the vault stays broken, e.g.
-undecryptable), `shed_connections` / `accept_errors` (connection-cap and
+undecryptable), `watcher_age_secs` (how long since the store watcher last
+ticked), `shed_connections` / `accept_errors` (connection-cap and
 per-connection accept-error counts), and `audit` / `audit_ok` /
 `audit_dropped` (a dead audit writer or a failed audit write reports
 `audit_ok:false` instead of silently dropping every line).
+
+`ok` only says the process answers; `healthy` says it is serving data it can
+trust — it goes false when the snapshot came from the stale backup, the hot
+reload keeps failing, the audit writer cannot write, or the watcher stopped
+ticking. Point liveness probes at `ok` (never restart a gateway that is still
+answering) and alerting/production-readiness at `healthy`.
 
 `--accept-degraded` covers a broken vault: when the primary store fails to
 decrypt, the gateway can start from `vault.age.bak` instead. That backup is one

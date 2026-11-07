@@ -182,6 +182,13 @@ impl Audit {
         self.state.dropped.load(Ordering::Relaxed)
     }
 
+    /// Test hook for other modules' health tests: simulate a writer thread
+    /// that died or a write that cannot land.
+    #[cfg(test)]
+    pub(crate) fn mark_unhealthy_for_test(&self) {
+        self.state.write_failed.store(true, Ordering::Relaxed);
+    }
+
     pub fn new(path: PathBuf) -> Self {
         // mode(0o600) only takes effect at creation; if an existing file has overly broad permissions, warn once at startup.
         for existing in [path.as_path(), reject_chain_path(&path).as_path()] {
