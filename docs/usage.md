@@ -83,7 +83,7 @@ integrity checks (owner, permissions, key parses, store decrypts, backup
 decrypts) and is what to run when something looks wrong.
 
 To check the gateway itself, `GET /__keysink/health` returns
-`{"ok":true,"healthy":true,"degraded":false,"version":"0.2.2","uptime_secs":…,"routes":2}`,
+`{"ok":true,"healthy":true,"degraded":false,"version":"0.2.3","uptime_secs":…,"routes":2}`,
 plus the state that used to be invisible:
 
 - `snapshot_age_secs`: how long the served snapshot has been in place. The

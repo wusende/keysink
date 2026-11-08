@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.2.3
+
+*Released 2026-11-08.*
+
+Two things a local gateway should have had from the start: it stops being
+readable from its own uid, and its README stops being a manual.
+
+One operational note: on Linux `serve` is no longer dumpable, so you cannot
+attach a debugger to it as the same user any more — use root, and expect no
+core dump from that process. Drop-in otherwise — no config or storage changes.
 
 **Security**
 

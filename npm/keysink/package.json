@@ -1,6 +1,6 @@
 {
   "name": "keysink",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "One-way local gateway for AI agents: real API keys (Anthropic, OpenAI, Gemini) never enter the agent's environment. Agents get revocable virtual keys; a prompt-injected agent can dump its env and get nothing.",
   "license": "MIT",
   "author": "wusende",
