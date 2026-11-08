@@ -1,7 +1,7 @@
 {
   "name": "keysink",
   "version": "0.2.2",
-  "description": "Local gateway that keeps real AI API keys out of agents (Claude Code, OpenAI, MCP): agents hold revocable virtual keys, real keys stay in an encrypted vault.",
+  "description": "One-way local gateway for AI agents: real API keys (Anthropic, OpenAI, Gemini) never enter the agent's environment. Agents get revocable virtual keys; a prompt-injected agent can dump its env and get nothing.",
   "license": "MIT",
   "author": "wusende",
   "homepage": "https://github.com/wusende/keysink#readme",
@@ -15,13 +15,22 @@
   "keywords": [
     "api-keys",
     "secrets",
+    "secrets-management",
+    "prompt-injection",
     "llm",
+    "llm-proxy",
     "proxy",
+    "gateway",
     "cli",
     "claude-code",
+    "anthropic",
     "openai",
+    "gemini",
     "mcp",
-    "ai-agents"
+    "ai-agents",
+    "api-key-rotation",
+    "dotenv",
+    "security"
   ],
   "bin": {
     "keysink": "bin/keysink.js"

@@ -11,13 +11,28 @@
 
 > 1.0 之前,CLI 与路由接口仍可能在版本间变动;每个版本的操作注意事项见 [CHANGELOG](CHANGELOG.md)。
 
-本机小型网关:真 API key 不进 agent。agent 只拿到可随时吊销的虚拟 key(`ks_…`),真 key 加密存在本地保险库,只在转发那一刻替换进去。
+## 这个工具针对的威胁
+
+现在的 agent 都带着真 API key 跑——而 agent 整天在读不可信的内容:网页、issue 讨论、工具输出、抓取的文档。离一次 prompt 注入的距离,`env | curl …` 就能把你的真 key 送出门,而你往往是从账单上知道的。
+
+keysink 的思路是把这个通道拆掉,而不是祈祷它别触发:
 
 ```
 agent ──ks_…──▶ keysink :8787 ──真 key──▶ 上游
 ```
 
-真 key **没有任何读取通道**:CLI 打印不出来,`export` 备份会剥离,网关只绑 loopback。
+agent 手里只有**虚拟 key**(`ks_…`)。真 key 加密存在本地保险库里,只在转发那一刻替换进去。真 key **没有任何读取通道**:CLI 打印不出来,`export` 备份会剥离,网关只绑 loopback。被 dump 出来的环境里只有一把 `ks_…`——一条命令吊销,其余一切照常。
+
+## 横向对比
+
+| | keysink | .env 写进 agent 配置 | LiteLLM / one-api | Vault / Infisical |
+|---|---|---|---|---|
+| 真 key 不进 agent 环境 | ✅ 根本不进 | ❌ 就在 env 里 | ⚠️ 网关自己持有上游 key | ⚠️ agent 会取到真 key |
+| 单向(没有读取/导出 key 的通道) | ✅ | ❌ | ❌ | ❌ |
+| 每个 agent 独立可吊销凭证 | ✅ vkey | ❌ | ⚠️ 有虚拟 key,但库里存的是真 key | ✅ |
+| 换供应商/换 key 不动 agent | ✅ 热重载约 1 秒 | ❌ 改配置+重启 | ⚠️ | ⚠️ |
+| 不需要服务器或 KMS | ✅ 一个二进制,loopback | ✅ | ❌ | ❌ |
+| 重试不重复扣费 | ✅ | — | ⚠️ | — |
 
 ## 为什么值得装
 
@@ -236,3 +251,7 @@ bash scripts/smoke.sh    # 端到端:假上游、转发 / SSE / 重试 / 热重�
 ```
 
 `cargo test` 里带一套固定种子的 fuzz(22 个纯函数目标、保险库损坏矩阵、对着 mock 上游的端到端 fuzz),外加 `perf/ksbench` 里的性能压测(load driver + 假上游)。推 `v*` tag 会触发 GitHub Actions 构建并发布全平台产物,开了 `CRATES_PUBLISH` / `NPM_PUBLISH` 后同时发布 crates.io 和 npm 包(见 `docs/publishing.md`)。
+
+---
+
+如果 keysink 让你不用再把 API key 粘进 agent 配置——或者已经帮你省掉了一次本该做的全量换 key——去[点个 star](https://github.com/wusende/keysink/stargazers),让别人在漏 key 之前先找到它。agent 之外的文件态密钥管理,见同作者的配套工具 [envpouch](https://github.com/wusende/envpouch):密码加密的 `.env` profile。

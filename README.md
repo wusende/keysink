@@ -16,12 +16,35 @@ A small local gateway that keeps your real API keys out of your agents. The
 agent gets a revocable virtual key (`ks_…`); keysink holds the real key in an
 encrypted local vault and swaps it in only at forward time.
 
+## The threat this exists for
+
+Modern agents run with your real API keys in their environment — and agents
+read untrusted content all day: web pages, issue threads, tool outputs, fetched
+documents. A single prompt injection away, `env | curl …` walks your real key
+out the door, and you find out from the bill.
+
+keysink removes that channel instead of hoping it never triggers:
+
 ```
 agent ──ks_…──▶ keysink :8787 ──real key──▶ upstream
 ```
 
-There is **no read channel for real keys**: the CLI cannot print them, `export`
-backups strip them, and the gateway binds loopback only.
+The agent holds a **virtual key** (`ks_…`). The real key lives in an encrypted
+local vault and is swapped in only at forward time. There is **no read channel
+for real keys**: the CLI cannot print them, `export` backups strip them, and
+the gateway binds loopback only. A dumped environment is a dumped `ks_…` —
+revocable in one command while the rest of your setup keeps working.
+
+## How it compares
+
+| | keysink | .env in agent config | LiteLLM / one-api | Vault / Infisical |
+|---|---|---|---|---|
+| Real key absent from agent env | ✅ never enters | ❌ sits in env | ⚠️ still holds upstream keys | ⚠️ agent fetches real keys |
+| One-way (no key read/export path) | ✅ | ❌ | ❌ | ❌ |
+| Per-agent revocable credential | ✅ vkey | ❌ | ⚠️ virtual keys, but key store holds real ones | ✅ |
+| Swap provider / rotate key, agent untouched | ✅ hot-reload ~1s | ❌ edit + restart | ⚠️ | ⚠️ |
+| Runs without a server or KMS | ✅ one binary, loopback | ✅ | ❌ | ❌ |
+| Retries that don't double-bill | ✅ | — | ⚠️ | — |
 
 ## Why bother
 
@@ -382,3 +405,12 @@ vault corruption matrix, and end-to-end fuzz against a mock upstream) plus the
 perf harness in `perf/ksbench`. Pushing a `v*` tag makes GitHub Actions build and
 publish release artifacts for all platforms, plus crates.io and the npm package
 once `CRATES_PUBLISH` / `NPM_PUBLISH` are enabled (see `docs/publishing.md`).
+
+---
+
+If keysink let you stop pasting API keys into agent configs — or it already
+caught the rotation you didn't have to do — a
+[star](https://github.com/wusende/keysink/stargazers) helps other people find
+it before the leak does. For file-based secrets outside agents, see the
+companion tool [envpouch](https://github.com/wusende/envpouch): encrypted
+`.env` profiles with the same author.
