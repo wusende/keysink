@@ -37,7 +37,7 @@ agent 是用你的账号跑的,它也就有你的文件和 `/proc`。Linux 上�
 | `/proc/<pid>/mem`、`gdb -p`、`strace -p` | 运行中进程的内存,里面就是真 key |
 
 前两行靠 `deploy` 给出的独立 uid 堵上;后两行靠 `serve` 在 Linux 上的 `prctl(PR_SET_DUMPABLE, 0)`(同 uid 读 `/proc/<pid>/*`、`ptrace` 全变 `EPERM`)。两者都在你自己的 uid 里跑时,这些都挡不住——保险库文件就是共享的。细节和做法见
-[docs/security.md](https://github.com/wusende/keysink/blob/main/docs/security.md)。
+[docs/zh-CN/security.md](docs/zh-CN/security.md)。
 
 ## 快速开始
 
@@ -80,12 +80,12 @@ agent 是用你的账号跑的,它也就有你的文件和 `/proc`。Linux 上�
 
 | 文档 | 内容 |
 |---|---|
-| [usage.md](https://github.com/wusende/keysink/blob/main/docs/usage.md) | 路由规则、全部命令与路由选项、health endpoint 字段、保险库布局、FAQ |
-| [service.md](https://github.com/wusende/keysink/blob/main/docs/service.md) | `sudo keysink deploy`:系统用户、systemd unit、无终端初始化 |
-| [security.md](https://github.com/wusende/keysink/blob/main/docs/security.md) | 威胁模型、同 uid 通道、审计日志、各种上界与关闭流程 |
-| [performance.md](https://github.com/wusende/keysink/blob/main/docs/performance.md) | 实测开销与 `scripts/perf.sh` 压测工具 |
+| [usage.md](docs/zh-CN/usage.md) | 路由规则、全部命令与路由选项、health endpoint 字段、保险库布局、FAQ |
+| [service.md](docs/zh-CN/service.md) | `sudo keysink deploy`:系统用户、systemd unit、无终端初始化 |
+| [security.md](docs/zh-CN/security.md) | 威胁模型、同 uid 通道、审计日志、各种上界与关闭流程 |
+| [performance.md](docs/zh-CN/performance.md) | 实测开销与 `scripts/perf.sh` 压测工具 |
 
-详细文档目前只有英文。
+英文原文见 [docs/](docs/)。
 
 ## 它不是什么
 
