@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 [![crates.io](https://img.shields.io/crates/v/keysink.svg)](https://crates.io/crates/keysink)
 [![docs.rs](https://img.shields.io/docsrs/keysink)](https://docs.rs/keysink)
 [![Release](https://img.shields.io/github/v/release/wusende/keysink)](https://github.com/wusende/keysink/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/wusende/keysink/releases/latest)
 
 > Pre-1.0: the CLI and route surface may still change between releases; each
@@ -16,24 +16,43 @@ A small local gateway that keeps your real API keys out of your agents. The
 agent gets a revocable virtual key (`ks_…`); keysink holds the real key in an
 encrypted local vault and swaps it in only at forward time.
 
-## The threat this exists for
-
-Modern agents run with your real API keys in their environment — and agents
-read untrusted content all day: web pages, issue threads, tool outputs, fetched
-documents. A single prompt injection away, `env | curl …` walks your real key
-out the door, and you find out from the bill.
-
-keysink removes that channel instead of hoping it never triggers:
-
 ```
 agent ──ks_…──▶ keysink :8787 ──real key──▶ upstream
 ```
 
-The agent holds a **virtual key** (`ks_…`). The real key lives in an encrypted
-local vault and is swapped in only at forward time. There is **no read channel
-for real keys**: the CLI cannot print them, `export` backups strip them, and
-the gateway binds loopback only. A dumped environment is a dumped `ks_…` —
-revocable in one command while the rest of your setup keeps working.
+## The threat this exists for
+
+Agents read untrusted content all day: web pages, issue threads, tool outputs,
+fetched documents. A single prompt injection away, `env | curl …` walks your
+real key out the door, and you find out from the bill.
+
+There is **no read channel for real keys**: the CLI cannot print them, `export`
+backups strip them, and the gateway binds loopback only. A dumped environment
+is a dumped `ks_…` — revocable in one command while the rest of your setup
+keeps working.
+
+One real key can back many routes: each agent gets its own `ks_…`, and rotating
+a key or switching provider is `keysink route update` — routes hot-reload in
+about a second, so the agent's config is pinned once.
+
+### The other channels
+
+An agent runs as you, so it also has your files and your `/proc`. Measured on
+Linux, agent and gateway under the same uid:
+
+| What the agent runs | What it gets |
+|---|---|
+| `cat token.txt`, `.env`, `~/.config/*/credentials` | plaintext — the key was never in a vault |
+| `age -d -i vault.key vault.age` | the whole vault, if `vault.key` is readable |
+| `tr '\0' '\n' < /proc/<pid>/environ` | whatever a launcher injected into a sibling process |
+| `/proc/<pid>/mem`, `gdb -p`, `strace -p` | a running program's memory, real keys included |
+
+`deploy` closes the first two rows with a dedicated uid for the vault. `serve`
+closes the last two on Linux — `prctl(PR_SET_DUMPABLE, 0)` at startup, so
+same-uid reads of `/proc/<pid>/*` and `ptrace` get `EPERM`. Neither helps if
+both run in your own uid: then the vault files are simply shared.
+[docs/security.md](https://github.com/wusende/keysink/blob/main/docs/security.md)
+has the details and what to do about them.
 
 ## How it compares
 
@@ -46,24 +65,6 @@ revocable in one command while the rest of your setup keeps working.
 | Runs without a server or KMS | ✅ one binary, loopback | ✅ | ❌ | ❌ |
 | Retries that don't double-bill | ✅ | — | ⚠️ | — |
 
-## Why bother
-
-**Change a key without touching an agent.** Your agent config pins one base URL
-and one `ks_…` token, once. Switching provider, account or real key afterwards is
-`keysink route update`: routes hot-reload into the running gateway in about a
-second. No config edit, no agent restart.
-
-**One real key, many revocable virtual keys.** Give each agent its own route:
-same upstream, separate vkey, independent lifecycle. Rotate or disable one and
-the others keep working.
-
-**Retries that don't double-bill.** `429`/`503`/`504` are retried twice, but a
-POST whose network call failed is never replayed, and nothing is retried once SSE
-streaming has started. A replayed POST is a second charge on your bill.
-
-Hence the name: keys sink in and never come out. A prompt-injected agent can
-dump everything in its environment, and the real key was never in it.
-
 ## Quick start
 
 1. Install — any of these:
@@ -73,21 +74,18 @@ dump everything in its environment, and the real key was never in it.
    cargo install keysink      # from crates.io, needs a Rust toolchain
    ```
 
-   `cargo install` lands in `~/.cargo/bin`, which sudo can't see. So if you later
-   run `sudo keysink deploy`, use `sudo ~/.cargo/bin/keysink deploy`.
-
+   `cargo install` lands in `~/.cargo/bin`, which sudo can't see. So if you
+   later run `sudo keysink deploy`, use `sudo ~/.cargo/bin/keysink deploy`.
    Prebuilt binaries are also on
    [Releases](https://github.com/wusende/keysink/releases) (Linux / macOS /
-   Windows, amd64 / arm64); put one on your `PATH`. The npm package is a thin
-   launcher around that same binary; Linux x86_64 needs glibc 2.35+, arm64 needs
-   2.39+, and anything uncovered (musl/Alpine, Windows arm64) falls back to
-   `cargo install`.
+   Windows, amd64 / arm64) — put one on your `PATH`. Linux x86_64 needs glibc
+   2.35+, arm64 needs 2.39+; anything uncovered (musl/Alpine, Windows arm64)
+   falls back to `cargo install`.
 
-2. Start the gateway (standalone mode — no root, no service):
+2. Start the gateway (standalone — no root, no service):
 
    ```bash
-   keysink serve
-   # first run: interactive init (set a master password), then the gateway starts
+   keysink serve      # first run: interactive init (set a master password), then the gateway starts
    ```
 
 3. Add a route, in another terminal:
@@ -98,15 +96,10 @@ dump everything in its environment, and the real key was never in it.
    # non-interactive: printf %s "$KEY" | keysink route add claude --base-url … --auth x-api-key
    ```
 
-   It prints the vkey and the two lines your agent needs:
+   It prints the vkey (only this once) and the two lines your agent needs:
 
    ```
-   route `claude` created (key goes in, never out: cannot be read/exported)
-   auth: x-api-key    base_url: https://api.anthropic.com
    vkey: ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
-   (vkey is shown only this once; if lost, only `keysink route rotate claude` can issue a new one)
-   gateway: http://127.0.0.1:8787 (running)
-   agent-side config (OpenAI-compatible clients usually need /v1 in base_url):
      BASE_URL=http://127.0.0.1:8787
      TOKEN=ks_R6OpUgxRjVnuCwISI0_BgtAi1E8FGUILJHQouA50tYc
    ```
@@ -114,244 +107,20 @@ dump everything in its environment, and the real key was never in it.
    Routes hot-reload into a running gateway within ~1s, so adding one never
    requires a restart.
 
-4. Point your agent at it:
-
-   ```
-   BASE_URL=http://127.0.0.1:8787
-   TOKEN=ks_...
-   ```
-
-   Claude Code: `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` in `settings.json`.
-   Other clients: provider `base_url` + `apiKey`.
-
-   The vkey rides in whatever header your client already sends (`Authorization:
-   Bearer`, `x-api-key`, `x-goog-api-key` or `api-key`), so for most clients this
+4. Point your agent at it: `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` in
+   Claude Code's `settings.json`, provider `base_url` + `apiKey` for anything
+   else (OpenAI-style clients usually need `/v1` in the base URL). The vkey
+   rides in whatever header your client already sends, so for most clients this
    is a base-URL change and nothing else.
 
-## How routing works
+## Documentation
 
-One loopback port serves every route. The **vkey in the request selects the
-route**, and the route carries everything upstream-specific: base URL, auth style
-(`bearer` / `x-api-key` / custom header / `basic` / query param), static headers
-to inject, retry policy, and an optional per-route upstream proxy.
-
-Inbound auth headers are stripped and rebuilt from the route, so a client can
-never smuggle its own credentials through. Everything else (method, path, body,
-`Accept`, streaming) is passed through unchanged, and the query string is
-preserved with the auth parameter managed by the route. SSE chunks are forwarded
-as they arrive instead of being buffered into a whole response.
-
-Two kinds of requests are refused outright even in passthrough mode. A request
-path containing dot segments (`..`, `%2e%2e`, or their `\`-separated forms) gets
-a 404: the downstream URL parser collapses those, and forwarding one would let a
-request escape the route's base_url prefix on the upstream host. `CONNECT`,
-`TRACE` and `TRACK` get a 405: a TRACE the upstream implements would echo the
-forwarded headers, real key included, back to the caller.
-
-`--auth` describes keysink → upstream only. Inbound, the vkey is accepted in any
-of `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`, `api-key`,
-`anthropic-api-key` or `openai-api-key` (the same names stripped before
-forwarding), so the client's auth style and the route's never have to match.
-
-Two agents on the same port can talk to two different providers, or to the same
-provider with different keys, without either of them knowing.
-
-## Everyday commands
-
-```
-keysink init                     # first entry point in scripts / headless environments (interactive serve auto-initializes)
-keysink route add|ls|show|rotate|update|rm|enable|disable
-# `route rm` destroys the route-only key, so it asks for confirmation
-# (`--yes` in scripts); `route disable` keeps the key and just stops serving it
-keysink serve [--listen 127.0.0.1:8787] [--audit-log FILE] [--max-concurrent N] [--accept-degraded]
-keysink status | doctor
-keysink export --output FILE      # needs master password; strips all key values
-keysink rekey [--yes]             # rotate the vault master key
-keysink deploy | uninstall        # system install / symmetric removal
-```
-
-Useful route options:
-
-- `--auth bearer|x-api-key|header|basic|query|none`: OpenAI is Bearer, Claude
-  `x-api-key`, Gemini `x-goog-api-key`. For anything else use `--auth header`
-  plus `--auth-header NAME` and optional `--auth-prefix 'Bearer '`
-- `--header 'K:V'` injects static headers (repeatable), a fallback rather than
-  an override: if the client sends the same header, the client's value wins.
-  Only the auth header names are protected (they cannot be set statically at
-  all); treat this as route defaults, never as enforcement;
-  `--proxy URL|direct` sets a per-route upstream proxy, defaulting to
-  `HTTP(S)_PROXY`
-- `--retry-on-status CODE` overrides the retryable set per route (400..=599)
-
-Common moves:
-
-```bash
-keysink route update claude --base-url https://api.openai.com     # switch upstream
-printf %s "$NEW_KEY" | keysink route update claude --route-key -   # swap the real key
-keysink route rotate claude                                       # new vkey, old one stops working
-```
-
-`status` prints the vault summary (home, schema, route count). `doctor` runs the
-integrity checks (owner, permissions, key parses, store decrypts, backup
-decrypts) and is what to run when something looks wrong.
-
-To check the gateway itself, `GET /__keysink/health` returns
-`{"ok":true,"healthy":true,"degraded":false,"version":"0.2.2","uptime_secs":…,"routes":2}`,
-plus the state that used to be invisible:
-
-- `snapshot_age_secs`: how long the served snapshot has been in place. The
-  watcher only reloads on vault changes, so on a stable vault this grows with
-  uptime; it reports data freshness, not watcher health, so don't alert on it.
-- `reload_failures` / `reload_attempts`: the actual reload signals. Failures
-  keep climbing while the vault stays broken (e.g. undecryptable).
-- `watcher_age_secs`: how long since the store watcher last ticked.
-- `shed_connections` / `accept_errors`: connection-cap and per-connection
-  accept-error counts.
-- `audit` / `audit_ok` / `audit_dropped`: a dead audit writer or a failed audit
-  write reports `audit_ok:false` instead of silently dropping every line; when
-  the write path recovers, the writer probes on its idle tick and the flag
-  turns back on.
-
-`ok` only says the process answers; `healthy` says it is serving data it can
-trust. It goes false when the snapshot came from the stale backup, the hot
-reload keeps failing, the audit writer cannot write, or the watcher stopped
-ticking. Point liveness probes at `ok` (never restart a gateway that is still
-answering) and alerting/production-readiness at `healthy`.
-
-`--accept-degraded` covers a broken vault: when the primary store fails to
-decrypt, the gateway can start from `vault.age.bak` instead. That backup is one
-write behind, so vkeys rotated or deleted since then work again. This is a
-stopgap to keep agents running, not a steady state. `doctor` tells you which file is
-bad and how to restore it.
-
-## Where the vault lives
-
-`~/.local/share/keysink` (Windows: `%LOCALAPPDATA%\keysink`; system installs:
-`/var/lib/keysink`). Move it with `--home` or `KEYSINK_VAULT_HOME`.
-
-The master password only protects `export` backups (and is verified before one
-is written). Serving, adding, rotating and disabling keys never ask for it, so
-a daemon restart can't be blocked by a forgotten password.
-
-`export` is a **configuration** backup, not a restorable vault: it contains the
-routes (base URLs, auth method, retry policy, vkeys) with every real key
-stripped, so it can neither be dropped in as `vault.age` nor decrypted into a
-working vault. Recovery is manual: `age -d` it, then re-create the routes and
-re-enter each key with `route update <name> --route-key -`. The copy that
-actually restores is `vault.key` + `vault.age`, so back those two up.
-
-`vault.key` is a plain age identity file (`0600`), not something the master
-password protects: the vault's protection is file mode plus a separate UID. For
-services, the identity can live outside the vault directory: `KEYSINK_MASTER_KEY`
-(inline age identity) or `KEYSINK_MASTER_KEY_FILE` (path to one); that is what
-systemd's `LoadCredential` wants.
-
-## Linux system service
-
-```bash
-sudo keysink deploy
-```
-
-One shot: creates the `keysink` system user and a 0700 vault dir, installs the
-binary to `/usr/local/bin/keysink`, writes the systemd unit and the sudoers rule
-(for the admin who ran sudo), initializes the vault interactively (hidden
-password, entered twice), then enables the service. Idempotent: re-running
-upgrades in place and restarts. Removal is symmetric: `sudo keysink uninstall`.
-
-The unit refuses to start until the vault exists (`ConditionPathExists`). With no
-terminal on the deploy host, init manually, interactively:
-
-```bash
-sudo -u keysink /usr/local/bin/keysink --home /var/lib/keysink init
-```
-
-or fully headless (`init` refuses to prompt without a TTY, so pipe the password):
-
-```bash
-printf '%s\n' "$MASTER_PASSWORD" | sudo -u keysink /usr/local/bin/keysink \
-  --home /var/lib/keysink init --password-stdin
-```
-
-Admin commands then go through `sudo -u keysink /usr/local/bin/keysink …`; each
-invocation re-authenticates (`timestamp_timeout=0`), so an agent cannot silently
-run them.
-
-## Security model
-
-| Channel | What it can see |
+| Doc | What is in it |
 |---|---|
-| `route ls` / `route show` | masked vkey, no real key |
-| CLI | no read command exists |
-| `export` backup | routes and metadata, key values stripped |
-| agent process / env / logs | only the vkey |
-| upstream | the real key, injected at forward time |
-
-Vault files are age-encrypted, `0600`/`0700`, owned by the service user. Any of
-`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`, `anthropic-api-key`,
-`openai-api-key` arriving from the client is dropped before forwarding. Root
-that can read both `vault.key` and `vault.age` can still decrypt offline;
-machine-level isolation stays your job (tight sudo, separate UID).
-
-`--audit-log` records route, vkey fingerprint, status and latency, never
-headers, body or query. Off by default. Five rotated generations (10 MB each)
-are kept for real traffic. Rejected requests are throttled (1/s per
-fingerprint, 100/s globally) and written to their own rotation chain
-(`<audit-file>.rej`, another 5 × 10 MB); a flood of unauthenticated requests
-can only ever cycle its own logs, never the record of real traffic. `serve`
-verifies both files are openable for append at startup and refuses to start
-otherwise; a write failure at runtime turns `audit_ok` false until the path is
-writable again: the writer probes on its idle tick, so an idle gateway recovers
-too, and the next record re-verifies it.
-
-`--listen` will bind a non-loopback address if you insist, but then TLS and
-network exposure are yours to solve; the intended deployment is loopback only.
-
-Nothing is unbounded: 32 MB bodies (`--body-limit-mb`), 64 in-flight requests
-(`--max-concurrent`), a capped connection count, per-phase timeouts, and 30s to
-finish reading http1 request heads. A non-streaming response body is bounded
-both per chunk and as a whole, so an upstream that trickles a byte a minute
-cannot hold a connection forever. An h2 connection that stops answering
-keep-alive PINGs is closed, and a connection that never sends its first
-request (including one that stalls inside the h2 handshake) is closed at the
-head timeout. A hung upstream or a misbehaving agent can't take
-the gateway down.
-
-Every forwarded request also has a whole-forward budget (10 minutes): retry
-attempts, backoff sleeps and retryable-body drains share it, so a route with a
-large `--max-retries` cannot hold an inbound slot for tens of minutes.
-
-Shutdown is graceful and bounded: `serve` stops accepting, tells every live
-connection to finish and close (`Connection: close`, h2 `GOAWAY`), and drains
-for at most `--drain-timeout-secs` (default 10, `0` = wait forever) before
-dropping what is left with a warning. Idle keep-alive sockets close
-immediately, so a restart no longer waits out a 30s header timeout; the
-systemd unit's `TimeoutStopSec=30` is the backstop above that. The store
-watcher is supervised too: if it dies it is restarted, and if it stops ticking
-the log says so.
-
-## Performance
-
-One machine's reference numbers (Apple M4 Pro, macOS 26, release build of
-v0.2.2; 1 KB POST over loopback, 10-second runs) — treat them as order of
-magnitude and reproduce with the harness on your own hardware:
-
-| scenario | direct | through keysink |
-|---|---|---|
-| 1 KB echo, concurrency 8 | 102k rps · p50 75 µs · p99 136 µs | 51k rps · p50 153 µs · p99 238 µs |
-| 1 KB echo, concurrency 64 | — | 80k rps · p50 785 µs · p99 1.4 ms |
-| SSE time-to-first-chunk (upstream waits 50 ms) | p50 52.4 ms | p50 52.7 ms (+0.3 ms) |
-| SSE inter-chunk gap (p50) | 0 µs | 4 µs |
-
-The two extra loopback hops cost real throughput on tiny requests — roughly
-half at the same concurrency, about 80 µs at p50. Against an LLM upstream
-that answers in hundreds of milliseconds and streams for seconds, both are
-noise.
-
-`scripts/perf.sh` is the full harness: a concurrency ladder, request bodies
-up to 32 MB in three `stream`-marker shapes, SSE streams up to 16 MB,
-behavior at the concurrency cap, audit on/off, per-request log cost, hot
-reload under load, and a 10-minute soak with RSS sampling. Methodology and
-metric definitions: `docs/perf-test-plan.md`.
+| [usage.md](https://github.com/wusende/keysink/blob/main/docs/usage.md) | routing rules, every command and route option, health endpoint fields, vault layout, FAQ |
+| [service.md](https://github.com/wusende/keysink/blob/main/docs/service.md) | `sudo keysink deploy`: system user, systemd unit, headless init |
+| [security.md](https://github.com/wusende/keysink/blob/main/docs/security.md) | threat model, same-uid channels, audit log, bounds and shutdown |
+| [performance.md](https://github.com/wusende/keysink/blob/main/docs/performance.md) | measured overhead and the `scripts/perf.sh` harness |
 
 ## What this is not
 
@@ -363,35 +132,6 @@ metric definitions: `docs/perf-test-plan.md`.
 - Not a sandbox for the agent: a vkey is a capability. `route disable` /
   `rotate` is how you take it back.
 
-## FAQ
-
-**Why isn't the vault in the current directory?**
-
-One vault per user, not per directory. The gateway runs as a daemon while the CLI
-is invoked from anywhere, so a CWD-relative vault would mean a different vault
-per directory, routes that "vanish", and broken hot reload. The hardening needs
-a directory it controls too: `0700`/`0600`, `O_NOFOLLOW` and owner checks only
-mean something in a dedicated directory, while a CWD may well be a git repo or a
-synced folder where `vault.key` + `vault.age` leak. It is also where the OS
-expects app data (XDG `$XDG_DATA_HOME`, `%LOCALAPPDATA%`, `/var/lib` for
-services, same convention as `~/.ssh` or `/var/lib/docker`). Use `--home` /
-`KEYSINK_VAULT_HOME` when you want another location.
-
-**Is a local proxy a single point of failure?**
-
-It's a local process, so yes: if it's down, requests fail. `GET
-/__keysink/health` says whether it's up and whether it's serving a stale backup;
-under systemd the unit restarts on failure. The vault is plain files, so a crash
-never loses keys.
-
-**My agent gets 401 — is the vkey wrong or the real key?**
-
-keysink's own 401 has a JSON body from keysink and an `x-keysink-request-id`
-header, e.g. `{"error":{"type":"authentication_error","message":"virtual key is
-invalid or has been rotated …"}}`. A bad *real* key comes back from the upstream
-instead: same status, but the body is the provider's own error, which means the
-request was forwarded.
-
 ## Development
 
 ```bash
@@ -402,9 +142,10 @@ bash scripts/smoke.sh    # end-to-end: fake upstream, forwarding / SSE / retry /
 
 `cargo test` includes a seeded fuzz suite (22 targets over the pure helpers, a
 vault corruption matrix, and end-to-end fuzz against a mock upstream) plus the
-perf harness in `perf/ksbench`. Pushing a `v*` tag makes GitHub Actions build and
-publish release artifacts for all platforms, plus crates.io and the npm package
-once `CRATES_PUBLISH` / `NPM_PUBLISH` are enabled (see `docs/publishing.md`).
+perf harness in `perf/ksbench`. Pushing a `v*` tag makes GitHub Actions build
+and publish release artifacts for all platforms, plus crates.io and the npm
+package once `CRATES_PUBLISH` / `NPM_PUBLISH` are enabled (see
+[docs/publishing.md](docs/publishing.md)).
 
 ---
 

@@ -17,6 +17,15 @@
 
 **Docs**
 
+- The README is now the front page — what it is, what it protects and does not,
+  install, a five-minute quick start — and the rest moved to `docs/`: `usage.md`
+  (routing, commands, health fields, vault, FAQ), `service.md` (`deploy`),
+  `security.md` (threat model, audit log, bounds), `performance.md`. Nothing was
+  dropped; the Chinese README mirrors the new shape and points at the same docs
+- The README gains a "same user, not same process" section: an agent runs as
+  your uid, so the channels a local gateway does not close by itself are your
+  files (`vault.key` → offline decrypt) and your `/proc`. Both hit `keysink`
+  standalone; `deploy` closes the file one
 - `docs/perf-test-plan.md` now exists: the scenario matrix, metric
   definitions and aggregation behind `scripts/perf.sh` lived only in script
   comments, and two of those comments pointed at this file before it was
