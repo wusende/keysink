@@ -54,17 +54,6 @@ both run in your own uid: then the vault files are simply shared.
 [docs/security.md](https://github.com/wusende/keysink/blob/main/docs/security.md)
 has the details and what to do about them.
 
-## How it compares
-
-| | keysink | .env in agent config | LiteLLM / one-api | Vault / Infisical |
-|---|---|---|---|---|
-| Real key absent from agent env | ✅ never enters | ❌ sits in env | ⚠️ still holds upstream keys | ⚠️ agent fetches real keys |
-| One-way (no key read/export path) | ✅ | ❌ | ❌ | ❌ |
-| Per-agent revocable credential | ✅ vkey | ❌ | ⚠️ virtual keys, but key store holds real ones | ✅ |
-| Swap provider / rotate key, agent untouched | ✅ hot-reload ~1s | ❌ edit + restart | ⚠️ | ⚠️ |
-| Runs without a server or KMS | ✅ one binary, loopback | ✅ | ❌ | ❌ |
-| Retries that don't double-bill | ✅ | — | ⚠️ | — |
-
 ## Quick start
 
 1. Install — any of these:
@@ -124,14 +113,16 @@ has the details and what to do about them.
 
 ## What this is not
 
-- Not a secret manager: one user, no RBAC, no HA, no KMS integration.
+- Not a secret manager: one user, no RBAC, no HA, no KMS. A team or several
+  hosts want Vault, Infisical or a cloud secrets manager.
 - Not an LLM gateway: no token accounting, budgets, model routing, caching or
-  rate limiting. If you want those, put LiteLLM or one-api next to it.
+  rate limiting. Put LiteLLM or one-api next to it.
 - Not multi-machine: one process, one host, loopback.
 - Not key pools: one upstream and one key per route, no failover.
 - Not a sandbox for the agent: a vkey is a capability. `route disable` /
   `rotate` is how you take it back.
-
+- Not worth the extra hop if your agent never reads untrusted content: a plain
+  `.env` is simpler, and nothing here protects you from a teammate.
 ## Development
 
 ```bash

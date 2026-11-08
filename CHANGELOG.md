@@ -26,6 +26,11 @@
   your uid, so the channels a local gateway does not close by itself are your
   files (`vault.key` → offline decrypt) and your `/proc`. Both hit `keysink`
   standalone; `deploy` closes the file one
+- The self-scored comparison table is gone. It lined keysink up against tools
+  that solve different problems, on rows keysink chose, and won every row; a
+  reader learns nothing from that. "What this is not" stays and now names the
+  alternative per bullet, including the case where a plain `.env` is the
+  simpler answer
 - `docs/perf-test-plan.md` now exists: the scenario matrix, metric
   definitions and aggregation behind `scripts/perf.sh` lived only in script
   comments, and two of those comments pointed at this file before it was

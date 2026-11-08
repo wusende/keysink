@@ -39,17 +39,6 @@ agent 是用你的账号跑的,它也就有你的文件和 `/proc`。Linux 上�
 前两行靠 `deploy` 给出的独立 uid 堵上;后两行靠 `serve` 在 Linux 上的 `prctl(PR_SET_DUMPABLE, 0)`(同 uid 读 `/proc/<pid>/*`、`ptrace` 全变 `EPERM`)。两者都在你自己的 uid 里跑时,这些都挡不住——保险库文件就是共享的。细节和做法见
 [docs/security.md](https://github.com/wusende/keysink/blob/main/docs/security.md)。
 
-## 横向对比
-
-| | keysink | .env 写进 agent 配置 | LiteLLM / one-api | Vault / Infisical |
-|---|---|---|---|---|
-| 真 key 不进 agent 环境 | ✅ 根本不进 | ❌ 就在 env 里 | ⚠️ 网关自己持有上游 key | ⚠️ agent 会取到真 key |
-| 单向(没有读取/导出 key 的通道) | ✅ | ❌ | ❌ | ❌ |
-| 每个 agent 独立可吊销凭证 | ✅ vkey | ❌ | ⚠️ 有虚拟 key,但库里存的是真 key | ✅ |
-| 换供应商/换 key 不动 agent | ✅ 热重载约 1 秒 | ❌ 改配置+重启 | ⚠️ | ⚠️ |
-| 不需要服务器或 KMS | ✅ 一个二进制,loopback | ✅ | ❌ | ❌ |
-| 重试不重复扣费 | ✅ | — | ⚠️ | — |
-
 ## 快速开始
 
 1. 安装,任选一种:
@@ -100,11 +89,12 @@ agent 是用你的账号跑的,它也就有你的文件和 `/proc`。Linux 上�
 
 ## 它不是什么
 
-- 不是 secret manager:单用户,没有 RBAC、HA、KMS 集成。
+- 不是 secret manager:单用户,没有 RBAC、HA、KMS。多人或多机共享要用 Vault、Infisical 或云厂商的 secrets manager。
 - 不是 LLM 网关:不做 token 计费、预算、模型路由、缓存、限流。要这些就配 LiteLLM / one-api。
 - 不是多机方案:一个进程、一台机器、loopback。
 - 不做 key 池:一条路由一个上游一把 key,没有故障转移。
 - 不是 agent 的沙箱:vkey 就是能力,收回靠 `route disable` / `rotate`。
+- 如果你的 agent 从不接触不可信内容,多这一跳不值:普通 `.env` 更简单,而且它同样挡不住同事。
 
 ## 开发
 
