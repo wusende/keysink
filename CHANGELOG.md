@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Security**
+
+- `serve` calls `prctl(PR_SET_DUMPABLE, 0)` at startup on Linux, so a process
+  running as the same user can no longer read the gateway's memory through
+  `/proc/<pid>/mem` or attach a debugger to pull real keys out of it
+  (`PTRACE_ATTACH` and `/proc/<pid>/{environ,mem,maps}` now fail with `EPERM`
+  for same-uid readers, whatever `kernel.yama.ptrace_scope` says). Only the
+  process holding the keys can do this: `execve(2)` resets the flag, so a
+  launcher cannot do it on someone else's behalf. Best effort — a kernel that
+  refuses logs a warning instead of stopping the gateway. It does not protect
+  the vault files: `vault.key` is still only as private as its file mode
+  (see `deploy`)
+
 **Docs**
 
 - `docs/perf-test-plan.md` now exists: the scenario matrix, metric

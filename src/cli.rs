@@ -1066,6 +1066,17 @@ pub(crate) fn cmd_serve(paths: Paths, args: ServeArgs) -> Result<()> {
         // overrides systemd's IgnoreSIGPIPE).
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    // Real keys live in this process's memory for as long as it runs. Drop the
+    // kernel's default that lets any same-uid process read them back through
+    // /proc/<pid>/mem or a debugger. Best effort: a failure here is worth a
+    // warning, not a refusal to serve (an operator can still debug the gateway
+    // as root).
+    if let Err(e) = crate::hardening::hide_from_same_uid() {
+        tracing::warn!(
+            error = %e,
+            "could not make this process non-dumpable; a process running as the same user may be able to read keys from memory"
+        );
+    }
     let addr: std::net::SocketAddr = args
         .listen
         .parse()

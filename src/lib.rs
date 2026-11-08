@@ -3,6 +3,7 @@ pub mod cli;
 pub mod error;
 #[cfg(test)]
 pub(crate) mod fuzz;
+pub mod hardening;
 pub mod model;
 pub mod password;
 pub mod proxy;
